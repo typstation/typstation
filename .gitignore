@@ -1,0 +1,8 @@
+# Artefatos de build do cargo.
+/target
+
+# Arquivos locais: anotações, rascunhos e experimentos que não vão para o git.
+/.local/
+
+# Tudo o que a aplicação gera (PDFs, imagens, ...).
+/out/

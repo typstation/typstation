@@ -1,0 +1,35 @@
+[package]
+name = "typstation"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "A Typst editor with live preview. Work in progress."
+repository = "https://github.com/typstation/typstation"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["typst", "editor", "pdf", "typesetting"]
+categories = ["text-editors", "command-line-utilities"]
+
+# Só o que está listado aqui vai para o crates.io. Sem isto, a saída da
+# aplicação (`out/`) e as anotações locais (`.local/`) entrariam no pacote.
+include = [
+    "/src",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+]
+
+[dependencies]
+typst = "=0.15.0"
+typst-assets = { version = "=0.15.0", features = ["fonts"] }
+typst-layout = "=0.15.0"
+typst-pdf = "=0.15.0"
+typst-kit = { version = "=0.15.0", features = [
+    "datetime",
+    "embedded-fonts",
+    "emit-diagnostics",
+    "scan-fonts",
+    "system-downloader",
+    "system-files",
+] }
