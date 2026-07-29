@@ -1,6 +1,11 @@
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::path::PathBuf;
 
+use iced::{
+    Element,
+    Length::Fill,
+    Task, Theme,
+    widget::{button, column, pane_grid, row, svg, text},
+};
 use typst::{
     Library, LibraryExt, World,
     diag::FileResult,
@@ -9,29 +14,226 @@ use typst::{
     text::{Font, FontBook},
     utils::LazyHash,
 };
+use typst_iced_editor::{Action, Content, code_editor};
 use typst_kit::{
     datetime::Time,
-    diagnostics::{
-        self, DiagnosticFormat, DiagnosticWorld,
-        termcolor::{ColorChoice, StandardStream},
-    },
+    diagnostics::DiagnosticWorld,
     downloader::SystemDownloader,
     files::{FileStore, FsRoot, SystemFiles},
     fonts::{self, FontStore},
     packages::SystemPackages,
 };
 use typst_layout::PagedDocument;
-use typst_pdf::PdfOptions;
 
-/// Identifica o programa ao baixar pacotes do Typst Universe.
+fn main() -> iced::Result {
+    let title: &str = concat!("Typstation v", env!("CARGO_PKG_VERSION"));
+    iced::application(App::boot, App::update, App::view)
+        .title(title)
+        .theme(Theme::Dark)
+        .window_size([1200.0, 800.0])
+        .centered()
+        .run()
+}
+
+struct App {
+    content: Content,
+    panes: pane_grid::State<Pane>,
+    world: TypstationWorld,
+    preview: Option<svg::Handle>,
+}
+
+#[derive(Debug, Clone)]
+enum Message {
+    Editor(Action),
+    PaneDragged(pane_grid::DragEvent),
+    PaneResized(pane_grid::ResizeEvent),
+    Compile,
+    Bold,
+    Italic,
+    Underline,
+    PrefixLines(String),
+}
+
+enum Pane {
+    Editor,
+    Preview,
+}
+
+impl App {
+    fn boot() -> App {
+        let root = std::env::current_dir().unwrap_or_else(|err| {
+            eprintln!("erro ao obter diretório atual: {err}");
+            PathBuf::from(".")
+        });
+
+        let (mut panes, editor_pane) = pane_grid::State::new(Pane::Editor);
+
+        panes.split(pane_grid::Axis::Vertical, editor_pane, Pane::Preview);
+
+        App {
+            content: Content::with_text(DEMO),
+            panes,
+            world: TypstationWorld::new(root),
+            preview: None,
+        }
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Editor(action) => {
+                let should_compile = action.is_edit();
+
+                self.content.perform(action);
+
+                if should_compile {
+                    Task::done(Message::Compile)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::Bold => {
+                if self.content.selection().is_empty() {
+                    Task::none()
+                } else {
+                    self.content.perform(Action::Insert("*".to_owned()));
+                    Task::done(Message::Compile)
+                }
+            }
+            Message::Italic => {
+                if self.content.selection().is_empty() {
+                    Task::none()
+                } else {
+                    self.content.perform(Action::Insert("_".to_owned()));
+                    Task::done(Message::Compile)
+                }
+            }
+            Message::Underline => {
+                let range = self.content.selection();
+
+                if range.is_empty() {
+                    Task::none()
+                } else {
+                    let selected = {
+                        let buffer = self.content.buffer();
+                        buffer.text()[range.clone()].to_owned()
+                    };
+
+                    let open = "#underline[";
+                    let replacement = format!("{open}{selected}]");
+
+                    // Posições da seleção depois da inserção.
+                    let selection_start = range.start + open.len();
+                    let selection_end = selection_start + selected.len();
+
+                    self.content.perform(Action::Replace {
+                        range,
+                        text: replacement,
+                    });
+
+                    // Mantém somente o texto interno selecionado.
+                    self.content.perform(Action::MoveTo(selection_start));
+                    self.content.perform(Action::SelectTo(selection_end));
+
+                    Task::done(Message::Compile)
+                }
+            }
+            Message::PaneDragged(event) => {
+                if let pane_grid::DragEvent::Dropped { pane, target } = event {
+                    self.panes.drop(pane, target);
+                }
+                Task::none()
+            }
+            Message::PaneResized(event) => {
+                self.panes.resize(event.split, event.ratio);
+                Task::none()
+            }
+            Message::Compile => {
+                let buffer = self.content.buffer();
+
+                self.world.set_source(buffer.text());
+
+                let result = typst::compile::<PagedDocument>(&self.world);
+
+                let document = match result.output {
+                    Ok(document) => document,
+                    Err(errors) => {
+                        println!("erro ao compilar: {} erro(s)", errors.len());
+                        return Task::none();
+                    }
+                };
+
+                let svg = typst_svg::svg(&document.pages()[0], &typst_svg::SvgOptions::default());
+
+                self.preview = Some(svg::Handle::from_memory(svg.into_bytes()));
+
+                Task::none()
+            }
+            Message::PrefixLines(prefix) => {
+                let selection = self.content.selection();
+
+                let edits = {
+                    let buffer = self.content.buffer();
+
+                    let first_line = buffer.byte_to_line(selection.start);
+
+                    let last_line = if selection.is_empty() {
+                        first_line
+                    } else {
+                        buffer.byte_to_line(selection.end.saturating_sub(1))
+                    };
+
+                    (first_line..=last_line)
+                        .map(|line| {
+                            let line_start = buffer.line_range(line).start;
+
+                            // Intervalo vazio significa inserir, sem remover texto.
+                            (line_start..line_start, prefix.clone())
+                        })
+                        .collect()
+                };
+
+                self.content.perform(Action::ApplyEdits(edits));
+                Task::done(Message::Compile)
+            }
+        }
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let pane_grid = pane_grid(&self.panes, |_id, pane, _is_maximized| {
+            let editor = code_editor(&self.content).on_action(Message::Editor);
+
+            let content: Element<'_, Message> = match pane {
+                Pane::Editor => editor.into(),
+
+                Pane::Preview => match &self.preview {
+                    Some(handle) => svg(handle.clone()).width(Fill).height(Fill).into(),
+
+                    None => text("Sem preview").into(),
+                },
+            };
+
+            pane_grid::Content::new(content)
+        })
+        .spacing(8)
+        .min_size(200)
+        .on_drag(Message::PaneDragged)
+        .on_resize(10, Message::PaneResized);
+
+        let header = row![
+            button("▶").on_press(Message::Compile),
+            button("B").on_press(Message::Bold),
+            button("I").on_press(Message::Italic),
+            button("U").on_press(Message::Underline),
+            button("Lista").on_press(Message::PrefixLines("- ".into())),
+            button("Numeração").on_press(Message::PrefixLines("+ ".into())),
+        ];
+
+        column![header, pane_grid].width(Fill).height(Fill).into()
+    }
+}
+
 const USER_AGENT: &str = concat!("typstation/", env!("CARGO_PKG_VERSION"));
 
-/// O ambiente que o compilador do Typst consulta durante a compilação.
-///
-/// Está dividido em duas partes: o ambiente propriamente dito (fontes, pacotes,
-/// raiz do projeto), que é caro de montar e imutável, e o texto principal, que
-/// muda a cada edição. Ver [`TypstationWorld::new`] e
-/// [`TypstationWorld::set_source`].
 struct TypstationWorld {
     library: LazyHash<Library>,
     fonts: FontStore,
@@ -39,17 +241,10 @@ struct TypstationWorld {
     time: Time,
     main: FileId,
     source: Source,
-    /// Os bytes de `source`, prontos para servir `World::file` sem recopiar o
-    /// documento inteiro a cada chamada.
     bytes: Bytes,
 }
 
 impl TypstationWorld {
-    /// Monta o ambiente de compilação.
-    ///
-    /// Isto é caro — o scan de fontes do sistema sozinho custa ~165 ms, contra
-    /// ~20 ms de uma compilação. Construa um `TypstationWorld` uma única vez e
-    /// reaproveite-o via [`set_source`](Self::set_source) a cada recompilação.
     fn new(root: PathBuf) -> Self {
         let mut fonts = FontStore::new();
         fonts.extend(fonts::embedded());
@@ -72,17 +267,9 @@ impl TypstationWorld {
         }
     }
 
-    /// Troca o texto principal e prepara o mundo para uma nova compilação.
-    ///
-    /// `Source::replace` faz diff do texto e remenda a árvore sintática no
-    /// lugar, em vez de reparsear do zero.
     fn set_source(&mut self, text: &str) {
         self.source.replace(text);
         self.bytes = Bytes::from_string(text.to_owned());
-
-        // Descarta os arquivos em cache para que edições em disco (imagens,
-        // arquivos incluídos) sejam relidas na próxima compilação, e refaz a
-        // leitura da data do sistema.
         self.files.reset();
         self.time.reset();
     }
@@ -136,8 +323,7 @@ impl DiagnosticWorld for TypstationWorld {
     }
 }
 
-const DEMO: &str = r#"
-#set page(paper: "a5")
+const DEMO: &str = r#"#set page(paper: "a5")
 #set heading(numbering: "1.")
 
 #show link: set text(fill: blue, weight: 700)
@@ -184,51 +370,3 @@ Once you've explored Typst a bit, why not set yourself up a proper editing envir
   You can also *download* our free and open-source command line tool to continue your journey locally.
 ]
 "#;
-
-/// Diretório onde a aplicação escreve tudo o que gera. É ignorado pelo git.
-const OUT_DIR: &str = "out";
-
-fn main() -> ExitCode {
-    match run() {
-        Ok(code) => code,
-        Err(err) => {
-            eprintln!("erro: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let root = std::env::current_dir()?;
-
-    let mut world = TypstationWorld::new(root);
-    world.set_source(DEMO);
-
-    let result = typst::compile::<PagedDocument>(&world);
-
-    let mut stderr = StandardStream::stderr(ColorChoice::Auto);
-    diagnostics::emit(
-        &mut stderr,
-        &world,
-        result.warnings.iter(),
-        DiagnosticFormat::Human,
-    )?;
-
-    let document = match result.output {
-        Ok(document) => document,
-        Err(errors) => {
-            diagnostics::emit(&mut stderr, &world, errors.iter(), DiagnosticFormat::Human)?;
-            return Ok(ExitCode::FAILURE);
-        }
-    };
-
-    let pdf = typst_pdf::pdf(&document, &PdfOptions::default())
-        .map_err(|errors| format!("falha ao exportar PDF: {}", errors.len()))?;
-
-    let output = Path::new(OUT_DIR).join("tutorial.pdf");
-    std::fs::create_dir_all(OUT_DIR)?;
-    std::fs::write(&output, pdf)?;
-
-    println!("PDF gerado em {}", output.display());
-    Ok(ExitCode::SUCCESS)
-}
