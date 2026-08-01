@@ -1,34 +1,31 @@
-use std::path::PathBuf;
+mod compiler;
+mod document;
+mod formatting;
 
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use document::Document;
 use iced::{
     Element,
     Length::Fill,
-    Task, Theme,
-    widget::{button, column, pane_grid, row, svg, text},
+    Subscription, Task, Theme,
+    time::{self, Instant},
+    widget::{button, column, container, pane_grid, row, scrollable, svg, text},
 };
-use typst::{
-    Library, LibraryExt, World,
-    diag::FileResult,
-    foundations::{Bytes, Datetime, Duration},
-    syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot},
-    text::{Font, FontBook},
-    utils::LazyHash,
-};
-use typst_iced_editor::{Action, Content, code_editor};
-use typst_kit::{
-    datetime::Time,
-    diagnostics::DiagnosticWorld,
-    downloader::SystemDownloader,
-    files::{FileStore, FsRoot, SystemFiles},
-    fonts::{self, FontStore},
-    packages::SystemPackages,
-};
-use typst_layout::PagedDocument;
+use rfd::{AsyncFileDialog, AsyncMessageDialog, MessageButtons, MessageDialogResult, MessageLevel};
+use typst_iced_editor::{Action, code_editor};
+
+const DEBOUNCE: Duration = Duration::from_millis(250);
+const DEBOUNCE_TICK: Duration = Duration::from_millis(50);
+const DEMO: &str = include_str!("demo.typ");
 
 fn main() -> iced::Result {
-    let title: &str = concat!("Typstation v", env!("CARGO_PKG_VERSION"));
     iced::application(App::boot, App::update, App::view)
-        .title(title)
+        .subscription(App::subscription)
+        .title(App::title)
         .theme(Theme::Dark)
         .window_size([1200.0, 800.0])
         .centered()
@@ -36,10 +33,18 @@ fn main() -> iced::Result {
 }
 
 struct App {
-    content: Content,
+    document: Document,
     panes: pane_grid::State<Pane>,
-    world: TypstationWorld,
+    workspace_root: PathBuf,
+    compiler: Option<compiler::Sender>,
+    pending_compile: Option<PendingCompile>,
+    next_request_id: u64,
+    latest_request_id: Option<u64>,
     preview: Option<svg::Handle>,
+    preview_status: PreviewStatus,
+    file_busy: bool,
+    pending_after_save: Option<DestructiveFileAction>,
+    file_status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,11 +52,23 @@ enum Message {
     Editor(Action),
     PaneDragged(pane_grid::DragEvent),
     PaneResized(pane_grid::ResizeEvent),
-    Compile,
+    CompileNow,
+    DebounceTick(Instant),
+    Compiler(compiler::Event),
     Bold,
     Italic,
     Underline,
     PrefixLines(String),
+    NewDocument,
+    OpenDocument,
+    SaveDocument,
+    SaveDocumentAs,
+    UnsavedDecision {
+        action: DestructiveFileAction,
+        decision: UnsavedDecision,
+    },
+    OpenFinished(OpenOutcome),
+    SaveFinished(SaveOutcome),
 }
 
 enum Pane {
@@ -59,156 +76,222 @@ enum Pane {
     Preview,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingCompile {
+    deadline: Instant,
+    reset_files: bool,
+}
+
+enum PreviewStatus {
+    Waiting,
+    Compiling,
+    Ready { pages: usize, warnings: usize },
+    Failed { errors: usize, summary: String },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DestructiveFileAction {
+    New,
+    Open,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UnsavedDecision {
+    Save,
+    Discard,
+    Cancel,
+}
+
+#[derive(Debug, Clone)]
+enum OpenOutcome {
+    Cancelled,
+    Loaded { path: PathBuf, source: String },
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+enum SaveOutcome {
+    Cancelled,
+    Saved { path: PathBuf, source: String },
+    Failed(String),
+}
+
 impl App {
-    fn boot() -> App {
-        let root = std::env::current_dir().unwrap_or_else(|err| {
-            eprintln!("erro ao obter diretório atual: {err}");
+    fn boot() -> Self {
+        let workspace_root = std::env::current_dir().unwrap_or_else(|error| {
+            eprintln!("erro ao obter diretório atual: {error}");
             PathBuf::from(".")
         });
 
         let (mut panes, editor_pane) = pane_grid::State::new(Pane::Editor);
-
         panes.split(pane_grid::Axis::Vertical, editor_pane, Pane::Preview);
 
-        App {
-            content: Content::with_text(DEMO),
+        Self {
+            document: Document::draft(DEMO),
             panes,
-            world: TypstationWorld::new(root),
+            workspace_root,
+            compiler: None,
+            pending_compile: Some(PendingCompile {
+                deadline: Instant::now(),
+                reset_files: true,
+            }),
+            next_request_id: 0,
+            latest_request_id: None,
             preview: None,
+            preview_status: PreviewStatus::Waiting,
+            file_busy: false,
+            pending_after_save: None,
+            file_status: Some("O tutorial inicial ainda não foi salvo".to_owned()),
         }
+    }
+
+    fn title(&self) -> String {
+        let dirty = if self.document.is_dirty() { " *" } else { "" };
+
+        format!(
+            "{}{} - Typstation v{}",
+            self.document.display_name(),
+            dirty,
+            env!("CARGO_PKG_VERSION")
+        )
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Editor(action) => {
-                let should_compile = action.is_edit();
+                let changed = action.is_edit();
+                self.document.perform(action);
 
-                self.content.perform(action);
-
-                if should_compile {
-                    Task::done(Message::Compile)
-                } else {
-                    Task::none()
+                if changed {
+                    self.document.clear_diagnostics();
+                    self.file_status = None;
+                    self.schedule_compile(DEBOUNCE, false);
                 }
+
+                Task::none()
             }
             Message::Bold => {
-                if self.content.selection().is_empty() {
-                    Task::none()
-                } else {
-                    self.content.perform(Action::Insert("*".to_owned()));
-                    Task::done(Message::Compile)
+                if self
+                    .document
+                    .edit(|content| formatting::toggle_surround(content, "*", "*"))
+                {
+                    self.after_formatting();
                 }
+
+                Task::none()
             }
             Message::Italic => {
-                if self.content.selection().is_empty() {
-                    Task::none()
-                } else {
-                    self.content.perform(Action::Insert("_".to_owned()));
-                    Task::done(Message::Compile)
+                if self
+                    .document
+                    .edit(|content| formatting::toggle_surround(content, "_", "_"))
+                {
+                    self.after_formatting();
                 }
+
+                Task::none()
             }
             Message::Underline => {
-                let range = self.content.selection();
-
-                if range.is_empty() {
-                    Task::none()
-                } else {
-                    let selected = {
-                        let buffer = self.content.buffer();
-                        buffer.text()[range.clone()].to_owned()
-                    };
-
-                    let open = "#underline[";
-                    let replacement = format!("{open}{selected}]");
-
-                    // Posições da seleção depois da inserção.
-                    let selection_start = range.start + open.len();
-                    let selection_end = selection_start + selected.len();
-
-                    self.content.perform(Action::Replace {
-                        range,
-                        text: replacement,
-                    });
-
-                    // Mantém somente o texto interno selecionado.
-                    self.content.perform(Action::MoveTo(selection_start));
-                    self.content.perform(Action::SelectTo(selection_end));
-
-                    Task::done(Message::Compile)
+                if self
+                    .document
+                    .edit(|content| formatting::toggle_surround(content, "#underline[", "]"))
+                {
+                    self.after_formatting();
                 }
+
+                Task::none()
+            }
+            Message::PrefixLines(prefix) => {
+                if self
+                    .document
+                    .edit(|content| formatting::toggle_line_prefix(content, &prefix))
+                {
+                    self.after_formatting();
+                }
+
+                Task::none()
             }
             Message::PaneDragged(event) => {
                 if let pane_grid::DragEvent::Dropped { pane, target } = event {
                     self.panes.drop(pane, target);
                 }
+
                 Task::none()
             }
             Message::PaneResized(event) => {
                 self.panes.resize(event.split, event.ratio);
                 Task::none()
             }
-            Message::Compile => {
-                let buffer = self.content.buffer();
-
-                self.world.set_source(buffer.text());
-
-                let result = typst::compile::<PagedDocument>(&self.world);
-
-                let document = match result.output {
-                    Ok(document) => document,
-                    Err(errors) => {
-                        println!("erro ao compilar: {} erro(s)", errors.len());
-                        return Task::none();
-                    }
-                };
-
-                let svg = typst_svg::svg(&document.pages()[0], &typst_svg::SvgOptions::default());
-
-                self.preview = Some(svg::Handle::from_memory(svg.into_bytes()));
-
+            Message::CompileNow => {
+                self.schedule_compile(Duration::ZERO, true);
+                self.dispatch_compile(Instant::now());
                 Task::none()
             }
-            Message::PrefixLines(prefix) => {
-                let selection = self.content.selection();
-
-                let edits = {
-                    let buffer = self.content.buffer();
-
-                    let first_line = buffer.byte_to_line(selection.start);
-
-                    let last_line = if selection.is_empty() {
-                        first_line
-                    } else {
-                        buffer.byte_to_line(selection.end.saturating_sub(1))
-                    };
-
-                    (first_line..=last_line)
-                        .map(|line| {
-                            let line_start = buffer.line_range(line).start;
-
-                            // Intervalo vazio significa inserir, sem remover texto.
-                            (line_start..line_start, prefix.clone())
-                        })
-                        .collect()
-                };
-
-                self.content.perform(Action::ApplyEdits(edits));
-                Task::done(Message::Compile)
+            Message::DebounceTick(now) => {
+                self.dispatch_compile(now);
+                Task::none()
             }
+            Message::Compiler(event) => {
+                self.handle_compiler_event(event);
+                Task::none()
+            }
+            Message::NewDocument => self.request_destructive_action(DestructiveFileAction::New),
+            Message::OpenDocument => self.request_destructive_action(DestructiveFileAction::Open),
+            Message::SaveDocument => {
+                self.pending_after_save = None;
+                self.start_save(false)
+            }
+            Message::SaveDocumentAs => {
+                self.pending_after_save = None;
+                self.start_save(true)
+            }
+            Message::UnsavedDecision { action, decision } => {
+                self.file_busy = false;
+
+                match decision {
+                    UnsavedDecision::Save => {
+                        self.pending_after_save = Some(action);
+                        self.start_save(false)
+                    }
+                    UnsavedDecision::Discard => {
+                        self.pending_after_save = None;
+                        self.execute_destructive_action(action)
+                    }
+                    UnsavedDecision::Cancel => {
+                        self.pending_after_save = None;
+                        Task::none()
+                    }
+                }
+            }
+            Message::OpenFinished(outcome) => self.handle_open_finished(outcome),
+            Message::SaveFinished(outcome) => self.handle_save_finished(outcome),
+        }
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let compiler = compiler::subscription(self.compiler_config()).map(Message::Compiler);
+
+        if self.pending_compile.is_some() {
+            Subscription::batch([
+                compiler,
+                time::every(DEBOUNCE_TICK).map(Message::DebounceTick),
+            ])
+        } else {
+            compiler
         }
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let pane_grid = pane_grid(&self.panes, |_id, pane, _is_maximized| {
-            let editor = code_editor(&self.content).on_action(Message::Editor);
-
+        let panes = pane_grid(&self.panes, |_id, pane, _is_maximized| {
             let content: Element<'_, Message> = match pane {
-                Pane::Editor => editor.into(),
-
+                Pane::Editor => code_editor(self.document.content())
+                    .on_action(Message::Editor)
+                    .into(),
                 Pane::Preview => match &self.preview {
-                    Some(handle) => svg(handle.clone()).width(Fill).height(Fill).into(),
-
-                    None => text("Sem preview").into(),
+                    Some(handle) => scrollable(svg(handle.clone()).width(Fill)).into(),
+                    None => container(text("Preview indisponível"))
+                        .center_x(Fill)
+                        .center_y(Fill)
+                        .into(),
                 },
             };
 
@@ -219,154 +302,479 @@ impl App {
         .on_drag(Message::PaneDragged)
         .on_resize(10, Message::PaneResized);
 
-        let header = row![
-            button("▶").on_press(Message::Compile),
+        let new = file_button("Novo", Message::NewDocument, !self.file_busy);
+        let open = file_button("Abrir", Message::OpenDocument, !self.file_busy);
+        let save = file_button(
+            "Salvar",
+            Message::SaveDocument,
+            !self.file_busy && self.document.is_dirty(),
+        );
+        let save_as = file_button("Salvar como", Message::SaveDocumentAs, !self.file_busy);
+
+        let toolbar = row![
+            new,
+            open,
+            save,
+            save_as,
+            button("▶").on_press(Message::CompileNow),
             button("B").on_press(Message::Bold),
             button("I").on_press(Message::Italic),
             button("U").on_press(Message::Underline),
             button("Lista").on_press(Message::PrefixLines("- ".into())),
             button("Numeração").on_press(Message::PrefixLines("+ ".into())),
-        ];
+        ]
+        .spacing(4)
+        .padding(4);
 
-        column![header, pane_grid].width(Fill).height(Fill).into()
+        let status = container(text(self.status_text()).size(13))
+            .width(Fill)
+            .padding([5, 8]);
+
+        column![toolbar, panes, status]
+            .width(Fill)
+            .height(Fill)
+            .into()
     }
-}
 
-const USER_AGENT: &str = concat!("typstation/", env!("CARGO_PKG_VERSION"));
-
-struct TypstationWorld {
-    library: LazyHash<Library>,
-    fonts: FontStore,
-    files: FileStore<SystemFiles>,
-    time: Time,
-    main: FileId,
-    source: Source,
-    bytes: Bytes,
-}
-
-impl TypstationWorld {
-    fn new(root: PathBuf) -> Self {
-        let mut fonts = FontStore::new();
-        fonts.extend(fonts::embedded());
-        fonts.extend(fonts::system());
-
-        let packages = SystemPackages::new(SystemDownloader::new(USER_AGENT));
-        let files = FileStore::new(SystemFiles::new(FsRoot::new(root), packages));
-
-        let vpath = VirtualPath::new("main.typ").expect("`main.typ` é um caminho válido");
-        let main = RootedPath::new(VirtualRoot::Project, vpath).intern();
-
-        Self {
-            library: LazyHash::new(Library::default()),
-            fonts,
-            files,
-            time: Time::system(),
-            main,
-            source: Source::new(main, String::new()),
-            bytes: Bytes::from_string(String::new()),
+    fn request_destructive_action(&mut self, action: DestructiveFileAction) -> Task<Message> {
+        if self.file_busy {
+            return Task::none();
         }
-    }
 
-    fn set_source(&mut self, text: &str) {
-        self.source.replace(text);
-        self.bytes = Bytes::from_string(text.to_owned());
-        self.files.reset();
-        self.time.reset();
-    }
-}
+        if self.document.is_dirty() {
+            self.file_busy = true;
+            let name = self.document.display_name();
 
-impl World for TypstationWorld {
-    fn library(&self) -> &LazyHash<Library> {
-        &self.library
-    }
-
-    fn book(&self) -> &LazyHash<FontBook> {
-        self.fonts.book()
-    }
-
-    fn main(&self) -> FileId {
-        self.main
-    }
-
-    fn source(&self, id: FileId) -> FileResult<Source> {
-        if id == self.main {
-            Ok(self.source.clone())
+            Task::perform(confirm_unsaved(name), move |decision| {
+                Message::UnsavedDecision { action, decision }
+            })
         } else {
-            self.files.source(id)
+            self.execute_destructive_action(action)
         }
     }
 
-    fn file(&self, id: FileId) -> FileResult<Bytes> {
-        if id == self.main {
-            Ok(self.bytes.clone())
+    fn execute_destructive_action(&mut self, action: DestructiveFileAction) -> Task<Message> {
+        match action {
+            DestructiveFileAction::New => {
+                let previous_config = self.compiler_config();
+                self.document = Document::new();
+                self.file_status = Some("Novo documento criado".to_owned());
+                self.document_replaced(previous_config);
+                Task::none()
+            }
+            DestructiveFileAction::Open => {
+                self.file_busy = true;
+                self.file_status = Some("Aguardando a escolha de um arquivo...".to_owned());
+                let directory = self.document.directory(&self.workspace_root);
+
+                Task::perform(open_document(directory), Message::OpenFinished)
+            }
+        }
+    }
+
+    fn start_save(&mut self, save_as: bool) -> Task<Message> {
+        if self.file_busy {
+            return Task::none();
+        }
+
+        self.file_busy = true;
+        self.file_status = Some("Salvando documento...".to_owned());
+
+        let (_, source) = self.document.snapshot();
+
+        if !save_as && let Some(path) = self.document.path() {
+            let path = path.to_path_buf();
+            return Task::perform(write_document(path, source), Message::SaveFinished);
+        }
+
+        let directory = self.document.directory(&self.workspace_root);
+        let file_name = self.document.display_name();
+
+        Task::perform(
+            save_document_as(directory, file_name, source),
+            Message::SaveFinished,
+        )
+    }
+
+    fn handle_open_finished(&mut self, outcome: OpenOutcome) -> Task<Message> {
+        self.file_busy = false;
+
+        match outcome {
+            OpenOutcome::Cancelled => {
+                self.file_status = Some("A abertura foi cancelada".to_owned());
+            }
+            OpenOutcome::Failed(error) => {
+                eprintln!("erro ao abrir documento: {error}");
+                self.file_status = Some(format!("Erro ao abrir: {error}"));
+            }
+            OpenOutcome::Loaded { path, source } => {
+                let previous_config = self.compiler_config();
+                self.document = Document::opened(path.clone(), source);
+                self.file_status = Some(format!("Aberto: {}", path.display()));
+                self.document_replaced(previous_config);
+            }
+        }
+
+        Task::none()
+    }
+
+    fn handle_save_finished(&mut self, outcome: SaveOutcome) -> Task<Message> {
+        self.file_busy = false;
+
+        match outcome {
+            SaveOutcome::Cancelled => {
+                self.pending_after_save = None;
+                self.file_status = Some("O salvamento foi cancelado".to_owned());
+                Task::none()
+            }
+            SaveOutcome::Failed(error) => {
+                self.pending_after_save = None;
+                eprintln!("erro ao salvar documento: {error}");
+                self.file_status = Some(format!("Erro ao salvar: {error}"));
+                Task::none()
+            }
+            SaveOutcome::Saved { path, source } => {
+                let previous_config = self.compiler_config();
+                self.document.mark_saved(path.clone(), source);
+
+                self.file_status = Some(if self.document.is_dirty() {
+                    format!(
+                        "Versão salva em {}; há alterações mais recentes",
+                        path.display()
+                    )
+                } else {
+                    format!("Salvo em {}", path.display())
+                });
+
+                self.refresh_compiler_config(previous_config);
+
+                if let Some(action) = self.pending_after_save.take() {
+                    self.request_destructive_action(action)
+                } else {
+                    Task::none()
+                }
+            }
+        }
+    }
+
+    fn document_replaced(&mut self, previous_config: compiler::Config) {
+        self.replace_editor_pane_identity();
+        self.preview = None;
+        self.latest_request_id = None;
+        self.refresh_compiler_config(previous_config);
+        self.schedule_compile(Duration::ZERO, true);
+        self.dispatch_compile(Instant::now());
+    }
+
+    fn replace_editor_pane_identity(&mut self) {
+        let Some(editor) = self
+            .panes
+            .iter()
+            .find_map(|(id, pane)| matches!(pane, Pane::Editor).then_some(*id))
+        else {
+            return;
+        };
+
+        // PaneGrid owns the CodeEditor widget tree, including its line cache.
+        // Replacing the pane ID makes Iced create a fresh tree for new Content.
+        let Some((replacement, _split)) =
+            self.panes
+                .split(pane_grid::Axis::Vertical, editor, Pane::Editor)
+        else {
+            return;
+        };
+
+        let removed = self.panes.close(editor);
+        debug_assert!(removed.is_some_and(|(_, sibling)| sibling == replacement));
+    }
+
+    fn refresh_compiler_config(&mut self, previous_config: compiler::Config) {
+        if previous_config != self.compiler_config() {
+            self.compiler = None;
+            self.latest_request_id = None;
+            self.schedule_compile(Duration::ZERO, true);
+        }
+    }
+
+    fn compiler_config(&self) -> compiler::Config {
+        compiler::Config::new(
+            self.document.directory(&self.workspace_root),
+            self.document.main_name(),
+        )
+    }
+
+    fn after_formatting(&mut self) {
+        self.document.clear_diagnostics();
+        self.file_status = None;
+        self.schedule_compile(Duration::ZERO, false);
+        self.dispatch_compile(Instant::now());
+    }
+
+    fn schedule_compile(&mut self, delay: Duration, reset_files: bool) {
+        let reset_files = self
+            .pending_compile
+            .is_some_and(|pending| pending.reset_files)
+            || reset_files;
+
+        self.pending_compile = Some(PendingCompile {
+            deadline: Instant::now() + delay,
+            reset_files,
+        });
+        self.preview_status = PreviewStatus::Waiting;
+    }
+
+    fn dispatch_compile(&mut self, now: Instant) {
+        let Some(pending) = self.pending_compile else {
+            return;
+        };
+
+        if now < pending.deadline {
+            return;
+        }
+
+        let Some(sender) = self.compiler.clone() else {
+            return;
+        };
+
+        let (revision, source) = self.document.snapshot();
+
+        self.next_request_id += 1;
+        let request_id = self.next_request_id;
+        let request = compiler::Request {
+            id: request_id,
+            revision,
+            source,
+            reset_files: pending.reset_files,
+        };
+
+        if sender.unbounded_send(request).is_ok() {
+            self.pending_compile = None;
+            self.latest_request_id = Some(request_id);
+            self.preview_status = PreviewStatus::Compiling;
         } else {
-            self.files.file(id)
+            self.compiler = None;
+            self.preview_status = PreviewStatus::Failed {
+                errors: 1,
+                summary: "O worker de compilação foi encerrado".to_owned(),
+            };
         }
     }
 
-    fn font(&self, index: usize) -> Option<Font> {
-        self.fonts.font(index)
+    fn handle_compiler_event(&mut self, event: compiler::Event) {
+        match event {
+            compiler::Event::Ready { config, sender } => {
+                if config != self.compiler_config() {
+                    return;
+                }
+
+                self.compiler = Some(sender);
+                self.dispatch_compile(Instant::now());
+            }
+            compiler::Event::Finished { config, output } => {
+                if config != self.compiler_config() {
+                    return;
+                }
+
+                let current_revision = self.document.revision();
+
+                if self.latest_request_id != Some(output.id) || current_revision != output.revision
+                {
+                    return;
+                }
+
+                self.document.set_diagnostics(output.diagnostics);
+
+                if output.error_count > 0 {
+                    self.preview_status = PreviewStatus::Failed {
+                        errors: output.error_count,
+                        summary: output
+                            .summary
+                            .unwrap_or_else(|| "Falha ao compilar o documento".to_owned()),
+                    };
+                    return;
+                }
+
+                let Some(svg) = output.svg else {
+                    self.preview_status = PreviewStatus::Failed {
+                        errors: 1,
+                        summary: "A compilação não produziu um preview".to_owned(),
+                    };
+                    return;
+                };
+
+                self.preview = Some(svg::Handle::from_memory(svg));
+                self.preview_status = PreviewStatus::Ready {
+                    pages: output.page_count,
+                    warnings: output.warning_count,
+                };
+            }
+        }
     }
 
-    fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
-        self.time.today(offset)
-    }
-}
+    fn status_text(&self) -> String {
+        let preview = match &self.preview_status {
+            PreviewStatus::Waiting => "Alterações pendentes; preview desatualizado".to_owned(),
+            PreviewStatus::Compiling => "Compilando preview...".to_owned(),
+            PreviewStatus::Ready { pages, warnings } => {
+                let page_label = if *pages == 1 { "página" } else { "páginas" };
+                let warning_label = if *warnings == 1 { "aviso" } else { "avisos" };
 
-impl DiagnosticWorld for TypstationWorld {
-    fn name(&self, id: FileId) -> String {
-        let path = id.vpath().get_without_slash();
-        match id.root() {
-            VirtualRoot::Project => path.to_string(),
-            VirtualRoot::Package(spec) => format!("{spec}/{path}"),
+                format!("Preview atualizado: {pages} {page_label}, {warnings} {warning_label}")
+            }
+            PreviewStatus::Failed { errors, summary } => {
+                let error_label = if *errors == 1 { "erro" } else { "erros" };
+                format!(
+                    "Preview desatualizado: {errors} {error_label} - {}",
+                    truncate(summary, 100)
+                )
+            }
+        };
+
+        match &self.file_status {
+            Some(file) => format!("{} | {preview}", truncate(file, 100)),
+            None => preview,
         }
     }
 }
 
-const DEMO: &str = r#"#set page(paper: "a5")
-#set heading(numbering: "1.")
+fn file_button<'a>(
+    label: &'a str,
+    message: Message,
+    enabled: bool,
+) -> iced::widget::Button<'a, Message> {
+    let button = button(label);
 
-#show link: set text(fill: blue, weight: 700)
-#show link: underline
+    if enabled {
+        button.on_press(message)
+    } else {
+        button
+    }
+}
 
-= The Typst Playground
+async fn confirm_unsaved(name: String) -> UnsavedDecision {
+    let result = AsyncMessageDialog::new()
+        .set_level(MessageLevel::Warning)
+        .set_title("Alterações não salvas")
+        .set_description(format!(
+            "{name} possui alterações não salvas. Deseja salvá-las antes de continuar?"
+        ))
+        .set_buttons(MessageButtons::YesNoCancel)
+        .show()
+        .await;
 
-Welcome to the Typst Playground! This is a sandbox where you can experiment with Typst. You can type anywhere in the editor panel on the left. The preview panel to the right will update live.
+    match result {
+        MessageDialogResult::Yes => UnsavedDecision::Save,
+        MessageDialogResult::No => UnsavedDecision::Discard,
+        MessageDialogResult::Ok | MessageDialogResult::Cancel | MessageDialogResult::Custom(_) => {
+            UnsavedDecision::Cancel
+        }
+    }
+}
 
-= Basics <basics>
-== Loaerstonrest
-Typst is a _markup_ language. You use it to express not just the content, but also the structure and formatting of your document. For example, surrounding a word with underscores _emphasizes_ it with italics and starting a line with an equals sign creates a section heading.
+async fn open_document(directory: PathBuf) -> OpenOutcome {
+    let Some(file) = AsyncFileDialog::new()
+        .add_filter("Documento Typst", &["typ"])
+        .set_directory(directory)
+        .set_title("Abrir documento Typst")
+        .pick_file()
+        .await
+    else {
+        return OpenOutcome::Cancelled;
+    };
 
-Typst has lightweight syntax like this for the most common formatting needs. Among other things, you can use it to:
+    let path = file.path().to_path_buf();
 
-- *Strongly emphasize* some text
-- Refer to @basics
-- Typeset math: $a, b in { 1/2, sqrt(4 a b) }$
+    match tokio::fs::read_to_string(&path).await {
+        Ok(source) => OpenOutcome::Loaded { path, source },
+        Err(error) => OpenOutcome::Failed(format!("{}: {error}", path.display())),
+    }
+}
 
-That's just the surface though! Typst has powerful systems for scripting, styling, introspection, and more. In the realm of a Typst document, there is nothing you can't automate.
+async fn save_document_as(directory: PathBuf, file_name: String, source: String) -> SaveOutcome {
+    let Some(file) = AsyncFileDialog::new()
+        .add_filter("Documento Typst", &["typ"])
+        .set_directory(directory)
+        .set_file_name(file_name)
+        .set_title("Salvar documento Typst")
+        .save_file()
+        .await
+    else {
+        return SaveOutcome::Cancelled;
+    };
 
-= Next steps
+    write_document(with_typst_extension(file.path()), source).await
+}
 
-To learn more about Typst, we recommend you to check out our tutorial at https://typst.app/docs/tutorial.
+async fn write_document(path: PathBuf, source: String) -> SaveOutcome {
+    match tokio::fs::write(&path, source.as_bytes()).await {
+        Ok(()) => SaveOutcome::Saved { path, source },
+        Err(error) => SaveOutcome::Failed(format!("{}: {error}", path.display())),
+    }
+}
 
-Once you've explored Typst a bit, why not set yourself up a proper editing environment?
+fn with_typst_extension(path: &Path) -> PathBuf {
+    let mut path = path.to_path_buf();
 
-#import "@preview/tiaoma:0.3.0"
-#let next-step(url, body) = grid(
-  columns: 2,
-  gutter: 1em,
-  tiaoma.qrcode(url, width: 3em),
-  {
-    show strong: link.with(url)
-    body
-  }
-)
+    if path
+        .extension()
+        .is_none_or(|extension| extension.is_empty())
+    {
+        path.set_extension("typ");
+    }
 
-#next-step("https://typst.app/signup")[
-  To get access to multi-file projects, live collaboration, and more, *sign up* to our web app for free.
-]
+    path
+}
 
-#next-step("https://typst.app/open-source/#download")[
-  You can also *download* our free and open-source command line tool to continue your journey locally.
-]
-"#;
+fn truncate(text: &str, limit: usize) -> String {
+    let mut characters = text.chars();
+    let shortened = characters.by_ref().take(limit).collect::<String>();
+
+    if characters.next().is_some() {
+        format!("{shortened}...")
+    } else {
+        shortened
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_as_adds_the_typst_extension_when_missing() {
+        assert_eq!(
+            with_typst_extension(Path::new("documento")),
+            PathBuf::from("documento.typ")
+        );
+        assert_eq!(
+            with_typst_extension(Path::new("documento.typ")),
+            PathBuf::from("documento.typ")
+        );
+    }
+
+    #[test]
+    fn discarding_before_new_replaces_the_editor_pane() {
+        let mut app = App::boot();
+        let previous_editor = app
+            .panes
+            .iter()
+            .find_map(|(id, pane)| matches!(pane, Pane::Editor).then_some(*id))
+            .expect("the editor pane exists");
+
+        let _ = app.update(Message::UnsavedDecision {
+            action: DestructiveFileAction::New,
+            decision: UnsavedDecision::Discard,
+        });
+
+        let (_, source) = app.document.snapshot();
+        let current_editor = app
+            .panes
+            .iter()
+            .find_map(|(id, pane)| matches!(pane, Pane::Editor).then_some(*id))
+            .expect("the replacement editor pane exists");
+
+        assert!(source.is_empty());
+        assert_ne!(current_editor, previous_editor);
+        assert_eq!(app.panes.len(), 2);
+    }
+}
