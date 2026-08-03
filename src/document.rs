@@ -1,5 +1,5 @@
 use std::{
-    ops::Range,
+    ops::{Deref, DerefMut, Range},
     path::{Path, PathBuf},
 };
 
@@ -8,12 +8,35 @@ use typst_iced_editor::{Action, Content, Diagnostic};
 const UNTITLED_NAME: &str = "Sem título.typ";
 const UNTITLED_MAIN: &str = "untitled.typ";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DocumentId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalChangeKind {
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalUpdate {
+    Unchanged,
+    Reloaded,
+    Conflict,
+}
+
+enum ExternalChange {
+    Modified(String),
+    Deleted,
+}
+
 /// A Typst document together with the state needed by file operations.
 pub struct Document {
     path: Option<PathBuf>,
     content: Content,
     saved_text: Option<String>,
     dirty: bool,
+    storage_revision: u64,
+    external_change: Option<ExternalChange>,
 }
 
 impl Document {
@@ -24,6 +47,8 @@ impl Document {
             content: Content::new(),
             saved_text: Some(String::new()),
             dirty: false,
+            storage_revision: 0,
+            external_change: None,
         }
     }
 
@@ -34,6 +59,8 @@ impl Document {
             content: Content::with_text(text),
             saved_text: None,
             dirty: true,
+            storage_revision: 0,
+            external_change: None,
         }
     }
 
@@ -44,6 +71,8 @@ impl Document {
             content: Content::with_text(&text),
             saved_text: Some(text),
             dirty: false,
+            storage_revision: 0,
+            external_change: None,
         }
     }
 
@@ -145,6 +174,64 @@ impl Document {
         self.dirty
     }
 
+    pub fn storage_revision(&self) -> u64 {
+        self.storage_revision
+    }
+
+    pub fn external_change(&self) -> Option<ExternalChangeKind> {
+        self.external_change.as_ref().map(|change| match change {
+            ExternalChange::Modified(_) => ExternalChangeKind::Modified,
+            ExternalChange::Deleted => ExternalChangeKind::Deleted,
+        })
+    }
+
+    pub fn observe_disk_source(&mut self, source: String) -> ExternalUpdate {
+        if self.saved_text.as_deref() == Some(source.as_str()) {
+            self.external_change = None;
+            return ExternalUpdate::Unchanged;
+        }
+
+        if self.dirty {
+            self.external_change = Some(ExternalChange::Modified(source));
+            ExternalUpdate::Conflict
+        } else {
+            self.replace_from_disk(source);
+            ExternalUpdate::Reloaded
+        }
+    }
+
+    pub fn observe_deleted_file(&mut self) -> ExternalUpdate {
+        if self.path.is_none() || self.saved_text.is_none() {
+            return ExternalUpdate::Unchanged;
+        }
+
+        self.external_change = Some(ExternalChange::Deleted);
+        ExternalUpdate::Conflict
+    }
+
+    pub fn reload_external_change(&mut self) -> bool {
+        let Some(ExternalChange::Modified(source)) = self.external_change.take() else {
+            return false;
+        };
+
+        self.replace_from_disk(source);
+        true
+    }
+
+    pub fn keep_local_after_external_change(&mut self) -> bool {
+        let Some(change) = self.external_change.take() else {
+            return false;
+        };
+
+        self.saved_text = match change {
+            ExternalChange::Modified(source) => Some(source),
+            ExternalChange::Deleted => None,
+        };
+        self.storage_revision += 1;
+        self.refresh_dirty();
+        true
+    }
+
     /// Marks the exact snapshot written to disk as saved.
     ///
     /// If the user edited the document while the write was in progress, the
@@ -152,7 +239,17 @@ impl Document {
     pub fn mark_saved(&mut self, path: PathBuf, saved_text: String) {
         self.path = Some(path);
         self.saved_text = Some(saved_text);
+        self.storage_revision += 1;
+        self.external_change = None;
         self.refresh_dirty();
+    }
+
+    fn replace_from_disk(&mut self, source: String) {
+        self.content = Content::with_text(&source);
+        self.saved_text = Some(source);
+        self.dirty = false;
+        self.storage_revision += 1;
+        self.external_change = None;
     }
 
     fn refresh_dirty(&mut self) {
@@ -161,6 +258,112 @@ impl Document {
             .saved_text
             .as_deref()
             .is_none_or(|saved| saved != buffer.text());
+    }
+}
+
+struct DocumentEntry {
+    id: DocumentId,
+    document: Document,
+}
+
+pub struct Documents {
+    entries: Vec<DocumentEntry>,
+    active: usize,
+    next_id: u64,
+}
+
+impl Documents {
+    pub fn new(initial: Document) -> Self {
+        Self {
+            entries: vec![DocumentEntry {
+                id: DocumentId(0),
+                document: initial,
+            }],
+            active: 0,
+            next_id: 1,
+        }
+    }
+
+    pub fn active_id(&self) -> DocumentId {
+        self.entries[self.active].id
+    }
+
+    pub fn active(&self) -> &Document {
+        &self.entries[self.active].document
+    }
+
+    pub fn active_mut(&mut self) -> &mut Document {
+        &mut self.entries[self.active].document
+    }
+
+    pub fn get(&self, id: DocumentId) -> Option<&Document> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| &entry.document)
+    }
+
+    pub fn get_mut(&mut self, id: DocumentId) -> Option<&mut Document> {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .map(|entry| &mut entry.document)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (DocumentId, &Document)> {
+        self.entries.iter().map(|entry| (entry.id, &entry.document))
+    }
+
+    pub fn add(&mut self, document: Document) -> DocumentId {
+        let id = DocumentId(self.next_id);
+        self.next_id += 1;
+        self.entries.push(DocumentEntry { id, document });
+        self.active = self.entries.len() - 1;
+        id
+    }
+
+    pub fn activate(&mut self, id: DocumentId) -> bool {
+        let Some(index) = self.entries.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+
+        let changed = self.active != index;
+        self.active = index;
+        changed
+    }
+
+    pub fn find_path(&self, path: &Path) -> Option<DocumentId> {
+        self.iter()
+            .find_map(|(id, document)| (document.path() == Some(path)).then_some(id))
+    }
+
+    pub fn remove(&mut self, id: DocumentId) -> Option<Document> {
+        let index = self.entries.iter().position(|entry| entry.id == id)?;
+        let removed = self.entries.remove(index).document;
+
+        if self.entries.is_empty() {
+            let _ = self.add(Document::new());
+        } else if self.active > index {
+            self.active -= 1;
+        } else if self.active >= self.entries.len() {
+            self.active = self.entries.len() - 1;
+        }
+
+        Some(removed)
+    }
+}
+
+impl Deref for Documents {
+    type Target = Document;
+
+    fn deref(&self) -> &Self::Target {
+        self.active()
+    }
+}
+
+impl DerefMut for Documents {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.active_mut()
     }
 }
 
@@ -202,5 +405,65 @@ mod tests {
         document.perform(Action::Undo);
 
         assert!(!document.is_dirty());
+    }
+
+    #[test]
+    fn clean_external_edits_are_reloaded_automatically() {
+        let mut document = Document::opened(PathBuf::from("documento.typ"), "original".to_owned());
+
+        let update = document.observe_disk_source("externo".to_owned());
+
+        assert_eq!(update, ExternalUpdate::Reloaded);
+        assert_eq!(document.snapshot().1, "externo");
+        assert!(!document.is_dirty());
+        assert_eq!(document.external_change(), None);
+    }
+
+    #[test]
+    fn dirty_external_edits_require_an_explicit_decision() {
+        let mut document = Document::opened(PathBuf::from("documento.typ"), "original".to_owned());
+        document.perform(Action::MoveTo("original".len()));
+        document.perform(Action::Insert(" local".to_owned()));
+
+        let update = document.observe_disk_source("externo".to_owned());
+
+        assert_eq!(update, ExternalUpdate::Conflict);
+        assert_eq!(document.snapshot().1, "original local");
+        assert_eq!(
+            document.external_change(),
+            Some(ExternalChangeKind::Modified)
+        );
+
+        assert!(document.keep_local_after_external_change());
+        assert!(document.is_dirty());
+        assert_eq!(document.external_change(), None);
+    }
+
+    #[test]
+    fn acknowledged_deletion_is_not_reported_repeatedly() {
+        let mut document = Document::opened(PathBuf::from("documento.typ"), "conteúdo".to_owned());
+
+        assert_eq!(document.observe_deleted_file(), ExternalUpdate::Conflict);
+        assert!(document.keep_local_after_external_change());
+        assert_eq!(document.observe_deleted_file(), ExternalUpdate::Unchanged);
+        assert!(document.is_dirty());
+    }
+
+    #[test]
+    fn documents_can_be_added_activated_and_removed() {
+        let mut documents = Documents::new(Document::new());
+        let first = documents.active_id();
+        let second = documents.add(Document::draft("segundo"));
+
+        assert_eq!(documents.iter().count(), 2);
+        assert_eq!(documents.active_id(), second);
+        assert!(documents.activate(first));
+        assert_eq!(documents.snapshot().1, "");
+
+        documents.remove(first);
+
+        assert_eq!(documents.iter().count(), 1);
+        assert_eq!(documents.active_id(), second);
+        assert_eq!(documents.snapshot().1, "segundo");
     }
 }

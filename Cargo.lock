@@ -5267,6 +5267,7 @@ dependencies = [
  "typst-layout",
  "typst-pdf",
  "typst-svg",
+ "walkdir",
 ]
 
 [[package]]

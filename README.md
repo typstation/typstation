@@ -2,9 +2,9 @@
 
 A [Typst](https://typst.app) editor with live preview, written in Rust.
 
-> **Status: early work in progress.** The single-document editor, native file
-> operations, and preview workflow are usable. Project management is still in
-> development.
+> **Status: early work in progress.** The multi-document editor, native file
+> operations, project tree, and preview workflow are usable. Session recovery
+> is still in development.
 
 ## What works today
 
@@ -24,8 +24,10 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
   worker.
 - Unicode-aware search and replace with match navigation, whole-word and case
   options, and single-step undo for Replace All.
-- Unsaved-change tracking and confirmation before replacing the current
-  document.
+- A recursive Typst project tree and multiple document tabs.
+- Automatic reload of clean files changed on disk, with explicit conflict
+  handling when local edits exist.
+- Unsaved-change tracking and confirmation before closing a tab or the window.
 - Embedded and system fonts.
 - Package loading from [Typst Universe](https://typst.app/universe), with
   download and on-disk caching.
@@ -38,8 +40,9 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
 - [x] Warn about unsaved changes when closing the window
 - [x] Add keyboard shortcuts and atomic document saves
 - [x] Export PDF from the interface
-- [ ] Project file tree and multi-file editing
+- [x] Project file tree and multi-file editing
 - [x] Search and replace
+- [ ] Recover open tabs and unsaved drafts after restarting
 
 ## Building
 

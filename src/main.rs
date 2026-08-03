@@ -4,13 +4,14 @@ mod formatting;
 mod search;
 
 use std::{
+    collections::HashSet,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use document::Document;
+use document::{Document, DocumentId, Documents, ExternalChangeKind, ExternalUpdate};
 use iced::{
     Element,
     Length::Fill,
@@ -41,7 +42,7 @@ fn main() -> iced::Result {
 }
 
 struct App {
-    document: Document,
+    document: Documents,
     panes: pane_grid::State<Pane>,
     workspace_root: PathBuf,
     compiler: Option<compiler::Sender>,
@@ -55,6 +56,10 @@ struct App {
     pending_pdf_export: Option<PendingPdfExport>,
     search: SearchState,
     search_input_id: Id,
+    project_files: Vec<PathBuf>,
+    project_scan_busy: bool,
+    external_check_busy: bool,
+    discarded_on_close: HashSet<DocumentId>,
     file_status: Option<String>,
 }
 
@@ -82,8 +87,19 @@ enum Message {
     SearchPrevious,
     ReplaceCurrent,
     ReplaceAll,
+    ActivateDocument(DocumentId),
+    CloseDocument(DocumentId),
     NewDocument,
     OpenDocument,
+    OpenProject,
+    OpenProjectFile(PathBuf),
+    ProjectFolderSelected(Option<PathBuf>),
+    ProjectScanned(ProjectScanOutcome),
+    ProjectRefreshTick(Instant),
+    ExternalRefreshTick(Instant),
+    ExternalFilesChecked(Vec<ExternalFileResult>),
+    ReloadExternal,
+    KeepLocalAfterExternal,
     SaveDocument,
     SaveDocumentAs,
     ExportPdf,
@@ -135,8 +151,7 @@ enum PreviewStatus {
 
 #[derive(Debug, Clone, Copy)]
 enum DestructiveFileAction {
-    New,
-    Open,
+    CloseDocument(DocumentId),
     Close(window::Id),
 }
 
@@ -156,9 +171,42 @@ enum OpenOutcome {
 
 #[derive(Debug, Clone)]
 enum SaveOutcome {
-    Cancelled,
-    Saved { path: PathBuf, source: String },
-    Failed(String),
+    Cancelled {
+        document_id: DocumentId,
+    },
+    Saved {
+        document_id: DocumentId,
+        path: PathBuf,
+        source: String,
+    },
+    Failed {
+        document_id: DocumentId,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum ExternalFileResult {
+    Source {
+        document_id: DocumentId,
+        storage_revision: u64,
+        source: String,
+    },
+    Deleted {
+        document_id: DocumentId,
+        storage_revision: u64,
+    },
+    Failed {
+        document_id: DocumentId,
+        storage_revision: u64,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ProjectScanOutcome {
+    root: PathBuf,
+    files: Result<Vec<PathBuf>, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,7 +222,18 @@ enum PdfWriteOutcome {
 }
 
 impl App {
-    fn boot() -> Self {
+    fn boot() -> (Self, Task<Message>) {
+        let mut app = Self::new();
+        app.project_scan_busy = true;
+        let root = app.workspace_root.clone();
+
+        (
+            app,
+            Task::perform(scan_project(root), Message::ProjectScanned),
+        )
+    }
+
+    fn new() -> Self {
         let workspace_root = std::env::current_dir().unwrap_or_else(|error| {
             eprintln!("erro ao obter diretório atual: {error}");
             PathBuf::from(".")
@@ -184,7 +243,7 @@ impl App {
         panes.split(pane_grid::Axis::Vertical, editor_pane, Pane::Preview);
 
         Self {
-            document: Document::draft(DEMO),
+            document: Documents::new(Document::draft(DEMO)),
             panes,
             workspace_root,
             compiler: None,
@@ -201,6 +260,10 @@ impl App {
             pending_pdf_export: None,
             search: SearchState::default(),
             search_input_id: Id::unique(),
+            project_files: Vec::new(),
+            project_scan_busy: false,
+            external_check_busy: false,
+            discarded_on_close: HashSet::new(),
             file_status: Some("O tutorial inicial ainda não foi salvo".to_owned()),
         }
     }
@@ -338,9 +401,58 @@ impl App {
                 Task::none()
             }
             Message::Compiler(event) => self.handle_compiler_event(event),
-            Message::NewDocument => self.request_destructive_action(DestructiveFileAction::New),
-            Message::OpenDocument => self.request_destructive_action(DestructiveFileAction::Open),
+            Message::ActivateDocument(id) => {
+                if !self.file_busy {
+                    self.activate_document(id);
+                }
+                Task::none()
+            }
+            Message::CloseDocument(id) => {
+                self.request_destructive_action(DestructiveFileAction::CloseDocument(id))
+            }
+            Message::NewDocument => {
+                if !self.file_busy {
+                    self.new_document();
+                }
+                Task::none()
+            }
+            Message::OpenDocument => self.start_open_document(),
+            Message::OpenProject => self.start_open_project(),
+            Message::OpenProjectFile(path) => self.open_project_file(path),
+            Message::ProjectFolderSelected(path) => self.handle_project_folder_selected(path),
+            Message::ProjectScanned(outcome) => {
+                if outcome.root != self.workspace_root {
+                    return Task::none();
+                }
+
+                self.project_scan_busy = false;
+                match outcome.files {
+                    Ok(files) => self.project_files = files,
+                    Err(error) => {
+                        eprintln!("erro ao examinar projeto: {error}");
+                        self.file_status = Some(format!("Erro no projeto: {error}"));
+                    }
+                }
+                Task::none()
+            }
+            Message::ProjectRefreshTick(_now) => self.refresh_project_files(),
+            Message::ExternalRefreshTick(_now) => self.check_external_files(),
+            Message::ExternalFilesChecked(results) => self.handle_external_files(results),
+            Message::ReloadExternal => {
+                self.reload_external_change();
+                Task::none()
+            }
+            Message::KeepLocalAfterExternal => {
+                if self.document.keep_local_after_external_change() {
+                    self.file_status = Some("A versão local foi mantida".to_owned());
+                }
+                Task::none()
+            }
             Message::SaveDocument => {
+                if self.file_busy {
+                    return Task::none();
+                }
+
                 self.pending_after_save = None;
 
                 if self.document.is_dirty() {
@@ -350,6 +462,10 @@ impl App {
                 }
             }
             Message::SaveDocumentAs => {
+                if self.file_busy {
+                    return Task::none();
+                }
+
                 self.pending_after_save = None;
                 self.start_save(true)
             }
@@ -369,10 +485,13 @@ impl App {
                     }
                     UnsavedDecision::Discard => {
                         self.pending_after_save = None;
-                        self.execute_destructive_action(action)
+                        self.discard_destructive_action(action)
                     }
                     UnsavedDecision::Cancel => {
                         self.pending_after_save = None;
+                        if matches!(action, DestructiveFileAction::Close(_)) {
+                            self.discarded_on_close.clear();
+                        }
                         Task::none()
                     }
                 }
@@ -386,6 +505,9 @@ impl App {
         let compiler = compiler::subscription(self.compiler_config()).map(Message::Compiler);
         let close_requests = window::close_requests().map(Message::CloseRequested);
         let shortcuts = shortcut_subscription();
+        let project_refresh = time::every(Duration::from_secs(5)).map(Message::ProjectRefreshTick);
+        let external_refresh =
+            time::every(Duration::from_secs(2)).map(Message::ExternalRefreshTick);
 
         if self.pending_compile.is_some() {
             Subscription::batch([
@@ -393,9 +515,17 @@ impl App {
                 time::every(DEBOUNCE_TICK).map(Message::DebounceTick),
                 close_requests,
                 shortcuts,
+                project_refresh,
+                external_refresh,
             ])
         } else {
-            Subscription::batch([compiler, close_requests, shortcuts])
+            Subscription::batch([
+                compiler,
+                close_requests,
+                shortcuts,
+                project_refresh,
+                external_refresh,
+            ])
         }
     }
 
@@ -423,6 +553,7 @@ impl App {
 
         let new = file_button("Novo", Message::NewDocument, !self.file_busy);
         let open = file_button("Abrir", Message::OpenDocument, !self.file_busy);
+        let open_project = file_button("Abrir pasta", Message::OpenProject, !self.file_busy);
         let save = file_button(
             "Salvar",
             Message::SaveDocument,
@@ -438,6 +569,7 @@ impl App {
         let toolbar = row![
             new,
             open,
+            open_project,
             save,
             save_as,
             export_pdf,
@@ -455,18 +587,111 @@ impl App {
             .width(Fill)
             .padding([5, 8]);
 
-        let mut content = column![toolbar];
+        let tabs = self.tabs_view();
+        let workspace = row![self.project_view(), panes].height(Fill);
+        let mut content = column![toolbar, tabs];
+
+        if self.document.external_change().is_some() {
+            content = content.push(self.external_change_view());
+        }
 
         if self.search.visible {
             content = content.push(self.search_view());
         }
 
         content
-            .push(panes)
+            .push(workspace)
             .push(status)
             .width(Fill)
             .height(Fill)
             .into()
+    }
+
+    fn tabs_view(&self) -> Element<'_, Message> {
+        let active = self.document.active_id();
+        let mut tabs = row![].spacing(2).padding([0, 4]);
+
+        for (id, document) in self.document.iter() {
+            let mut label = document.display_name();
+            if document.is_dirty() {
+                label.push_str(" *");
+            }
+            if document.external_change().is_some() {
+                label.push_str(" !");
+            }
+
+            let select = button(text(label));
+            let select = if id != active && !self.file_busy {
+                select.on_press(Message::ActivateDocument(id))
+            } else {
+                select
+            };
+            let close = button("X");
+            let close = if self.file_busy {
+                close
+            } else {
+                close.on_press(Message::CloseDocument(id))
+            };
+
+            tabs = tabs.push(row![select, close].spacing(1));
+        }
+
+        scrollable(tabs)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::default(),
+            ))
+            .into()
+    }
+
+    fn project_view(&self) -> Element<'_, Message> {
+        let mut files = column![].spacing(2);
+
+        for path in &self.project_files {
+            let relative = path.strip_prefix(&self.workspace_root).unwrap_or(path);
+            let item = button(text(relative.to_string_lossy())).width(Fill);
+            let item = if self.file_busy {
+                item
+            } else {
+                item.on_press(Message::OpenProjectFile(path.clone()))
+            };
+            files = files.push(item);
+        }
+
+        let root = truncate(&self.workspace_root.to_string_lossy(), 28);
+        let content = column![
+            text("Projeto").size(16),
+            text(root).size(12),
+            scrollable(files).height(Fill),
+        ]
+        .spacing(6);
+
+        container(content)
+            .width(220)
+            .height(Fill)
+            .padding([6, 8])
+            .into()
+    }
+
+    fn external_change_view(&self) -> Element<'_, Message> {
+        let kind = self.document.external_change();
+        let message = match kind {
+            Some(ExternalChangeKind::Modified) => "O arquivo foi alterado fora do Typstation",
+            Some(ExternalChangeKind::Deleted) => "O arquivo foi removido fora do Typstation",
+            None => "",
+        };
+        let mut actions = row![text(message)]
+            .spacing(8)
+            .push(button("Manter local").on_press(Message::KeepLocalAfterExternal));
+
+        if kind == Some(ExternalChangeKind::Modified) {
+            actions = actions.push(button("Recarregar").on_press(Message::ReloadExternal));
+        } else {
+            actions = actions.push(
+                button("Fechar aba").on_press(Message::CloseDocument(self.document.active_id())),
+            );
+        }
+
+        container(actions).width(Fill).padding([4, 8]).into()
     }
 
     fn search_view(&self) -> Element<'_, Message> {
@@ -525,9 +750,27 @@ impl App {
             return Task::none();
         }
 
-        if self.document.is_dirty() {
+        let dirty_document = match action {
+            DestructiveFileAction::CloseDocument(id) => self
+                .document
+                .get(id)
+                .filter(|document| document.is_dirty())
+                .map(|_| id),
+            DestructiveFileAction::Close(_) => self
+                .document
+                .iter()
+                .find(|(id, document)| document.is_dirty() && !self.discarded_on_close.contains(id))
+                .map(|(id, _)| id),
+        };
+
+        if let Some(id) = dirty_document {
+            self.activate_document(id);
             self.file_busy = true;
-            let name = self.document.display_name();
+            let name = self
+                .document
+                .get(id)
+                .map(Document::display_name)
+                .unwrap_or_else(|| "Documento".to_owned());
 
             Task::perform(confirm_unsaved(name), move |decision| {
                 Message::UnsavedDecision { action, decision }
@@ -539,21 +782,262 @@ impl App {
 
     fn execute_destructive_action(&mut self, action: DestructiveFileAction) -> Task<Message> {
         match action {
-            DestructiveFileAction::New => {
-                let previous_config = self.compiler_config();
-                self.document = Document::new();
-                self.file_status = Some("Novo documento criado".to_owned());
-                self.document_replaced(previous_config);
+            DestructiveFileAction::CloseDocument(id) => {
+                self.close_document(id);
                 Task::none()
             }
-            DestructiveFileAction::Open => {
-                self.file_busy = true;
-                self.file_status = Some("Aguardando a escolha de um arquivo...".to_owned());
-                let directory = self.document.directory(&self.workspace_root);
-
-                Task::perform(open_document(directory), Message::OpenFinished)
+            DestructiveFileAction::Close(id) => {
+                self.discarded_on_close.clear();
+                window::close(id)
             }
-            DestructiveFileAction::Close(id) => window::close(id),
+        }
+    }
+
+    fn discard_destructive_action(&mut self, action: DestructiveFileAction) -> Task<Message> {
+        match action {
+            DestructiveFileAction::CloseDocument(id) => {
+                self.close_document(id);
+                Task::none()
+            }
+            DestructiveFileAction::Close(window) => {
+                self.discarded_on_close.insert(self.document.active_id());
+                self.request_destructive_action(DestructiveFileAction::Close(window))
+            }
+        }
+    }
+
+    fn activate_document(&mut self, id: DocumentId) -> bool {
+        if self.document.active_id() == id || self.document.get(id).is_none() {
+            return false;
+        }
+
+        let previous_config = self.compiler_config();
+        self.document.clear_search_matches();
+        self.document.activate(id);
+        self.document_replaced(previous_config);
+        true
+    }
+
+    fn new_document(&mut self) {
+        let previous_config = self.compiler_config();
+        self.document.clear_search_matches();
+        self.document.add(Document::new());
+        self.file_status = Some("Novo documento criado".to_owned());
+        self.document_replaced(previous_config);
+    }
+
+    fn close_document(&mut self, id: DocumentId) {
+        let Some(document) = self.document.get(id) else {
+            return;
+        };
+        let name = document.display_name();
+        let was_active = self.document.active_id() == id;
+        let previous_config = was_active.then(|| self.compiler_config());
+
+        self.document.remove(id);
+        self.discarded_on_close.remove(&id);
+        self.file_status = Some(format!("Aba fechada: {name}"));
+
+        if let Some(previous_config) = previous_config {
+            self.document_replaced(previous_config);
+        }
+    }
+
+    fn start_open_document(&mut self) -> Task<Message> {
+        if self.file_busy {
+            return Task::none();
+        }
+
+        self.file_busy = true;
+        self.file_status = Some("Aguardando a escolha de um arquivo...".to_owned());
+        let directory = self.document.directory(&self.workspace_root);
+
+        Task::perform(open_document(directory), Message::OpenFinished)
+    }
+
+    fn start_open_project(&mut self) -> Task<Message> {
+        if self.file_busy {
+            return Task::none();
+        }
+
+        self.file_busy = true;
+        self.file_status = Some("Aguardando a escolha de uma pasta...".to_owned());
+        let directory = self.workspace_root.clone();
+
+        Task::perform(
+            choose_project_folder(directory),
+            Message::ProjectFolderSelected,
+        )
+    }
+
+    fn handle_project_folder_selected(&mut self, path: Option<PathBuf>) -> Task<Message> {
+        self.file_busy = false;
+
+        let Some(path) = path else {
+            self.file_status = Some("A abertura da pasta foi cancelada".to_owned());
+            return Task::none();
+        };
+
+        self.workspace_root = path;
+        self.project_files.clear();
+        self.project_scan_busy = false;
+        self.file_status = Some(format!("Projeto aberto: {}", self.workspace_root.display()));
+        self.refresh_project_files()
+    }
+
+    fn open_project_file(&mut self, path: PathBuf) -> Task<Message> {
+        if self.file_busy {
+            return Task::none();
+        }
+
+        if let Some(id) = self.document.find_path(&path) {
+            self.activate_document(id);
+            self.file_status = Some(format!("Aba ativada: {}", path.display()));
+            return Task::none();
+        }
+
+        self.file_busy = true;
+        self.file_status = Some(format!("Abrindo {}...", path.display()));
+        Task::perform(read_document(path), Message::OpenFinished)
+    }
+
+    fn refresh_project_files(&mut self) -> Task<Message> {
+        if self.project_scan_busy {
+            return Task::none();
+        }
+
+        self.project_scan_busy = true;
+        Task::perform(
+            scan_project(self.workspace_root.clone()),
+            Message::ProjectScanned,
+        )
+    }
+
+    fn check_external_files(&mut self) -> Task<Message> {
+        if self.file_busy || self.external_check_busy {
+            return Task::none();
+        }
+
+        let files = self
+            .document
+            .iter()
+            .filter_map(|(id, document)| {
+                document
+                    .path()
+                    .map(|path| (id, document.storage_revision(), path.to_path_buf()))
+            })
+            .collect::<Vec<_>>();
+
+        if files.is_empty() {
+            return Task::none();
+        }
+
+        self.external_check_busy = true;
+        Task::perform(check_external_files(files), Message::ExternalFilesChecked)
+    }
+
+    fn handle_external_files(&mut self, results: Vec<ExternalFileResult>) -> Task<Message> {
+        self.external_check_busy = false;
+
+        // A leitura pode ter começado antes de um salvamento ou diálogo. Nesse
+        // caso, o snapshot do disco já não é confiável e será consultado de novo.
+        if self.file_busy {
+            return Task::none();
+        }
+
+        let active = self.document.active_id();
+        let previous_config = self.compiler_config();
+        let mut active_reloaded = false;
+        let mut imported_file_reloaded = false;
+        let mut status = None;
+
+        for result in results {
+            match result {
+                ExternalFileResult::Source {
+                    document_id,
+                    storage_revision,
+                    source,
+                } => {
+                    let Some(document) = self.document.get_mut(document_id) else {
+                        continue;
+                    };
+                    if document.storage_revision() != storage_revision {
+                        continue;
+                    }
+
+                    match document.observe_disk_source(source) {
+                        ExternalUpdate::Unchanged => {}
+                        ExternalUpdate::Reloaded => {
+                            active_reloaded |= document_id == active;
+                            imported_file_reloaded |= document_id != active;
+                            status = Some(format!(
+                                "Recarregado após alteração externa: {}",
+                                document.display_name()
+                            ));
+                        }
+                        ExternalUpdate::Conflict => {
+                            status = Some(format!(
+                                "Conflito com alteração externa: {}",
+                                document.display_name()
+                            ));
+                        }
+                    }
+                }
+                ExternalFileResult::Deleted {
+                    document_id,
+                    storage_revision,
+                } => {
+                    let Some(document) = self.document.get_mut(document_id) else {
+                        continue;
+                    };
+                    if document.storage_revision() != storage_revision {
+                        continue;
+                    }
+
+                    if document.observe_deleted_file() == ExternalUpdate::Conflict {
+                        status = Some(format!(
+                            "Arquivo removido externamente: {}",
+                            document.display_name()
+                        ));
+                    }
+                }
+                ExternalFileResult::Failed {
+                    document_id,
+                    storage_revision,
+                    error,
+                } => {
+                    if self
+                        .document
+                        .get(document_id)
+                        .is_some_and(|document| document.storage_revision() == storage_revision)
+                    {
+                        eprintln!("erro ao verificar alteração externa: {error}");
+                        status = Some(format!("Erro ao verificar arquivo: {error}"));
+                    }
+                }
+            }
+        }
+
+        if let Some(status) = status {
+            self.file_status = Some(status);
+        }
+
+        if active_reloaded {
+            self.document_replaced(previous_config);
+        } else if imported_file_reloaded {
+            self.schedule_compile(Duration::ZERO, true);
+            self.dispatch_compile(Instant::now());
+        }
+
+        Task::none()
+    }
+
+    fn reload_external_change(&mut self) {
+        let previous_config = self.compiler_config();
+
+        if self.document.reload_external_change() {
+            self.file_status = Some("A versão externa foi recarregada".to_owned());
+            self.document_replaced(previous_config);
         }
     }
 
@@ -565,18 +1049,22 @@ impl App {
         self.file_busy = true;
         self.file_status = Some("Salvando documento...".to_owned());
 
+        let document_id = self.document.active_id();
         let (_, source) = self.document.snapshot();
 
         if !save_as && let Some(path) = self.document.path() {
             let path = path.to_path_buf();
-            return Task::perform(write_document(path, source), Message::SaveFinished);
+            return Task::perform(
+                write_document(document_id, path, source),
+                Message::SaveFinished,
+            );
         }
 
         let directory = self.document.directory(&self.workspace_root);
         let file_name = self.document.display_name();
 
         Task::perform(
-            save_document_as(directory, file_name, source),
+            save_document_as(document_id, directory, file_name, source),
             Message::SaveFinished,
         )
     }
@@ -664,10 +1152,16 @@ impl App {
                 self.file_status = Some(format!("Erro ao abrir: {error}"));
             }
             OpenOutcome::Loaded { path, source } => {
-                let previous_config = self.compiler_config();
-                self.document = Document::opened(path.clone(), source);
-                self.file_status = Some(format!("Aberto: {}", path.display()));
-                self.document_replaced(previous_config);
+                if let Some(id) = self.document.find_path(&path) {
+                    self.activate_document(id);
+                    self.file_status = Some(format!("Aba ativada: {}", path.display()));
+                } else {
+                    let previous_config = self.compiler_config();
+                    self.document.clear_search_matches();
+                    self.document.add(Document::opened(path.clone(), source));
+                    self.file_status = Some(format!("Aberto: {}", path.display()));
+                    self.document_replaced(previous_config);
+                }
             }
         }
 
@@ -678,22 +1172,55 @@ impl App {
         self.file_busy = false;
 
         match outcome {
-            SaveOutcome::Cancelled => {
+            SaveOutcome::Cancelled { document_id } => {
+                if matches!(
+                    self.pending_after_save,
+                    Some(DestructiveFileAction::Close(_))
+                ) {
+                    self.discarded_on_close.clear();
+                }
                 self.pending_after_save = None;
-                self.file_status = Some("O salvamento foi cancelado".to_owned());
+                let name = self
+                    .document
+                    .get(document_id)
+                    .map(Document::display_name)
+                    .unwrap_or_else(|| "documento".to_owned());
+                self.file_status = Some(format!("O salvamento de {name} foi cancelado"));
                 Task::none()
             }
-            SaveOutcome::Failed(error) => {
+            SaveOutcome::Failed { document_id, error } => {
+                if matches!(
+                    self.pending_after_save,
+                    Some(DestructiveFileAction::Close(_))
+                ) {
+                    self.discarded_on_close.clear();
+                }
                 self.pending_after_save = None;
                 eprintln!("erro ao salvar documento: {error}");
-                self.file_status = Some(format!("Erro ao salvar: {error}"));
+                let name = self
+                    .document
+                    .get(document_id)
+                    .map(Document::display_name)
+                    .unwrap_or_else(|| "documento".to_owned());
+                self.file_status = Some(format!("Erro ao salvar {name}: {error}"));
                 Task::none()
             }
-            SaveOutcome::Saved { path, source } => {
-                let previous_config = self.compiler_config();
-                self.document.mark_saved(path.clone(), source);
+            SaveOutcome::Saved {
+                document_id,
+                path,
+                source,
+            } => {
+                let is_active = self.document.active_id() == document_id;
+                let previous_config = is_active.then(|| self.compiler_config());
+                let Some(document) = self.document.get_mut(document_id) else {
+                    self.pending_after_save = None;
+                    return Task::none();
+                };
 
-                self.file_status = Some(if self.document.is_dirty() {
+                document.mark_saved(path.clone(), source);
+                let still_dirty = document.is_dirty();
+
+                self.file_status = Some(if still_dirty {
                     format!(
                         "Versão salva em {}; há alterações mais recentes",
                         path.display()
@@ -702,7 +1229,9 @@ impl App {
                     format!("Salvo em {}", path.display())
                 });
 
-                self.refresh_compiler_config(previous_config);
+                if let Some(previous_config) = previous_config {
+                    self.refresh_compiler_config(previous_config);
+                }
 
                 if let Some(action) = self.pending_after_save.take() {
                     self.request_destructive_action(action)
@@ -1090,13 +1619,99 @@ async fn open_document(directory: PathBuf) -> OpenOutcome {
 
     let path = file.path().to_path_buf();
 
+    read_document(path).await
+}
+
+async fn read_document(path: PathBuf) -> OpenOutcome {
     match tokio::fs::read_to_string(&path).await {
         Ok(source) => OpenOutcome::Loaded { path, source },
         Err(error) => OpenOutcome::Failed(format!("{}: {error}", path.display())),
     }
 }
 
-async fn save_document_as(directory: PathBuf, file_name: String, source: String) -> SaveOutcome {
+async fn choose_project_folder(directory: PathBuf) -> Option<PathBuf> {
+    AsyncFileDialog::new()
+        .set_directory(directory)
+        .set_title("Abrir pasta de projeto")
+        .pick_folder()
+        .await
+        .map(|folder| folder.path().to_path_buf())
+}
+
+async fn scan_project(root: PathBuf) -> ProjectScanOutcome {
+    let scan_root = root.clone();
+    let files = tokio::task::spawn_blocking(move || scan_project_files(&scan_root))
+        .await
+        .map_err(|error| format!("tarefa de varredura interrompida: {error}"))
+        .and_then(|files| files);
+
+    ProjectScanOutcome { root, files }
+}
+
+fn scan_project_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 || !entry.file_type().is_dir() {
+                return true;
+            }
+
+            let name = entry.file_name().to_string_lossy();
+            name != ".git" && name != "target" && !name.starts_with('.')
+        })
+        .filter_map(|entry| match entry {
+            Ok(entry)
+                if entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "typ") =>
+            {
+                Some(Ok(entry.into_path()))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error.to_string())),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    files.sort();
+    Ok(files)
+}
+
+async fn check_external_files(files: Vec<(DocumentId, u64, PathBuf)>) -> Vec<ExternalFileResult> {
+    let mut results = Vec::with_capacity(files.len());
+
+    for (document_id, storage_revision, path) in files {
+        match tokio::fs::read_to_string(&path).await {
+            Ok(source) => results.push(ExternalFileResult::Source {
+                document_id,
+                storage_revision,
+                source,
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                results.push(ExternalFileResult::Deleted {
+                    document_id,
+                    storage_revision,
+                });
+            }
+            Err(error) => results.push(ExternalFileResult::Failed {
+                document_id,
+                storage_revision,
+                error: format!("{}: {error}", path.display()),
+            }),
+        }
+    }
+
+    results
+}
+
+async fn save_document_as(
+    document_id: DocumentId,
+    directory: PathBuf,
+    file_name: String,
+    source: String,
+) -> SaveOutcome {
     let Some(file) = AsyncFileDialog::new()
         .add_filter("Documento Typst", &["typ"])
         .set_directory(directory)
@@ -1105,10 +1720,10 @@ async fn save_document_as(directory: PathBuf, file_name: String, source: String)
         .save_file()
         .await
     else {
-        return SaveOutcome::Cancelled;
+        return SaveOutcome::Cancelled { document_id };
     };
 
-    write_document(with_typst_extension(file.path()), source).await
+    write_document(document_id, with_typst_extension(file.path()), source).await
 }
 
 async fn choose_pdf_path(directory: PathBuf, file_name: String) -> PdfPathOutcome {
@@ -1126,7 +1741,7 @@ async fn choose_pdf_path(directory: PathBuf, file_name: String) -> PdfPathOutcom
     PdfPathOutcome::Selected(with_pdf_extension(file.path()))
 }
 
-async fn write_document(path: PathBuf, source: String) -> SaveOutcome {
+async fn write_document(document_id: DocumentId, path: PathBuf, source: String) -> SaveOutcome {
     let destination = path.clone();
     let result = tokio::task::spawn_blocking(move || {
         atomic_write_file(&destination, source.as_bytes())?;
@@ -1135,12 +1750,22 @@ async fn write_document(path: PathBuf, source: String) -> SaveOutcome {
     .await;
 
     match result {
-        Ok(Ok(source)) => SaveOutcome::Saved { path, source },
-        Ok(Err(error)) => SaveOutcome::Failed(format!("{}: {error}", path.display())),
-        Err(error) => SaveOutcome::Failed(format!(
-            "{}: tarefa de salvamento interrompida: {error}",
-            path.display()
-        )),
+        Ok(Ok(source)) => SaveOutcome::Saved {
+            document_id,
+            path,
+            source,
+        },
+        Ok(Err(error)) => SaveOutcome::Failed {
+            document_id,
+            error: format!("{}: {error}", path.display()),
+        },
+        Err(error) => SaveOutcome::Failed {
+            document_id,
+            error: format!(
+                "{}: tarefa de salvamento interrompida: {error}",
+                path.display()
+            ),
+        },
     }
 }
 
@@ -1335,18 +1960,16 @@ mod tests {
     }
 
     #[test]
-    fn discarding_before_new_replaces_the_editor_pane() {
-        let mut app = App::boot();
+    fn new_document_opens_another_tab_and_replaces_the_editor_pane() {
+        let mut app = App::new();
+        let first = app.document.active_id();
         let previous_editor = app
             .panes
             .iter()
             .find_map(|(id, pane)| matches!(pane, Pane::Editor).then_some(*id))
             .expect("the editor pane exists");
 
-        let _ = app.update(Message::UnsavedDecision {
-            action: DestructiveFileAction::New,
-            decision: UnsavedDecision::Discard,
-        });
+        app.new_document();
 
         let (_, source) = app.document.snapshot();
         let current_editor = app
@@ -1356,13 +1979,16 @@ mod tests {
             .expect("the replacement editor pane exists");
 
         assert!(source.is_empty());
+        assert_ne!(app.document.active_id(), first);
+        assert!(app.document.get(first).is_some_and(Document::is_dirty));
+        assert_eq!(app.document.iter().count(), 2);
         assert_ne!(current_editor, previous_editor);
         assert_eq!(app.panes.len(), 2);
     }
 
     #[test]
     fn closing_a_dirty_document_starts_confirmation() {
-        let mut app = App::boot();
+        let mut app = App::new();
 
         let _ = app.update(Message::CloseRequested(window::Id::unique()));
 
@@ -1373,7 +1999,7 @@ mod tests {
 
     #[test]
     fn saving_before_close_keeps_the_close_action_pending() {
-        let mut app = App::boot();
+        let mut app = App::new();
         let id = window::Id::unique();
         app.file_busy = true;
 
@@ -1387,6 +2013,76 @@ mod tests {
             Some(DestructiveFileAction::Close(pending_id)) if pending_id == id
         ));
         assert!(app.file_busy);
+    }
+
+    #[test]
+    fn discarding_a_dirty_tab_closes_only_that_tab() {
+        let mut app = App::new();
+        let first = app.document.active_id();
+        app.new_document();
+        let second = app.document.active_id();
+        app.document.perform(Action::Insert("rascunho".to_owned()));
+        app.file_busy = true;
+
+        let _ = app.update(Message::UnsavedDecision {
+            action: DestructiveFileAction::CloseDocument(second),
+            decision: UnsavedDecision::Discard,
+        });
+
+        assert_eq!(app.document.iter().count(), 1);
+        assert_eq!(app.document.active_id(), first);
+        assert!(app.document.get(second).is_none());
+    }
+
+    #[test]
+    fn window_close_walks_through_every_dirty_tab() {
+        let mut app = App::new();
+        let first = app.document.active_id();
+        app.new_document();
+        let second = app.document.active_id();
+        app.document.perform(Action::Insert("segundo".to_owned()));
+        let window = window::Id::unique();
+        app.file_busy = true;
+
+        let _ = app.update(Message::UnsavedDecision {
+            action: DestructiveFileAction::Close(window),
+            decision: UnsavedDecision::Discard,
+        });
+
+        assert!(app.discarded_on_close.contains(&second));
+        assert_eq!(app.document.active_id(), first);
+        assert!(app.file_busy);
+
+        let _ = app.update(Message::UnsavedDecision {
+            action: DestructiveFileAction::Close(window),
+            decision: UnsavedDecision::Discard,
+        });
+
+        assert!(app.discarded_on_close.is_empty());
+        assert!(!app.file_busy);
+    }
+
+    #[test]
+    fn file_operation_blocks_tab_changes_and_preserves_a_pending_close() {
+        let mut app = App::new();
+        let first = app.document.active_id();
+        app.new_document();
+        let second = app.document.active_id();
+        assert!(app.activate_document(first));
+        let window = window::Id::unique();
+        app.pending_after_save = Some(DestructiveFileAction::Close(window));
+        app.file_busy = true;
+
+        let _ = app.update(Message::ActivateDocument(second));
+        let _ = app.update(Message::NewDocument);
+        let _ = app.update(Message::SaveDocument);
+
+        assert_eq!(app.document.active_id(), first);
+        assert_eq!(app.document.iter().count(), 2);
+        assert!(matches!(
+            app.pending_after_save,
+            Some(DestructiveFileAction::Close(id)) if id == window
+        ));
     }
 
     #[test]
@@ -1440,8 +2136,9 @@ mod tests {
 
     #[test]
     fn replace_all_is_a_single_undoable_edit() {
-        let mut app = App::boot();
-        app.document = Document::opened(PathBuf::from("document.typ"), "cat and cat".to_owned());
+        let mut app = App::new();
+        *app.document.active_mut() =
+            Document::opened(PathBuf::from("document.typ"), "cat and cat".to_owned());
         app.search.visible = true;
         app.search.query = "cat".to_owned();
         app.search.replacement = "dog".to_owned();
@@ -1456,8 +2153,9 @@ mod tests {
 
     #[test]
     fn replace_current_advances_to_the_next_match() {
-        let mut app = App::boot();
-        app.document = Document::opened(PathBuf::from("document.typ"), "cat cat".to_owned());
+        let mut app = App::new();
+        *app.document.active_mut() =
+            Document::opened(PathBuf::from("document.typ"), "cat cat".to_owned());
         app.search.visible = true;
         app.search.query = "cat".to_owned();
         app.search.replacement = "dog".to_owned();
@@ -1468,6 +2166,64 @@ mod tests {
         assert_eq!(app.document.snapshot().1, "dog cat");
         assert_eq!(app.document.current_search_match(), Some(0));
         assert_eq!(app.document.search_matches(), vec![4..7]);
+    }
+
+    #[test]
+    fn project_scan_lists_typst_files_and_ignores_build_and_hidden_directories() {
+        let directory = tempfile::tempdir().expect("a temporary directory can be created");
+        let root = directory.path();
+        fs::create_dir_all(root.join("chapters")).expect("the chapter directory can be created");
+        fs::create_dir_all(root.join("target")).expect("the target directory can be created");
+        fs::create_dir_all(root.join(".hidden")).expect("the hidden directory can be created");
+        fs::write(root.join("main.typ"), "main").expect("the main file can be written");
+        fs::write(root.join("chapters/one.typ"), "one").expect("the chapter can be written");
+        fs::write(root.join("target/generated.typ"), "generated")
+            .expect("the generated file can be written");
+        fs::write(root.join(".hidden/private.typ"), "private")
+            .expect("the hidden file can be written");
+        fs::write(root.join("notes.md"), "notes").expect("the note can be written");
+
+        let files = scan_project_files(root).expect("the project can be scanned");
+
+        assert_eq!(
+            files,
+            vec![root.join("chapters/one.typ"), root.join("main.typ")]
+        );
+    }
+
+    #[test]
+    fn stale_external_read_cannot_undo_a_completed_save() {
+        let mut app = App::new();
+        let document_id = app.document.active_id();
+        *app.document.active_mut() =
+            Document::opened(PathBuf::from("document.typ"), "novo".to_owned());
+        let stale_revision = app.document.storage_revision();
+        app.document
+            .mark_saved(PathBuf::from("document.typ"), "novo".to_owned());
+
+        let _ = app.handle_external_files(vec![ExternalFileResult::Source {
+            document_id,
+            storage_revision: stale_revision,
+            source: "antigo".to_owned(),
+        }]);
+
+        assert_eq!(app.document.snapshot().1, "novo");
+        assert!(!app.document.is_dirty());
+    }
+
+    #[test]
+    fn stale_project_scan_does_not_replace_the_current_tree() {
+        let mut app = App::new();
+        app.workspace_root = PathBuf::from("/projeto/novo");
+        app.project_scan_busy = true;
+
+        let _ = app.update(Message::ProjectScanned(ProjectScanOutcome {
+            root: PathBuf::from("/projeto/antigo"),
+            files: Ok(vec![PathBuf::from("/projeto/antigo/main.typ")]),
+        }));
+
+        assert!(app.project_files.is_empty());
+        assert!(app.project_scan_busy);
     }
 
     #[test]
