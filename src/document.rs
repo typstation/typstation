@@ -76,6 +76,22 @@ impl Document {
         }
     }
 
+    /// Restores the durable parts of a document from a previous session.
+    pub fn restored(path: Option<PathBuf>, text: String, saved_text: Option<String>) -> Self {
+        let dirty = saved_text
+            .as_deref()
+            .is_none_or(|saved| saved != text.as_str());
+
+        Self {
+            path,
+            content: Content::with_text(&text),
+            saved_text,
+            dirty,
+            storage_revision: 0,
+            external_change: None,
+        }
+    }
+
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
@@ -172,6 +188,10 @@ impl Document {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    pub fn saved_text(&self) -> Option<&str> {
+        self.saved_text.as_deref()
     }
 
     pub fn storage_revision(&self) -> u64 {
@@ -281,6 +301,29 @@ impl Documents {
             }],
             active: 0,
             next_id: 1,
+        }
+    }
+
+    pub fn restored(mut documents: Vec<Document>, active: usize) -> Self {
+        if documents.is_empty() {
+            documents.push(Document::new());
+        }
+
+        let entries = documents
+            .into_iter()
+            .enumerate()
+            .map(|(index, document)| DocumentEntry {
+                id: DocumentId(index as u64),
+                document,
+            })
+            .collect::<Vec<_>>();
+        let active = active.min(entries.len().saturating_sub(1));
+        let next_id = entries.len() as u64;
+
+        Self {
+            entries,
+            active,
+            next_id,
         }
     }
 
@@ -465,5 +508,23 @@ mod tests {
         assert_eq!(documents.iter().count(), 1);
         assert_eq!(documents.active_id(), second);
         assert_eq!(documents.snapshot().1, "segundo");
+    }
+
+    #[test]
+    fn restored_document_rebuilds_its_dirty_state() {
+        let clean = Document::restored(
+            Some(PathBuf::from("documento.typ")),
+            "salvo".to_owned(),
+            Some("salvo".to_owned()),
+        );
+        let dirty = Document::restored(
+            Some(PathBuf::from("documento.typ")),
+            "rascunho".to_owned(),
+            Some("salvo".to_owned()),
+        );
+
+        assert!(!clean.is_dirty());
+        assert!(dirty.is_dirty());
+        assert_eq!(dirty.saved_text(), Some("salvo"));
     }
 }

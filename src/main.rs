@@ -2,6 +2,7 @@ mod compiler;
 mod document;
 mod formatting;
 mod search;
+mod session;
 
 use std::{
     collections::HashSet,
@@ -28,6 +29,8 @@ use typst_iced_editor::{Action, code_editor};
 
 const DEBOUNCE: Duration = Duration::from_millis(250);
 const DEBOUNCE_TICK: Duration = Duration::from_millis(50);
+const SESSION_DEBOUNCE: Duration = Duration::from_millis(750);
+const SESSION_TICK: Duration = Duration::from_millis(200);
 const DEMO: &str = include_str!("demo.typ");
 
 fn main() -> iced::Result {
@@ -60,6 +63,7 @@ struct App {
     project_scan_busy: bool,
     external_check_busy: bool,
     discarded_on_close: HashSet<DocumentId>,
+    session: SessionTracker,
     file_status: Option<String>,
 }
 
@@ -100,6 +104,8 @@ enum Message {
     ExternalFilesChecked(Vec<ExternalFileResult>),
     ReloadExternal,
     KeepLocalAfterExternal,
+    SessionTick(Instant),
+    SessionWriteFinished(SessionWriteOutcome),
     SaveDocument,
     SaveDocumentAs,
     ExportPdf,
@@ -114,6 +120,7 @@ enum Message {
     SaveFinished(SaveOutcome),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Editor,
     Preview,
@@ -130,6 +137,27 @@ struct PendingPdfExport {
     request_id: u64,
     revision: u64,
     path: PathBuf,
+}
+
+#[derive(Debug)]
+struct SessionTracker {
+    path: Option<PathBuf>,
+    revision: u64,
+    deadline: Option<Instant>,
+    write_busy: bool,
+    close_after_write: Option<window::Id>,
+}
+
+impl SessionTracker {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            revision: 0,
+            deadline: None,
+            write_busy: false,
+            close_after_write: None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -210,6 +238,12 @@ struct ProjectScanOutcome {
 }
 
 #[derive(Debug, Clone)]
+struct SessionWriteOutcome {
+    revision: u64,
+    result: Result<(), String>,
+}
+
+#[derive(Debug, Clone)]
 enum PdfPathOutcome {
     Cancelled,
     Selected(PathBuf),
@@ -223,27 +257,75 @@ enum PdfWriteOutcome {
 
 impl App {
     fn boot() -> (Self, Task<Message>) {
-        let mut app = Self::new();
-        app.project_scan_busy = true;
-        let root = app.workspace_root.clone();
+        let session_path = session::default_path();
+        let stored = match session_path.as_deref() {
+            Some(path) => session::load(path),
+            None => Ok(None),
+        };
+        let mut app = match stored {
+            Ok(Some(stored)) => Self::restore(stored, session_path),
+            Ok(None) => Self::fresh(session_path),
+            Err(error) => {
+                eprintln!("erro ao restaurar sessão: {error}");
+                let mut app = Self::fresh(session_path);
+                app.file_status = Some(format!("Não foi possível restaurar a sessão: {error}"));
+                app
+            }
+        };
+        let project_scan = app.refresh_project_files();
+        let external_check = app.check_external_files();
 
-        (
-            app,
-            Task::perform(scan_project(root), Message::ProjectScanned),
-        )
+        (app, Task::batch([project_scan, external_check]))
     }
 
+    #[cfg(test)]
     fn new() -> Self {
+        Self::fresh(None)
+    }
+
+    fn fresh(session_path: Option<PathBuf>) -> Self {
         let workspace_root = std::env::current_dir().unwrap_or_else(|error| {
             eprintln!("erro ao obter diretório atual: {error}");
             PathBuf::from(".")
         });
+        let panes = panes_from_layout(session::PaneLayout::default());
 
-        let (mut panes, editor_pane) = pane_grid::State::new(Pane::Editor);
-        panes.split(pane_grid::Axis::Vertical, editor_pane, Pane::Preview);
+        Self::build(
+            Documents::new(Document::draft(DEMO)),
+            panes,
+            workspace_root,
+            session_path,
+            "O tutorial inicial ainda não foi salvo".to_owned(),
+        )
+    }
 
+    fn restore(stored: session::Session, session_path: Option<PathBuf>) -> Self {
+        let documents = stored
+            .documents
+            .into_iter()
+            .map(|document| Document::restored(document.path, document.text, document.saved_text))
+            .collect();
+        let document = Documents::restored(documents, stored.active_document);
+        let panes = panes_from_layout(stored.pane_layout);
+
+        Self::build(
+            document,
+            panes,
+            stored.workspace_root,
+            session_path,
+            "Sessão anterior restaurada".to_owned(),
+        )
+    }
+
+    fn build(
+        document: Documents,
+        panes: pane_grid::State<Pane>,
+        workspace_root: PathBuf,
+        session_path: Option<PathBuf>,
+        file_status: String,
+    ) -> Self {
         Self {
-            document: Documents::new(Document::draft(DEMO)),
+            document,
             panes,
             workspace_root,
             compiler: None,
@@ -264,7 +346,8 @@ impl App {
             project_scan_busy: false,
             external_check_busy: false,
             discarded_on_close: HashSet::new(),
-            file_status: Some("O tutorial inicial ainda não foi salvo".to_owned()),
+            session: SessionTracker::new(session_path),
+            file_status: Some(file_status),
         }
     }
 
@@ -288,6 +371,7 @@ impl App {
                 if changed {
                     self.document.clear_diagnostics();
                     self.file_status = None;
+                    self.mark_session_changed();
                     self.schedule_compile(DEBOUNCE, false);
                     self.refresh_search_matches(None, false);
                 }
@@ -383,12 +467,14 @@ impl App {
             Message::PaneDragged(event) => {
                 if let pane_grid::DragEvent::Dropped { pane, target } = event {
                     self.panes.drop(pane, target);
+                    self.mark_session_changed();
                 }
 
                 Task::none()
             }
             Message::PaneResized(event) => {
                 self.panes.resize(event.split, event.ratio);
+                self.mark_session_changed();
                 Task::none()
             }
             Message::CompileNow => {
@@ -445,9 +531,12 @@ impl App {
             Message::KeepLocalAfterExternal => {
                 if self.document.keep_local_after_external_change() {
                     self.file_status = Some("A versão local foi mantida".to_owned());
+                    self.mark_session_changed();
                 }
                 Task::none()
             }
+            Message::SessionTick(now) => self.dispatch_session_save(now),
+            Message::SessionWriteFinished(outcome) => self.handle_session_write_finished(outcome),
             Message::SaveDocument => {
                 if self.file_busy {
                     return Task::none();
@@ -508,25 +597,22 @@ impl App {
         let project_refresh = time::every(Duration::from_secs(5)).map(Message::ProjectRefreshTick);
         let external_refresh =
             time::every(Duration::from_secs(2)).map(Message::ExternalRefreshTick);
+        let mut subscriptions = vec![
+            compiler,
+            close_requests,
+            shortcuts,
+            project_refresh,
+            external_refresh,
+        ];
 
         if self.pending_compile.is_some() {
-            Subscription::batch([
-                compiler,
-                time::every(DEBOUNCE_TICK).map(Message::DebounceTick),
-                close_requests,
-                shortcuts,
-                project_refresh,
-                external_refresh,
-            ])
-        } else {
-            Subscription::batch([
-                compiler,
-                close_requests,
-                shortcuts,
-                project_refresh,
-                external_refresh,
-            ])
+            subscriptions.push(time::every(DEBOUNCE_TICK).map(Message::DebounceTick));
         }
+        if self.session.deadline.is_some() {
+            subscriptions.push(time::every(SESSION_TICK).map(Message::SessionTick));
+        }
+
+        Subscription::batch(subscriptions)
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -786,10 +872,7 @@ impl App {
                 self.close_document(id);
                 Task::none()
             }
-            DestructiveFileAction::Close(id) => {
-                self.discarded_on_close.clear();
-                window::close(id)
-            }
+            DestructiveFileAction::Close(id) => self.close_after_session_save(id),
         }
     }
 
@@ -840,6 +923,8 @@ impl App {
 
         if let Some(previous_config) = previous_config {
             self.document_replaced(previous_config);
+        } else {
+            self.mark_session_changed();
         }
     }
 
@@ -882,6 +967,7 @@ impl App {
         self.project_files.clear();
         self.project_scan_busy = false;
         self.file_status = Some(format!("Projeto aberto: {}", self.workspace_root.display()));
+        self.mark_session_changed();
         self.refresh_project_files()
     }
 
@@ -1025,6 +1111,7 @@ impl App {
         if active_reloaded {
             self.document_replaced(previous_config);
         } else if imported_file_reloaded {
+            self.mark_session_changed();
             self.schedule_compile(Duration::ZERO, true);
             self.dispatch_compile(Instant::now());
         }
@@ -1038,6 +1125,153 @@ impl App {
         if self.document.reload_external_change() {
             self.file_status = Some("A versão externa foi recarregada".to_owned());
             self.document_replaced(previous_config);
+        }
+    }
+
+    fn mark_session_changed(&mut self) {
+        if self.session.path.is_none() {
+            return;
+        }
+
+        self.session.revision += 1;
+        self.session.deadline = Some(if self.session.close_after_write.is_some() {
+            Instant::now()
+        } else {
+            Instant::now() + SESSION_DEBOUNCE
+        });
+    }
+
+    fn close_after_session_save(&mut self, window: window::Id) -> Task<Message> {
+        if self.session.path.is_none() {
+            self.discarded_on_close.clear();
+            return window::close(window);
+        }
+
+        self.file_busy = true;
+        self.session.close_after_write = Some(window);
+        self.session.revision += 1;
+        self.session.deadline = Some(Instant::now());
+        self.dispatch_session_save(Instant::now())
+    }
+
+    fn dispatch_session_save(&mut self, now: Instant) -> Task<Message> {
+        if self.session.write_busy {
+            return Task::none();
+        }
+
+        let Some(deadline) = self.session.deadline else {
+            return Task::none();
+        };
+        if now < deadline {
+            return Task::none();
+        }
+
+        let Some(path) = self.session.path.clone() else {
+            self.session.deadline = None;
+            return Task::none();
+        };
+        let revision = self.session.revision;
+        let stored = self.session_snapshot(self.session.close_after_write.is_some());
+
+        self.session.deadline = None;
+        self.session.write_busy = true;
+
+        Task::perform(session::save(path, stored), move |result| {
+            Message::SessionWriteFinished(SessionWriteOutcome { revision, result })
+        })
+    }
+
+    fn handle_session_write_finished(&mut self, outcome: SessionWriteOutcome) -> Task<Message> {
+        self.session.write_busy = false;
+
+        if let Err(error) = outcome.result {
+            eprintln!("erro ao salvar sessão: {error}");
+            self.file_status = Some(format!("Erro ao salvar sessão: {error}"));
+
+            if let Some(window) = self.session.close_after_write.take() {
+                self.file_busy = false;
+                self.discarded_on_close.clear();
+                return window::close(window);
+            }
+
+            return Task::none();
+        }
+
+        if let Some(window) = self.session.close_after_write {
+            if outcome.revision == self.session.revision {
+                self.session.close_after_write = None;
+                self.file_busy = false;
+                self.discarded_on_close.clear();
+                return window::close(window);
+            }
+
+            self.session.deadline = Some(Instant::now());
+            return self.dispatch_session_save(Instant::now());
+        }
+
+        self.dispatch_session_save(Instant::now())
+    }
+
+    fn session_snapshot(&self, closing: bool) -> session::Session {
+        let active = self.document.active_id();
+        let mut active_document = None;
+        let mut documents = Vec::new();
+
+        for (id, document) in self.document.iter() {
+            let stored = if closing && self.discarded_on_close.contains(&id) {
+                match (document.path(), document.saved_text()) {
+                    (Some(path), Some(saved_text)) => session::Document {
+                        path: Some(path.to_path_buf()),
+                        text: saved_text.to_owned(),
+                        saved_text: Some(saved_text.to_owned()),
+                    },
+                    _ => continue,
+                }
+            } else {
+                session::Document {
+                    path: document.path().map(Path::to_path_buf),
+                    text: document.snapshot().1,
+                    saved_text: document.saved_text().map(str::to_owned),
+                }
+            };
+
+            if id == active {
+                active_document = Some(documents.len());
+            }
+            documents.push(stored);
+        }
+
+        if documents.is_empty() {
+            documents.push(session::Document::blank());
+        }
+
+        session::Session::new(
+            self.workspace_root.clone(),
+            active_document.unwrap_or(0),
+            documents,
+            self.pane_layout(),
+        )
+    }
+
+    fn pane_layout(&self) -> session::PaneLayout {
+        let pane_grid::Node::Split { axis, ratio, a, .. } = self.panes.layout() else {
+            return session::PaneLayout::default();
+        };
+        let first = first_pane(a)
+            .and_then(|pane| self.panes.get(pane))
+            .copied()
+            .unwrap_or(Pane::Editor);
+
+        session::PaneLayout {
+            axis: match axis {
+                pane_grid::Axis::Horizontal => session::Axis::Horizontal,
+                pane_grid::Axis::Vertical => session::Axis::Vertical,
+            },
+            ratio: *ratio,
+            first: match first {
+                Pane::Editor => session::Pane::Editor,
+                Pane::Preview => session::Pane::Preview,
+            },
         }
     }
 
@@ -1219,6 +1453,7 @@ impl App {
 
                 document.mark_saved(path.clone(), source);
                 let still_dirty = document.is_dirty();
+                self.mark_session_changed();
 
                 self.file_status = Some(if still_dirty {
                     format!(
@@ -1247,6 +1482,7 @@ impl App {
         self.replace_editor_pane_identity();
         self.preview = None;
         self.latest_request_id = None;
+        self.mark_session_changed();
         self.refresh_compiler_config(previous_config);
         self.schedule_compile(Duration::ZERO, true);
         self.dispatch_compile(Instant::now());
@@ -1292,6 +1528,7 @@ impl App {
     fn after_formatting(&mut self) {
         self.document.clear_diagnostics();
         self.file_status = None;
+        self.mark_session_changed();
         self.schedule_compile(Duration::ZERO, false);
         self.dispatch_compile(Instant::now());
         self.refresh_search_matches(None, false);
@@ -1572,6 +1809,35 @@ impl App {
     }
 }
 
+fn panes_from_layout(layout: session::PaneLayout) -> pane_grid::State<Pane> {
+    let first = match layout.first {
+        session::Pane::Editor => Pane::Editor,
+        session::Pane::Preview => Pane::Preview,
+    };
+    let second = match first {
+        Pane::Editor => Pane::Preview,
+        Pane::Preview => Pane::Editor,
+    };
+    let axis = match layout.axis {
+        session::Axis::Horizontal => pane_grid::Axis::Horizontal,
+        session::Axis::Vertical => pane_grid::Axis::Vertical,
+    };
+
+    pane_grid::State::with_configuration(pane_grid::Configuration::Split {
+        axis,
+        ratio: layout.ratio.clamp(0.1, 0.9),
+        a: Box::new(pane_grid::Configuration::Pane(first)),
+        b: Box::new(pane_grid::Configuration::Pane(second)),
+    })
+}
+
+fn first_pane(node: &pane_grid::Node) -> Option<pane_grid::Pane> {
+    match node {
+        pane_grid::Node::Pane(pane) => Some(*pane),
+        pane_grid::Node::Split { a, .. } => first_pane(a),
+    }
+}
+
 fn file_button<'a>(
     label: &'a str,
     message: Message,
@@ -1784,6 +2050,18 @@ async fn write_pdf(path: PathBuf, pdf: Vec<u8>) -> PdfWriteOutcome {
 }
 
 fn atomic_write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    atomic_write_file_with_mode(path, contents, None)
+}
+
+fn atomic_write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    atomic_write_file_with_mode(path, contents, Some(0o600))
+}
+
+fn atomic_write_file_with_mode(
+    path: &Path,
+    contents: &[u8],
+    forced_mode: Option<u32>,
+) -> io::Result<()> {
     let destination = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)?,
         Ok(_) => path.to_path_buf(),
@@ -1814,12 +2092,18 @@ fn atomic_write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        builder.permissions(
-            permissions
-                .clone()
-                .unwrap_or_else(|| fs::Permissions::from_mode(0o666)),
-        );
+        builder.permissions(forced_mode.map_or_else(
+            || {
+                permissions
+                    .clone()
+                    .unwrap_or_else(|| fs::Permissions::from_mode(0o666))
+            },
+            fs::Permissions::from_mode,
+        ));
     }
+
+    #[cfg(not(unix))]
+    let _ = forced_mode;
 
     let mut temporary = builder.tempfile_in(directory)?;
 
@@ -1832,8 +2116,16 @@ fn atomic_write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     temporary.as_file().sync_all()?;
     temporary
         .persist(destination)
-        .map(|_| ())
-        .map_err(|error| error.error)
+        .map_err(|error| error.error)?;
+
+    #[cfg(unix)]
+    if let Some(mode) = forced_mode {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+
+    Ok(())
 }
 
 fn shortcut_subscription() -> Subscription<Message> {
@@ -2224,6 +2516,125 @@ mod tests {
 
         assert!(app.project_files.is_empty());
         assert!(app.project_scan_busy);
+    }
+
+    #[test]
+    fn session_snapshot_restores_tab_order_active_draft_and_pane_layout() {
+        let directory = tempfile::tempdir().expect("a temporary directory can be created");
+        let mut app = App::fresh(Some(directory.path().join("session.json")));
+        *app.document.active_mut() =
+            Document::opened(PathBuf::from("/project/main.typ"), "saved".to_owned());
+        app.document.perform(Action::MoveTo("saved".len()));
+        app.document.perform(Action::Insert(" local".to_owned()));
+        app.new_document();
+        app.document.perform(Action::Insert("draft".to_owned()));
+        app.workspace_root = PathBuf::from("/project");
+        app.panes = panes_from_layout(session::PaneLayout {
+            axis: session::Axis::Horizontal,
+            ratio: 0.7,
+            first: session::Pane::Preview,
+        });
+
+        let stored = app.session_snapshot(false);
+        let restored = App::restore(stored, None);
+        let documents = restored
+            .document
+            .iter()
+            .map(|(_, document)| document.snapshot().1)
+            .collect::<Vec<_>>();
+
+        assert_eq!(documents, vec!["saved local", "draft"]);
+        assert_eq!(restored.document.snapshot().1, "draft");
+        assert_eq!(restored.workspace_root, PathBuf::from("/project"));
+        assert_eq!(
+            restored.pane_layout(),
+            session::PaneLayout {
+                axis: session::Axis::Horizontal,
+                ratio: 0.7,
+                first: session::Pane::Preview,
+            }
+        );
+    }
+
+    #[test]
+    fn final_session_snapshot_removes_discarded_drafts_and_local_edits() {
+        let mut app = App::new();
+        *app.document.active_mut() =
+            Document::opened(PathBuf::from("/project/main.typ"), "saved".to_owned());
+        let saved_document = app.document.active_id();
+        app.document.perform(Action::MoveTo("saved".len()));
+        app.document.perform(Action::Insert(" local".to_owned()));
+        app.new_document();
+        let draft = app.document.active_id();
+        app.document
+            .perform(Action::Insert("discard me".to_owned()));
+        app.discarded_on_close.extend([saved_document, draft]);
+
+        let stored = app.session_snapshot(true);
+
+        assert_eq!(stored.documents.len(), 1);
+        assert_eq!(
+            stored.documents[0].path,
+            Some(PathBuf::from("/project/main.typ"))
+        );
+        assert_eq!(stored.documents[0].text, "saved");
+        assert_eq!(stored.documents[0].saved_text.as_deref(), Some("saved"));
+        assert_eq!(stored.active_document, 0);
+    }
+
+    #[test]
+    fn editing_schedules_a_debounced_session_write() {
+        let directory = tempfile::tempdir().expect("a temporary directory can be created");
+        let mut app = App::fresh(Some(directory.path().join("session.json")));
+
+        let _ = app.update(Message::Editor(Action::Insert("edit".to_owned())));
+
+        assert_eq!(app.session.revision, 1);
+        assert!(app.session.deadline.is_some());
+        assert!(!app.session.write_busy);
+    }
+
+    #[test]
+    fn stale_session_write_is_repeated_before_window_close() {
+        let directory = tempfile::tempdir().expect("a temporary directory can be created");
+        let mut app = App::fresh(Some(directory.path().join("session.json")));
+        let window = window::Id::unique();
+        app.file_busy = true;
+        app.session.revision = 2;
+        app.session.write_busy = true;
+        app.session.close_after_write = Some(window);
+
+        let _ = app.handle_session_write_finished(SessionWriteOutcome {
+            revision: 1,
+            result: Ok(()),
+        });
+
+        assert!(app.session.write_busy);
+        assert_eq!(app.session.close_after_write, Some(window));
+        assert!(app.file_busy);
+    }
+
+    #[test]
+    fn current_session_write_completes_window_close_cleanup() {
+        let directory = tempfile::tempdir().expect("a temporary directory can be created");
+        let mut app = App::fresh(Some(directory.path().join("session.json")));
+        let window = window::Id::unique();
+        let document = app.document.active_id();
+        app.discarded_on_close.insert(document);
+        app.file_busy = true;
+        app.session.revision = 2;
+        app.session.write_busy = true;
+        app.session.close_after_write = Some(window);
+
+        let _ = app.handle_session_write_finished(SessionWriteOutcome {
+            revision: 2,
+            result: Ok(()),
+        });
+
+        assert!(!app.session.write_busy);
+        assert!(app.session.close_after_write.is_none());
+        assert!(app.discarded_on_close.is_empty());
+        assert!(!app.file_busy);
     }
 
     #[test]
