@@ -1,43 +1,50 @@
 mod compiler;
 mod document;
 mod formatting;
+mod project;
 mod search;
 mod session;
+mod settings;
+mod watcher;
 
 use std::{
     collections::HashSet,
     fs,
     io::{self, Write},
+    ops::Range,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use document::{Document, DocumentId, Documents, ExternalChangeKind, ExternalUpdate};
 use iced::{
-    Element,
-    Length::Fill,
+    Alignment, Element,
+    Length::{Fill, FillPortion},
     Subscription, Task, Theme, event, keyboard,
     time::{self, Instant},
     widget::{
-        Id, button, checkbox, column, container, operation, pane_grid, row, scrollable, svg, text,
-        text_input,
+        Id, button, checkbox, column, container, operation, pane_grid, row, scrollable, slider,
+        svg, text, text_input, tooltip,
     },
     window,
 };
 use rfd::{AsyncFileDialog, AsyncMessageDialog, MessageButtons, MessageDialogResult, MessageLevel};
 use typst_iced_editor::{Action, code_editor};
+use typstation::world::SourceOverlay;
 
 const DEBOUNCE: Duration = Duration::from_millis(250);
 const DEBOUNCE_TICK: Duration = Duration::from_millis(50);
 const SESSION_DEBOUNCE: Duration = Duration::from_millis(750);
 const SESSION_TICK: Duration = Duration::from_millis(200);
+const WATCHER_DEBOUNCE: Duration = Duration::from_millis(150);
+const WATCHER_TICK: Duration = Duration::from_millis(50);
 const DEMO: &str = include_str!("demo.typ");
 
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
         .subscription(App::subscription)
         .title(App::title)
-        .theme(Theme::Dark)
+        .theme(App::theme)
         .window_size([1200.0, 800.0])
         .centered()
         .exit_on_close_request(false)
@@ -52,7 +59,7 @@ struct App {
     pending_compile: Option<PendingCompile>,
     next_request_id: u64,
     latest_request_id: Option<u64>,
-    preview: Option<svg::Handle>,
+    preview: Vec<PreviewPage>,
     preview_status: PreviewStatus,
     file_busy: bool,
     pending_after_save: Option<DestructiveFileAction>,
@@ -60,11 +67,23 @@ struct App {
     search: SearchState,
     search_input_id: Id,
     project_files: Vec<PathBuf>,
+    selected_project_file: Option<PathBuf>,
+    diagnostics: Vec<compiler::ReportedDiagnostic>,
+    pending_diagnostic_reveal: Option<(PathBuf, Range<usize>)>,
     project_scan_busy: bool,
     external_check_busy: bool,
+    watcher_deadline: Option<Instant>,
     discarded_on_close: HashSet<DocumentId>,
     session: SessionTracker,
+    settings: settings::Settings,
+    settings_visible: bool,
     file_status: Option<String>,
+}
+
+struct PreviewPage {
+    handle: svg::Handle,
+    width: f32,
+    height: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +98,18 @@ enum Message {
     Italic,
     Underline,
     PrefixLines(String),
+    ToggleSettings,
+    TabWidthChanged(u16),
+    AutoPairsChanged(bool),
+    AutoIndentChanged(bool),
+    WrapLinesChanged(bool),
+    ShowGutterChanged(bool),
+    EditorFontSizeChanged(u16),
+    LightThemeChanged(bool),
+    PreviewZoomIn,
+    PreviewZoomOut,
+    PreviewZoomReset,
+    PreviewZoomChanged(u16),
     OpenSearch,
     OpenReplace,
     CloseSearch,
@@ -97,10 +128,15 @@ enum Message {
     OpenDocument,
     OpenProject,
     OpenProjectFile(PathBuf),
+    CreateProjectFile,
+    RenameProjectFile,
+    DeleteProjectFile,
+    ProjectOperationFinished(project::OperationOutcome),
+    OpenDiagnostic(compiler::DiagnosticTarget, Range<usize>),
     ProjectFolderSelected(Option<PathBuf>),
-    ProjectScanned(ProjectScanOutcome),
-    ProjectRefreshTick(Instant),
-    ExternalRefreshTick(Instant),
+    ProjectScanned(project::ScanOutcome),
+    Watcher(watcher::Event),
+    WatcherTick(Instant),
     ExternalFilesChecked(Vec<ExternalFileResult>),
     ReloadExternal,
     KeepLocalAfterExternal,
@@ -232,12 +268,6 @@ enum ExternalFileResult {
 }
 
 #[derive(Debug, Clone)]
-struct ProjectScanOutcome {
-    root: PathBuf,
-    files: Result<Vec<PathBuf>, String>,
-}
-
-#[derive(Debug, Clone)]
 struct SessionWriteOutcome {
     revision: u64,
     result: Result<(), String>,
@@ -295,6 +325,7 @@ impl App {
             panes,
             workspace_root,
             session_path,
+            settings::Settings::default(),
             "O tutorial inicial ainda não foi salvo".to_owned(),
         )
     }
@@ -313,6 +344,7 @@ impl App {
             panes,
             stored.workspace_root,
             session_path,
+            stored.settings,
             "Sessão anterior restaurada".to_owned(),
         )
     }
@@ -322,9 +354,10 @@ impl App {
         panes: pane_grid::State<Pane>,
         workspace_root: PathBuf,
         session_path: Option<PathBuf>,
+        settings: settings::Settings,
         file_status: String,
     ) -> Self {
-        Self {
+        let mut app = Self {
             document,
             panes,
             workspace_root,
@@ -335,7 +368,7 @@ impl App {
             }),
             next_request_id: 0,
             latest_request_id: None,
-            preview: None,
+            preview: Vec::new(),
             preview_status: PreviewStatus::Waiting,
             file_busy: false,
             pending_after_save: None,
@@ -343,12 +376,20 @@ impl App {
             search: SearchState::default(),
             search_input_id: Id::unique(),
             project_files: Vec::new(),
+            selected_project_file: None,
+            diagnostics: Vec::new(),
+            pending_diagnostic_reveal: None,
             project_scan_busy: false,
             external_check_busy: false,
+            watcher_deadline: None,
             discarded_on_close: HashSet::new(),
             session: SessionTracker::new(session_path),
+            settings: settings.validate(),
+            settings_visible: false,
             file_status: Some(file_status),
-        }
+        };
+        app.apply_editor_settings();
+        app
     }
 
     fn title(&self) -> String {
@@ -362,14 +403,23 @@ impl App {
         )
     }
 
+    fn theme(&self) -> Theme {
+        match self.settings.theme {
+            settings::ThemeMode::Dark => Theme::Dark,
+            settings::ThemeMode::Light => Theme::Light,
+        }
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Editor(action) => {
-                let changed = action.is_edit();
-                self.document.perform(action);
+                if action.is_edit() && self.file_busy {
+                    return Task::none();
+                }
+                let changed = self.document.perform(action);
 
                 if changed {
-                    self.document.clear_diagnostics();
+                    self.clear_compile_diagnostics();
                     self.file_status = None;
                     self.mark_session_changed();
                     self.schedule_compile(DEBOUNCE, false);
@@ -379,6 +429,9 @@ impl App {
                 Task::none()
             }
             Message::Bold => {
+                if self.file_busy {
+                    return Task::none();
+                }
                 if self
                     .document
                     .edit(|content| formatting::toggle_surround(content, "*", "*"))
@@ -389,6 +442,9 @@ impl App {
                 Task::none()
             }
             Message::Italic => {
+                if self.file_busy {
+                    return Task::none();
+                }
                 if self
                     .document
                     .edit(|content| formatting::toggle_surround(content, "_", "_"))
@@ -399,6 +455,9 @@ impl App {
                 Task::none()
             }
             Message::Underline => {
+                if self.file_busy {
+                    return Task::none();
+                }
                 if self
                     .document
                     .edit(|content| formatting::toggle_surround(content, "#underline[", "]"))
@@ -409,6 +468,9 @@ impl App {
                 Task::none()
             }
             Message::PrefixLines(prefix) => {
+                if self.file_busy {
+                    return Task::none();
+                }
                 if self
                     .document
                     .edit(|content| formatting::toggle_line_prefix(content, &prefix))
@@ -416,6 +478,67 @@ impl App {
                     self.after_formatting();
                 }
 
+                Task::none()
+            }
+            Message::ToggleSettings => {
+                self.settings_visible = !self.settings_visible;
+                Task::none()
+            }
+            Message::TabWidthChanged(tab_width) => {
+                self.settings.tab_width = usize::from(tab_width.clamp(1, 8));
+                self.settings_changed(true);
+                Task::none()
+            }
+            Message::AutoPairsChanged(auto_pairs) => {
+                self.settings.auto_pairs = auto_pairs;
+                self.settings_changed(true);
+                Task::none()
+            }
+            Message::AutoIndentChanged(auto_indent) => {
+                self.settings.auto_indent = auto_indent;
+                self.settings_changed(true);
+                Task::none()
+            }
+            Message::WrapLinesChanged(wrap_lines) => {
+                self.settings.wrap_lines = wrap_lines;
+                self.settings_changed(false);
+                Task::none()
+            }
+            Message::ShowGutterChanged(show_gutter) => {
+                self.settings.show_gutter = show_gutter;
+                self.settings_changed(false);
+                Task::none()
+            }
+            Message::EditorFontSizeChanged(size) => {
+                self.settings.editor_font_size = size.clamp(10, 30);
+                self.settings_changed(false);
+                Task::none()
+            }
+            Message::LightThemeChanged(light) => {
+                self.settings.theme = if light {
+                    settings::ThemeMode::Light
+                } else {
+                    settings::ThemeMode::Dark
+                };
+                self.settings_changed(false);
+                Task::none()
+            }
+            Message::PreviewZoomIn => {
+                self.change_preview_zoom(10);
+                Task::none()
+            }
+            Message::PreviewZoomOut => {
+                self.change_preview_zoom(-10);
+                Task::none()
+            }
+            Message::PreviewZoomReset => {
+                self.settings.preview_zoom = 100;
+                self.settings_changed(false);
+                Task::none()
+            }
+            Message::PreviewZoomChanged(zoom) => {
+                self.settings.preview_zoom = zoom.clamp(25, 300);
+                self.settings_changed(false);
                 Task::none()
             }
             Message::OpenSearch => self.open_search(false),
@@ -505,6 +628,11 @@ impl App {
             Message::OpenDocument => self.start_open_document(),
             Message::OpenProject => self.start_open_project(),
             Message::OpenProjectFile(path) => self.open_project_file(path),
+            Message::CreateProjectFile => self.start_create_project_file(),
+            Message::RenameProjectFile => self.start_rename_project_file(),
+            Message::DeleteProjectFile => self.start_delete_project_file(),
+            Message::ProjectOperationFinished(outcome) => self.handle_project_operation(outcome),
+            Message::OpenDiagnostic(target, range) => self.open_diagnostic(target, range),
             Message::ProjectFolderSelected(path) => self.handle_project_folder_selected(path),
             Message::ProjectScanned(outcome) => {
                 if outcome.root != self.workspace_root {
@@ -513,7 +641,16 @@ impl App {
 
                 self.project_scan_busy = false;
                 match outcome.files {
-                    Ok(files) => self.project_files = files,
+                    Ok(files) => {
+                        if self
+                            .selected_project_file
+                            .as_ref()
+                            .is_some_and(|selected| !files.contains(selected) && !selected.exists())
+                        {
+                            self.selected_project_file = None;
+                        }
+                        self.project_files = files;
+                    }
                     Err(error) => {
                         eprintln!("erro ao examinar projeto: {error}");
                         self.file_status = Some(format!("Erro no projeto: {error}"));
@@ -521,8 +658,8 @@ impl App {
                 }
                 Task::none()
             }
-            Message::ProjectRefreshTick(_now) => self.refresh_project_files(),
-            Message::ExternalRefreshTick(_now) => self.check_external_files(),
+            Message::Watcher(event) => self.handle_watcher_event(event),
+            Message::WatcherTick(now) => self.dispatch_watcher_refresh(now),
             Message::ExternalFilesChecked(results) => self.handle_external_files(results),
             Message::ReloadExternal => {
                 self.reload_external_change();
@@ -594,22 +731,17 @@ impl App {
         let compiler = compiler::subscription(self.compiler_config()).map(Message::Compiler);
         let close_requests = window::close_requests().map(Message::CloseRequested);
         let shortcuts = shortcut_subscription();
-        let project_refresh = time::every(Duration::from_secs(5)).map(Message::ProjectRefreshTick);
-        let external_refresh =
-            time::every(Duration::from_secs(2)).map(Message::ExternalRefreshTick);
-        let mut subscriptions = vec![
-            compiler,
-            close_requests,
-            shortcuts,
-            project_refresh,
-            external_refresh,
-        ];
+        let watcher = watcher::subscription(self.workspace_root.clone()).map(Message::Watcher);
+        let mut subscriptions = vec![compiler, close_requests, shortcuts, watcher];
 
         if self.pending_compile.is_some() {
             subscriptions.push(time::every(DEBOUNCE_TICK).map(Message::DebounceTick));
         }
         if self.session.deadline.is_some() {
             subscriptions.push(time::every(SESSION_TICK).map(Message::SessionTick));
+        }
+        if self.watcher_deadline.is_some() {
+            subscriptions.push(time::every(WATCHER_TICK).map(Message::WatcherTick));
         }
 
         Subscription::batch(subscriptions)
@@ -620,14 +752,11 @@ impl App {
             let content: Element<'_, Message> = match pane {
                 Pane::Editor => code_editor(self.document.content())
                     .on_action(Message::Editor)
+                    .wrap(self.settings.wrap_lines)
+                    .gutter(self.settings.show_gutter)
+                    .size(f32::from(self.settings.editor_font_size))
                     .into(),
-                Pane::Preview => match &self.preview {
-                    Some(handle) => scrollable(svg(handle.clone()).width(Fill)).into(),
-                    None => container(text("Preview indisponível"))
-                        .center_x(Fill)
-                        .center_y(Fill)
-                        .into(),
-                },
+                Pane::Preview => self.preview_view(),
             };
 
             pane_grid::Content::new(content)
@@ -652,7 +781,7 @@ impl App {
             !self.file_busy && self.compiler.is_some(),
         );
 
-        let toolbar = row![
+        let file_toolbar = row![
             new,
             open,
             open_project,
@@ -660,14 +789,50 @@ impl App {
             save_as,
             export_pdf,
             button("▶").on_press(Message::CompileNow),
-            button("B").on_press(Message::Bold),
-            button("I").on_press(Message::Italic),
-            button("U").on_press(Message::Underline),
-            button("Lista").on_press(Message::PrefixLines("- ".into())),
-            button("Numeração").on_press(Message::PrefixLines("+ ".into())),
+            button("Buscar").on_press(Message::OpenSearch),
+            button("Configurações").on_press(Message::ToggleSettings),
         ]
         .spacing(4)
         .padding(4);
+        let edit_toolbar = row![
+            command_button("↶", "Desfazer", Action::Undo, !self.file_busy),
+            command_button("↷", "Refazer", Action::Redo, !self.file_busy),
+            command_button(
+                "//",
+                "Alternar comentário de linha",
+                Action::ToggleLineComment,
+                !self.file_busy,
+            ),
+            command_button(
+                "⧉",
+                "Duplicar linha ou seleção",
+                Action::DuplicateLine,
+                !self.file_busy,
+            ),
+            command_button(
+                "↑",
+                "Mover linha para cima",
+                Action::MoveLineUp,
+                !self.file_busy,
+            ),
+            command_button(
+                "↓",
+                "Mover linha para baixo",
+                Action::MoveLineDown,
+                !self.file_busy,
+            ),
+            file_button("B", Message::Bold, !self.file_busy),
+            file_button("I", Message::Italic, !self.file_busy),
+            file_button("U", Message::Underline, !self.file_busy),
+            file_button("Lista", Message::PrefixLines("- ".into()), !self.file_busy,),
+            file_button(
+                "Numeração",
+                Message::PrefixLines("+ ".into()),
+                !self.file_busy,
+            ),
+        ]
+        .spacing(4)
+        .padding([0, 4]);
 
         let status = container(text(self.status_text()).size(13))
             .width(Fill)
@@ -675,7 +840,13 @@ impl App {
 
         let tabs = self.tabs_view();
         let workspace = row![self.project_view(), panes].height(Fill);
-        let mut content = column![toolbar, tabs];
+        let mut content = column![file_toolbar, edit_toolbar];
+
+        if self.settings_visible {
+            content = content.push(self.settings_view());
+        }
+
+        content = content.push(tabs);
 
         if self.document.external_change().is_some() {
             content = content.push(self.external_change_view());
@@ -690,6 +861,129 @@ impl App {
             .push(status)
             .width(Fill)
             .height(Fill)
+            .into()
+    }
+
+    fn preview_view(&self) -> Element<'_, Message> {
+        if self.preview.is_empty() {
+            return container(text("Preview indisponível"))
+                .center_x(Fill)
+                .center_y(Fill)
+                .into();
+        }
+
+        let zoom = f32::from(self.settings.preview_zoom) / 100.0;
+        let controls = row![
+            file_button(
+                "−",
+                Message::PreviewZoomOut,
+                self.settings.preview_zoom > 25,
+            ),
+            button(text(format!("{}%", self.settings.preview_zoom)))
+                .on_press(Message::PreviewZoomReset),
+            file_button(
+                "+",
+                Message::PreviewZoomIn,
+                self.settings.preview_zoom < 300,
+            ),
+            text(format!("{} página(s)", self.preview.len())).size(13),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(4)
+        .padding([4, 8]);
+        let mut pages = column![].align_x(Alignment::Center).spacing(12);
+
+        for (index, page) in self.preview.iter().enumerate() {
+            let width = (page.width * zoom).max(1.0);
+            let height = (page.height * zoom).max(1.0);
+            pages = pages.push(
+                column![
+                    text(format!("Página {}", index + 1)).size(12),
+                    svg(page.handle.clone())
+                        .width(iced::Length::Fixed(width))
+                        .height(iced::Length::Fixed(height)),
+                ]
+                .align_x(Alignment::Center)
+                .spacing(4),
+            );
+        }
+
+        column![
+            controls,
+            scrollable(container(pages).padding(12))
+                .direction(scrollable::Direction::Both {
+                    vertical: scrollable::Scrollbar::default(),
+                    horizontal: scrollable::Scrollbar::default(),
+                })
+                .height(Fill),
+        ]
+        .height(Fill)
+        .into()
+    }
+
+    fn settings_view(&self) -> Element<'_, Message> {
+        let editor_size = row![
+            text(format!("Tabulação: {}", self.settings.tab_width)).width(110),
+            slider(
+                1..=8,
+                self.settings.tab_width as u16,
+                Message::TabWidthChanged,
+            )
+            .width(120),
+            text(format!(
+                "Fonte do editor: {}",
+                self.settings.editor_font_size
+            ))
+            .width(150),
+            slider(
+                10..=30,
+                self.settings.editor_font_size,
+                Message::EditorFontSizeChanged,
+            )
+            .width(140),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(6);
+        let preview_size = row![
+            text(format!("Zoom: {}%", self.settings.preview_zoom)).width(90),
+            slider(
+                25..=300,
+                self.settings.preview_zoom,
+                Message::PreviewZoomChanged,
+            )
+            .step(5u16)
+            .width(180),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(6);
+        let editing = row![
+            checkbox(self.settings.auto_pairs)
+                .label("Fechar pares")
+                .on_toggle(Message::AutoPairsChanged),
+            checkbox(self.settings.auto_indent)
+                .label("Indentação automática")
+                .on_toggle(Message::AutoIndentChanged),
+            checkbox(self.settings.wrap_lines)
+                .label("Quebrar linhas")
+                .on_toggle(Message::WrapLinesChanged),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(10);
+        let appearance = row![
+            checkbox(self.settings.show_gutter)
+                .label("Mostrar números de linha")
+                .on_toggle(Message::ShowGutterChanged),
+            checkbox(self.settings.theme == settings::ThemeMode::Light)
+                .label("Tema claro")
+                .on_toggle(Message::LightThemeChanged),
+            button("Fechar").on_press(Message::ToggleSettings),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(10);
+
+        container(column![editor_size, preview_size, editing, appearance].spacing(6))
+            .width(Fill)
+            .padding([6, 8])
             .into()
     }
 
@@ -734,7 +1028,9 @@ impl App {
 
         for path in &self.project_files {
             let relative = path.strip_prefix(&self.workspace_root).unwrap_or(path);
-            let item = button(text(relative.to_string_lossy())).width(Fill);
+            let selected = self.selected_project_file.as_deref() == Some(path.as_path());
+            let marker = if selected { "› " } else { "" };
+            let item = button(text(format!("{marker}{}", relative.to_string_lossy()))).width(Fill);
             let item = if self.file_busy {
                 item
             } else {
@@ -743,16 +1039,66 @@ impl App {
             files = files.push(item);
         }
 
+        let mut diagnostics = column![].spacing(2);
+        for diagnostic in &self.diagnostics {
+            let location = match &diagnostic.target {
+                compiler::DiagnosticTarget::Main => self.document.display_name(),
+                compiler::DiagnosticTarget::ProjectFile(path) => path
+                    .strip_prefix(&self.workspace_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            let severity = match diagnostic.severity {
+                compiler::DiagnosticSeverity::Error => "Erro",
+                compiler::DiagnosticSeverity::Warning => "Aviso",
+            };
+            let label = format!(
+                "{severity} em {location}: {}",
+                truncate(&diagnostic.message, 70)
+            );
+            diagnostics = diagnostics.push(button(text(label).size(12)).width(Fill).on_press(
+                Message::OpenDiagnostic(diagnostic.target.clone(), diagnostic.range.clone()),
+            ));
+        }
+
         let root = truncate(&self.workspace_root.to_string_lossy(), 28);
-        let content = column![
+        let has_selection = self.selected_project_file.is_some();
+        let actions = row![
+            file_button("Novo arquivo", Message::CreateProjectFile, !self.file_busy),
+            file_button(
+                "Renomear",
+                Message::RenameProjectFile,
+                !self.file_busy && has_selection,
+            ),
+            file_button(
+                "Excluir",
+                Message::DeleteProjectFile,
+                !self.file_busy && has_selection,
+            ),
+        ]
+        .spacing(2);
+        let file_height = if self.diagnostics.is_empty() {
+            Fill
+        } else {
+            FillPortion(2)
+        };
+        let mut content = column![
             text("Projeto").size(16),
             text(root).size(12),
-            scrollable(files).height(Fill),
+            actions,
+            scrollable(files).height(file_height),
         ]
         .spacing(6);
 
+        if !self.diagnostics.is_empty() {
+            content = content
+                .push(text(format!("Problemas ({})", self.diagnostics.len())).size(14))
+                .push(scrollable(diagnostics).height(FillPortion(1)));
+        }
+
         container(content)
-            .width(220)
+            .width(280)
             .height(Fill)
             .padding([6, 8])
             .into()
@@ -963,18 +1309,27 @@ impl App {
             return Task::none();
         };
 
+        let previous_config = self.compiler_config();
         self.workspace_root = path;
         self.project_files.clear();
+        self.selected_project_file = None;
         self.project_scan_busy = false;
         self.file_status = Some(format!("Projeto aberto: {}", self.workspace_root.display()));
         self.mark_session_changed();
-        self.refresh_project_files()
+        self.refresh_compiler_config(previous_config);
+        self.schedule_compile(Duration::ZERO, true);
+
+        let scan = self.refresh_project_files();
+        self.dispatch_compile(Instant::now());
+        scan
     }
 
     fn open_project_file(&mut self, path: PathBuf) -> Task<Message> {
         if self.file_busy {
             return Task::none();
         }
+
+        self.selected_project_file = Some(path.clone());
 
         if let Some(id) = self.document.find_path(&path) {
             self.activate_document(id);
@@ -987,6 +1342,151 @@ impl App {
         Task::perform(read_document(path), Message::OpenFinished)
     }
 
+    fn start_create_project_file(&mut self) -> Task<Message> {
+        if self.file_busy {
+            return Task::none();
+        }
+
+        self.file_busy = true;
+        self.file_status = Some("Escolha o nome do novo arquivo Typst...".to_owned());
+        Task::perform(
+            project::create_file(self.workspace_root.clone()),
+            Message::ProjectOperationFinished,
+        )
+    }
+
+    fn start_rename_project_file(&mut self) -> Task<Message> {
+        if self.file_busy {
+            return Task::none();
+        }
+        let Some(path) = self.selected_project_file.clone() else {
+            self.file_status = Some("Selecione um arquivo do projeto para renomear".to_owned());
+            return Task::none();
+        };
+
+        self.file_busy = true;
+        self.file_status = Some(format!("Renomeando {}...", path.display()));
+        Task::perform(
+            project::rename_file(self.workspace_root.clone(), path),
+            Message::ProjectOperationFinished,
+        )
+    }
+
+    fn start_delete_project_file(&mut self) -> Task<Message> {
+        if self.file_busy {
+            return Task::none();
+        }
+        let Some(path) = self.selected_project_file.clone() else {
+            self.file_status = Some("Selecione um arquivo do projeto para excluir".to_owned());
+            return Task::none();
+        };
+        if self
+            .document
+            .find_path(&path)
+            .and_then(|id| self.document.get(id))
+            .is_some_and(Document::is_dirty)
+        {
+            self.file_status =
+                Some("Salve ou feche a aba antes de excluir esse arquivo".to_owned());
+            return Task::none();
+        }
+
+        self.file_busy = true;
+        self.file_status = Some(format!("Confirmando exclusão de {}...", path.display()));
+        Task::perform(
+            project::delete_file(path),
+            Message::ProjectOperationFinished,
+        )
+    }
+
+    fn handle_project_operation(&mut self, outcome: project::OperationOutcome) -> Task<Message> {
+        self.file_busy = false;
+
+        match outcome {
+            project::OperationOutcome::Cancelled => {
+                self.file_status = Some("A operação de projeto foi cancelada".to_owned());
+            }
+            project::OperationOutcome::Failed(error) => {
+                eprintln!("erro em operação de projeto: {error}");
+                self.file_status = Some(format!("Erro no projeto: {error}"));
+            }
+            project::OperationOutcome::Created(path) => {
+                let previous_config = self.compiler_config();
+                self.selected_project_file = Some(path.clone());
+                self.document.clear_search_matches();
+                self.document
+                    .add(Document::opened(path.clone(), String::new()));
+                self.file_status = Some(format!("Arquivo criado: {}", path.display()));
+                self.document_replaced(previous_config);
+            }
+            project::OperationOutcome::Renamed { from, to } => {
+                let previous_config = self.compiler_config();
+                let renamed = self.document.find_path(&from);
+                let active_renamed = renamed == Some(self.document.active_id());
+
+                if let Some(id) = renamed
+                    && let Some(document) = self.document.get_mut(id)
+                {
+                    document.relocate(to.clone());
+                }
+
+                self.selected_project_file = Some(to.clone());
+                self.file_status = Some(format!(
+                    "Arquivo renomeado: {} -> {}",
+                    from.display(),
+                    to.display()
+                ));
+                if active_renamed {
+                    self.document_replaced(previous_config);
+                } else {
+                    self.mark_session_changed();
+                    self.schedule_compile(Duration::ZERO, true);
+                    self.dispatch_compile(Instant::now());
+                }
+            }
+            project::OperationOutcome::Deleted(path) => {
+                if let Some(id) = self.document.find_path(&path) {
+                    self.close_document(id);
+                } else {
+                    self.mark_session_changed();
+                    self.schedule_compile(Duration::ZERO, true);
+                    self.dispatch_compile(Instant::now());
+                }
+                self.selected_project_file = None;
+                self.file_status = Some(format!("Arquivo excluído: {}", path.display()));
+            }
+        }
+
+        self.refresh_project_files()
+    }
+
+    fn open_diagnostic(
+        &mut self,
+        target: compiler::DiagnosticTarget,
+        range: Range<usize>,
+    ) -> Task<Message> {
+        match target {
+            compiler::DiagnosticTarget::Main => {
+                self.document.reveal_range(range);
+                Task::none()
+            }
+            compiler::DiagnosticTarget::ProjectFile(path) => {
+                if let Some(id) = self.document.find_path(&path) {
+                    self.activate_document(id);
+                    if let Some(document) = self.document.get_mut(id) {
+                        document.reveal_range(range);
+                    }
+                    Task::none()
+                } else if self.file_busy {
+                    Task::none()
+                } else {
+                    self.pending_diagnostic_reveal = Some((path.clone(), range));
+                    self.open_project_file(path)
+                }
+            }
+        }
+    }
+
     fn refresh_project_files(&mut self) -> Task<Message> {
         if self.project_scan_busy {
             return Task::none();
@@ -994,9 +1494,57 @@ impl App {
 
         self.project_scan_busy = true;
         Task::perform(
-            scan_project(self.workspace_root.clone()),
+            project::scan(self.workspace_root.clone()),
             Message::ProjectScanned,
         )
+    }
+
+    fn handle_watcher_event(&mut self, event: watcher::Event) -> Task<Message> {
+        match event {
+            watcher::Event::Ready { root } => {
+                if root == self.workspace_root {
+                    self.watcher_deadline = None;
+                }
+            }
+            watcher::Event::Changed { root, paths } => {
+                if root != self.workspace_root || paths.is_empty() {
+                    return Task::none();
+                }
+
+                self.latest_request_id = None;
+                self.preview_status = PreviewStatus::Waiting;
+                self.watcher_deadline = Some(Instant::now() + WATCHER_DEBOUNCE);
+            }
+            watcher::Event::Failed { root, error } => {
+                if root != self.workspace_root {
+                    return Task::none();
+                }
+
+                eprintln!("erro ao observar projeto: {error}");
+                self.file_status = Some(format!("Watcher do projeto indisponível: {error}"));
+            }
+        }
+
+        Task::none()
+    }
+
+    fn dispatch_watcher_refresh(&mut self, now: Instant) -> Task<Message> {
+        let Some(deadline) = self.watcher_deadline else {
+            return Task::none();
+        };
+        if now < deadline {
+            return Task::none();
+        }
+        if self.file_busy || self.external_check_busy || self.project_scan_busy {
+            self.watcher_deadline = Some(now + WATCHER_DEBOUNCE);
+            return Task::none();
+        }
+
+        self.watcher_deadline = None;
+        self.schedule_compile(Duration::ZERO, true);
+        self.dispatch_compile(now);
+
+        Task::batch([self.refresh_project_files(), self.check_external_files()])
     }
 
     fn check_external_files(&mut self) -> Task<Message> {
@@ -1111,6 +1659,7 @@ impl App {
         if active_reloaded {
             self.document_replaced(previous_config);
         } else if imported_file_reloaded {
+            self.apply_editor_settings();
             self.mark_session_changed();
             self.schedule_compile(Duration::ZERO, true);
             self.dispatch_compile(Instant::now());
@@ -1250,6 +1799,7 @@ impl App {
             active_document.unwrap_or(0),
             documents,
             self.pane_layout(),
+            self.settings,
         )
     }
 
@@ -1338,6 +1888,7 @@ impl App {
             id: request_id,
             revision,
             source,
+            overlays: self.source_overlays(),
             reset_files: true,
             purpose: compiler::Purpose::ExportPdf,
         };
@@ -1379,9 +1930,11 @@ impl App {
 
         match outcome {
             OpenOutcome::Cancelled => {
+                self.pending_diagnostic_reveal = None;
                 self.file_status = Some("A abertura foi cancelada".to_owned());
             }
             OpenOutcome::Failed(error) => {
+                self.pending_diagnostic_reveal = None;
                 eprintln!("erro ao abrir documento: {error}");
                 self.file_status = Some(format!("Erro ao abrir: {error}"));
             }
@@ -1395,6 +1948,14 @@ impl App {
                     self.document.add(Document::opened(path.clone(), source));
                     self.file_status = Some(format!("Aberto: {}", path.display()));
                     self.document_replaced(previous_config);
+                }
+
+                if let Some((reveal_path, range)) = self.pending_diagnostic_reveal.take()
+                    && reveal_path == path
+                    && let Some(id) = self.document.find_path(&path)
+                    && let Some(document) = self.document.get_mut(id)
+                {
+                    document.reveal_range(range);
                 }
             }
         }
@@ -1479,8 +2040,10 @@ impl App {
 
     fn document_replaced(&mut self, previous_config: compiler::Config) {
         self.search.visible = false;
+        self.clear_compile_diagnostics();
+        self.apply_editor_settings();
         self.replace_editor_pane_identity();
-        self.preview = None;
+        self.preview.clear();
         self.latest_request_id = None;
         self.mark_session_changed();
         self.refresh_compiler_config(previous_config);
@@ -1519,19 +2082,84 @@ impl App {
     }
 
     fn compiler_config(&self) -> compiler::Config {
-        compiler::Config::new(
-            self.document.directory(&self.workspace_root),
-            self.document.main_name(),
-        )
+        let (root, main_name) = self.document.compiler_location(&self.workspace_root);
+        compiler::Config::new(root, main_name)
+    }
+
+    fn apply_editor_settings(&mut self) {
+        for (_id, document) in self.document.iter_mut() {
+            document.configure_editor(
+                self.settings.tab_width,
+                self.settings.auto_pairs,
+                self.settings.auto_indent,
+            );
+        }
+    }
+
+    fn settings_changed(&mut self, apply_to_content: bool) {
+        if apply_to_content {
+            self.apply_editor_settings();
+        }
+        self.mark_session_changed();
+    }
+
+    fn change_preview_zoom(&mut self, delta: i16) {
+        let zoom = i32::from(self.settings.preview_zoom) + i32::from(delta);
+        self.settings.preview_zoom = zoom.clamp(25, 300) as u16;
+        self.settings_changed(false);
+    }
+
+    fn source_overlays(&self) -> Vec<SourceOverlay> {
+        let active = self.document.active_id();
+        let config = self.compiler_config();
+
+        self.document
+            .iter()
+            .filter(|(id, document)| *id != active && document.is_dirty())
+            .filter_map(|(_id, document)| {
+                let path = document.path()?.to_path_buf();
+                path.starts_with(config.root()).then(|| SourceOverlay {
+                    path,
+                    text: document.snapshot().1,
+                })
+            })
+            .collect()
     }
 
     fn after_formatting(&mut self) {
-        self.document.clear_diagnostics();
+        self.clear_compile_diagnostics();
         self.file_status = None;
         self.mark_session_changed();
         self.schedule_compile(Duration::ZERO, false);
         self.dispatch_compile(Instant::now());
         self.refresh_search_matches(None, false);
+    }
+
+    fn clear_compile_diagnostics(&mut self) {
+        self.diagnostics.clear();
+        for (_id, document) in self.document.iter_mut() {
+            document.clear_diagnostics();
+        }
+    }
+
+    fn install_diagnostics(&mut self, diagnostics: Vec<compiler::ReportedDiagnostic>) {
+        let active = self.document.active_id();
+
+        for (id, document) in self.document.iter_mut() {
+            let editor_diagnostics = diagnostics
+                .iter()
+                .filter(|diagnostic| match &diagnostic.target {
+                    compiler::DiagnosticTarget::Main => id == active,
+                    compiler::DiagnosticTarget::ProjectFile(path) => {
+                        document.path() == Some(path.as_path())
+                    }
+                })
+                .map(compiler::ReportedDiagnostic::editor_diagnostic)
+                .collect::<Vec<_>>();
+            document.set_diagnostics(editor_diagnostics);
+        }
+
+        self.diagnostics = diagnostics;
     }
 
     fn open_search(&mut self, replace_visible: bool) -> Task<Message> {
@@ -1594,6 +2222,10 @@ impl App {
     }
 
     fn replace_current_match(&mut self) {
+        if self.file_busy {
+            return;
+        }
+
         let matches = self.document.search_matches();
         let Some(index) = self.document.current_search_match() else {
             return;
@@ -1620,6 +2252,10 @@ impl App {
     }
 
     fn replace_all_matches(&mut self) {
+        if self.file_busy {
+            return;
+        }
+
         let matches = self.document.search_matches();
 
         if matches.is_empty() {
@@ -1672,6 +2308,7 @@ impl App {
             id: request_id,
             revision,
             source,
+            overlays: self.source_overlays(),
             reset_files: pending.reset_files,
             purpose: compiler::Purpose::Preview,
         };
@@ -1720,7 +2357,7 @@ impl App {
             return Task::none();
         }
 
-        self.document.set_diagnostics(output.diagnostics);
+        self.install_diagnostics(output.diagnostics);
 
         if output.error_count > 0 {
             self.preview_status = PreviewStatus::Failed {
@@ -1732,15 +2369,23 @@ impl App {
             return Task::none();
         }
 
-        let Some(svg) = output.svg else {
+        if output.pages.is_empty() {
             self.preview_status = PreviewStatus::Failed {
                 errors: 1,
                 summary: "A compilação não produziu um preview".to_owned(),
             };
             return Task::none();
-        };
+        }
 
-        self.preview = Some(svg::Handle::from_memory(svg));
+        self.preview = output
+            .pages
+            .into_iter()
+            .map(|page| PreviewPage {
+                handle: svg::Handle::from_memory(page.svg),
+                width: page.width,
+                height: page.height,
+            })
+            .collect();
         self.preview_status = PreviewStatus::Ready {
             pages: output.page_count,
             warnings: output.warning_count,
@@ -1759,7 +2404,7 @@ impl App {
         }
 
         if self.document.revision() == output.revision {
-            self.document.set_diagnostics(output.diagnostics);
+            self.install_diagnostics(output.diagnostics);
         }
 
         if output.error_count > 0 {
@@ -1852,6 +2497,27 @@ fn file_button<'a>(
     }
 }
 
+fn command_button<'a>(
+    symbol: &'a str,
+    description: &'a str,
+    action: Action,
+    enabled: bool,
+) -> Element<'a, Message> {
+    let button = button(text(symbol).width(24).align_x(Alignment::Center));
+    let button = if enabled {
+        button.on_press(Message::Editor(action))
+    } else {
+        button
+    };
+
+    tooltip(
+        button,
+        container(text(description).size(12)).padding([4, 6]),
+        tooltip::Position::Bottom,
+    )
+    .into()
+}
+
 async fn confirm_unsaved(name: String) -> UnsavedDecision {
     let result = AsyncMessageDialog::new()
         .set_level(MessageLevel::Warning)
@@ -1902,47 +2568,6 @@ async fn choose_project_folder(directory: PathBuf) -> Option<PathBuf> {
         .pick_folder()
         .await
         .map(|folder| folder.path().to_path_buf())
-}
-
-async fn scan_project(root: PathBuf) -> ProjectScanOutcome {
-    let scan_root = root.clone();
-    let files = tokio::task::spawn_blocking(move || scan_project_files(&scan_root))
-        .await
-        .map_err(|error| format!("tarefa de varredura interrompida: {error}"))
-        .and_then(|files| files);
-
-    ProjectScanOutcome { root, files }
-}
-
-fn scan_project_files(root: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut files = walkdir::WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            if entry.depth() == 0 || !entry.file_type().is_dir() {
-                return true;
-            }
-
-            let name = entry.file_name().to_string_lossy();
-            name != ".git" && name != "target" && !name.starts_with('.')
-        })
-        .filter_map(|entry| match entry {
-            Ok(entry)
-                if entry.file_type().is_file()
-                    && entry
-                        .path()
-                        .extension()
-                        .is_some_and(|extension| extension == "typ") =>
-            {
-                Some(Ok(entry.into_path()))
-            }
-            Ok(_) => None,
-            Err(error) => Some(Err(error.to_string())),
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    files.sort();
-    Ok(files)
 }
 
 async fn check_external_files(files: Vec<(DocumentId, u64, PathBuf)>) -> Vec<ExternalFileResult> {
@@ -2173,6 +2798,9 @@ fn shortcut_message(
     }
 
     match (key.to_ascii_lowercase(), modifiers.shift()) {
+        ('+' | '=', _) => Some(Message::PreviewZoomIn),
+        ('-', _) => Some(Message::PreviewZoomOut),
+        ('0', _) => Some(Message::PreviewZoomReset),
         ('n', false) => Some(Message::NewDocument),
         ('o', false) => Some(Message::OpenDocument),
         ('s', false) => Some(Message::SaveDocument),
@@ -2461,29 +3089,6 @@ mod tests {
     }
 
     #[test]
-    fn project_scan_lists_typst_files_and_ignores_build_and_hidden_directories() {
-        let directory = tempfile::tempdir().expect("a temporary directory can be created");
-        let root = directory.path();
-        fs::create_dir_all(root.join("chapters")).expect("the chapter directory can be created");
-        fs::create_dir_all(root.join("target")).expect("the target directory can be created");
-        fs::create_dir_all(root.join(".hidden")).expect("the hidden directory can be created");
-        fs::write(root.join("main.typ"), "main").expect("the main file can be written");
-        fs::write(root.join("chapters/one.typ"), "one").expect("the chapter can be written");
-        fs::write(root.join("target/generated.typ"), "generated")
-            .expect("the generated file can be written");
-        fs::write(root.join(".hidden/private.typ"), "private")
-            .expect("the hidden file can be written");
-        fs::write(root.join("notes.md"), "notes").expect("the note can be written");
-
-        let files = scan_project_files(root).expect("the project can be scanned");
-
-        assert_eq!(
-            files,
-            vec![root.join("chapters/one.typ"), root.join("main.typ")]
-        );
-    }
-
-    #[test]
     fn stale_external_read_cannot_undo_a_completed_save() {
         let mut app = App::new();
         let document_id = app.document.active_id();
@@ -2509,13 +3114,25 @@ mod tests {
         app.workspace_root = PathBuf::from("/projeto/novo");
         app.project_scan_busy = true;
 
-        let _ = app.update(Message::ProjectScanned(ProjectScanOutcome {
+        let _ = app.update(Message::ProjectScanned(project::ScanOutcome {
             root: PathBuf::from("/projeto/antigo"),
             files: Ok(vec![PathBuf::from("/projeto/antigo/main.typ")]),
         }));
 
         assert!(app.project_files.is_empty());
         assert!(app.project_scan_busy);
+    }
+
+    #[test]
+    fn watcher_refresh_waits_for_in_flight_filesystem_reads() {
+        let mut app = App::new();
+        let now = Instant::now();
+        app.watcher_deadline = Some(now);
+        app.external_check_busy = true;
+
+        let _ = app.dispatch_watcher_refresh(now);
+
+        assert!(app.watcher_deadline.is_some_and(|deadline| deadline > now));
     }
 
     #[test]
@@ -2534,6 +3151,8 @@ mod tests {
             ratio: 0.7,
             first: session::Pane::Preview,
         });
+        app.settings.wrap_lines = true;
+        app.settings.preview_zoom = 135;
 
         let stored = app.session_snapshot(false);
         let restored = App::restore(stored, None);
@@ -2546,6 +3165,8 @@ mod tests {
         assert_eq!(documents, vec!["saved local", "draft"]);
         assert_eq!(restored.document.snapshot().1, "draft");
         assert_eq!(restored.workspace_root, PathBuf::from("/project"));
+        assert!(restored.settings.wrap_lines);
+        assert_eq!(restored.settings.preview_zoom, 135);
         assert_eq!(
             restored.pane_layout(),
             session::PaneLayout {
@@ -2635,6 +3256,71 @@ mod tests {
         assert!(app.session.close_after_write.is_none());
         assert!(app.discarded_on_close.is_empty());
         assert!(!app.file_busy);
+    }
+
+    #[test]
+    fn dirty_open_imports_are_sent_as_compiler_overlays() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let main_path = directory.path().join("main.typ");
+        let part_path = directory.path().join("part.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.document = Documents::new(Document::opened(main_path, String::new()));
+        let main = app.document.active_id();
+        let part = app
+            .document
+            .add(Document::opened(part_path.clone(), "saved".to_owned()));
+        app.document
+            .get_mut(part)
+            .expect("the import is open")
+            .perform(Action::Insert(" unsaved".to_owned()));
+        app.document.activate(main);
+
+        let overlays = app.source_overlays();
+
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0].path, part_path);
+        assert_eq!(overlays[0].text, " unsavedsaved");
+    }
+
+    #[test]
+    fn imported_diagnostics_are_attached_to_the_matching_open_document() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let main_path = directory.path().join("main.typ");
+        let part_path = directory.path().join("part.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.document = Documents::new(Document::opened(main_path, String::new()));
+        let main = app.document.active_id();
+        let part = app
+            .document
+            .add(Document::opened(part_path.clone(), "broken".to_owned()));
+        app.document.activate(main);
+
+        app.install_diagnostics(vec![compiler::ReportedDiagnostic {
+            target: compiler::DiagnosticTarget::ProjectFile(part_path),
+            range: 0..6,
+            severity: compiler::DiagnosticSeverity::Error,
+            message: "erro importado".to_owned(),
+        }]);
+
+        assert_eq!(
+            app.document
+                .get(part)
+                .expect("the import is open")
+                .content()
+                .diagnostics()
+                .len(),
+            1
+        );
+        assert!(
+            app.document
+                .get(main)
+                .expect("the main document is open")
+                .content()
+                .diagnostics()
+                .is_empty()
+        );
     }
 
     #[test]

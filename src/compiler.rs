@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{ops::Range, path::PathBuf};
 
 use iced::{
     Subscription,
@@ -8,10 +8,10 @@ use iced::{
     },
     stream,
 };
-use typst::{diag::SourceDiagnostic, layout::Abs};
+use typst::diag::SourceDiagnostic;
 use typst_iced_editor::Diagnostic;
 use typst_layout::PagedDocument;
-use typstation::world::TypstationWorld;
+use typstation::world::{SourceOverlay, TypstationWorld};
 
 pub type Sender = UnboundedSender<Request>;
 
@@ -20,6 +20,7 @@ pub struct Request {
     pub id: u64,
     pub revision: u64,
     pub source: String,
+    pub overlays: Vec<SourceOverlay>,
     pub reset_files: bool,
     pub purpose: Purpose,
 }
@@ -41,13 +42,53 @@ pub struct Output {
     pub id: u64,
     pub revision: u64,
     pub purpose: Purpose,
-    pub svg: Option<Vec<u8>>,
+    pub pages: Vec<RenderedPage>,
     pub pdf: Option<Vec<u8>>,
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<ReportedDiagnostic>,
     pub page_count: usize,
     pub warning_count: usize,
     pub error_count: usize,
     pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderedPage {
+    pub svg: Vec<u8>,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiagnosticTarget {
+    Main,
+    ProjectFile(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedDiagnostic {
+    pub target: DiagnosticTarget,
+    pub range: Range<usize>,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+}
+
+impl ReportedDiagnostic {
+    pub fn editor_diagnostic(&self) -> Diagnostic {
+        match self.severity {
+            DiagnosticSeverity::Error => {
+                Diagnostic::error(self.range.clone(), self.message.clone())
+            }
+            DiagnosticSeverity::Warning => {
+                Diagnostic::warning(self.range.clone(), self.message.clone())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -59,6 +100,10 @@ pub struct Config {
 impl Config {
     pub fn new(root: PathBuf, main_name: String) -> Self {
         Self { root, main_name }
+    }
+
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
     }
 }
 
@@ -108,6 +153,7 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
     }
 
     world.set_source(&request.source);
+    world.set_overlays(request.overlays);
 
     let result = typst::compile::<PagedDocument>(world);
     let mut diagnostics = Vec::new();
@@ -130,7 +176,7 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
                 id: request.id,
                 revision: request.revision,
                 purpose: request.purpose,
-                svg: None,
+                pages: Vec::new(),
                 pdf: None,
                 diagnostics,
                 page_count,
@@ -141,12 +187,16 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
 
             match request.purpose {
                 Purpose::Preview => {
-                    let svg = typst_svg::svg_merged(
-                        &document,
-                        &typst_svg::SvgOptions::default(),
-                        Abs::pt(12.0),
-                    );
-                    output.svg = Some(svg.into_bytes());
+                    let options = typst_svg::SvgOptions::default();
+                    output.pages = document
+                        .pages()
+                        .iter()
+                        .map(|page| RenderedPage {
+                            svg: typst_svg::svg(page, &options).into_bytes(),
+                            width: page.frame.width().to_pt() as f32,
+                            height: page.frame.height().to_pt() as f32,
+                        })
+                        .collect();
                 }
                 Purpose::ExportPdf => {
                     match typst_pdf::pdf(&document, &typst_pdf::PdfOptions::default()) {
@@ -174,7 +224,7 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
             id: request.id,
             revision: request.revision,
             purpose: request.purpose,
-            svg: None,
+            pages: Vec::new(),
             pdf: None,
             diagnostics,
             page_count: 0,
@@ -198,7 +248,7 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
                 id: request.id,
                 revision: request.revision,
                 purpose: request.purpose,
-                svg: None,
+                pages: Vec::new(),
                 pdf: None,
                 diagnostics,
                 page_count: 0,
@@ -210,19 +260,33 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
     }
 }
 
-fn editor_diagnostic(world: &TypstationWorld, diagnostic: &SourceDiagnostic) -> Option<Diagnostic> {
-    let range = world.main_range(diagnostic.span)?;
+fn editor_diagnostic(
+    world: &TypstationWorld,
+    diagnostic: &SourceDiagnostic,
+) -> Option<ReportedDiagnostic> {
+    let (id, range) = world.span_range(diagnostic.span)?;
+    let target = if world.is_main(id) {
+        DiagnosticTarget::Main
+    } else {
+        DiagnosticTarget::ProjectFile(world.project_path(id)?)
+    };
     let message = diagnostic.message.to_string();
 
-    Some(match diagnostic.severity {
-        typst::diag::Severity::Error => Diagnostic::error(range, message),
-        typst::diag::Severity::Warning => Diagnostic::warning(range, message),
+    Some(ReportedDiagnostic {
+        target,
+        range,
+        severity: match diagnostic.severity {
+            typst::diag::Severity::Error => DiagnosticSeverity::Error,
+            typst::diag::Severity::Warning => DiagnosticSeverity::Warning,
+        },
+        message,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn compiler_generates_multiple_pages_and_editor_diagnostics() {
@@ -235,6 +299,7 @@ mod tests {
                 id: 1,
                 revision: 4,
                 source: "First page\n#pagebreak()\nSecond page".to_owned(),
+                overlays: Vec::new(),
                 reset_files: true,
                 purpose: Purpose::Preview,
             },
@@ -244,7 +309,7 @@ mod tests {
         assert_eq!(preview.revision, 4);
         assert_eq!(preview.page_count, 2);
         assert_eq!(preview.error_count, 0);
-        assert!(preview.svg.is_some());
+        assert_eq!(preview.pages.len(), 2);
         assert!(preview.pdf.is_none());
 
         let pdf = compile(
@@ -253,13 +318,14 @@ mod tests {
                 id: 2,
                 revision: 4,
                 source: "Exported page".to_owned(),
+                overlays: Vec::new(),
                 reset_files: false,
                 purpose: Purpose::ExportPdf,
             },
         );
 
         assert_eq!(pdf.error_count, 0);
-        assert!(pdf.svg.is_none());
+        assert!(pdf.pages.is_empty());
         assert!(
             pdf.pdf
                 .as_deref()
@@ -272,13 +338,58 @@ mod tests {
                 id: 3,
                 revision: 5,
                 source: "#let value =".to_owned(),
+                overlays: Vec::new(),
                 reset_files: false,
                 purpose: Purpose::Preview,
             },
         );
 
         assert!(failure.error_count > 0);
-        assert!(failure.svg.is_none());
+        assert!(failure.pages.is_empty());
         assert!(!failure.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unsaved_import_overrides_disk_and_reports_its_own_path() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let imported = directory.path().join("part.typ");
+        fs::write(&imported, "#let title = [Saved]").expect("the imported source can be written");
+        let mut world = TypstationWorld::with_main(directory.path().to_path_buf(), "main.typ");
+        let main = "#import \"part.typ\": title\n#title".to_owned();
+
+        let unsaved_failure = compile(
+            &mut world,
+            Request {
+                id: 1,
+                revision: 1,
+                source: main.clone(),
+                overlays: vec![SourceOverlay {
+                    path: imported.clone(),
+                    text: "#let title =".to_owned(),
+                }],
+                reset_files: true,
+                purpose: Purpose::Preview,
+            },
+        );
+
+        assert!(unsaved_failure.error_count > 0);
+        assert!(unsaved_failure.diagnostics.iter().any(|diagnostic| {
+            diagnostic.target == DiagnosticTarget::ProjectFile(imported.clone())
+        }));
+
+        let disk_success = compile(
+            &mut world,
+            Request {
+                id: 2,
+                revision: 1,
+                source: main,
+                overlays: Vec::new(),
+                reset_files: false,
+                purpose: Purpose::Preview,
+            },
+        );
+
+        assert_eq!(disk_success.error_count, 0);
+        assert_eq!(disk_success.pages.len(), 1);
     }
 }

@@ -5,6 +5,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::settings::Settings;
+
 const SESSION_VERSION: u32 = 1;
 const MAX_SESSION_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_DOCUMENTS: usize = 512;
@@ -16,6 +18,8 @@ pub struct Session {
     pub active_document: usize,
     pub documents: Vec<Document>,
     pub pane_layout: PaneLayout,
+    #[serde(default)]
+    pub settings: Settings,
 }
 
 impl Session {
@@ -24,6 +28,7 @@ impl Session {
         active_document: usize,
         documents: Vec<Document>,
         pane_layout: PaneLayout,
+        settings: Settings,
     ) -> Self {
         Self {
             version: SESSION_VERSION,
@@ -31,6 +36,7 @@ impl Session {
             active_document,
             documents,
             pane_layout,
+            settings,
         }
     }
 
@@ -56,6 +62,7 @@ impl Session {
         } else {
             PaneLayout::default().ratio
         };
+        self.settings = self.settings.validate();
 
         Ok(self)
     }
@@ -207,6 +214,11 @@ mod tests {
                 ratio: 0.7,
                 first: Pane::Preview,
             },
+            Settings {
+                wrap_lines: true,
+                preview_zoom: 125,
+                ..Settings::default()
+            },
         )
     }
 
@@ -222,6 +234,8 @@ mod tests {
             .expect("the session exists");
 
         assert_eq!(loaded, expected);
+        assert!(loaded.settings.wrap_lines);
+        assert_eq!(loaded.settings.preview_zoom, 125);
     }
 
     #[test]
@@ -238,6 +252,29 @@ mod tests {
             .expect("the session exists");
 
         assert_eq!(loaded.pane_layout.ratio, 0.9);
+    }
+
+    #[test]
+    fn sessions_written_before_settings_use_defaults() {
+        let directory = tempfile::tempdir().expect("a temporary directory can be created");
+        let path = directory.path().join("session.json");
+        let mut stored = serde_json::to_value(sample_session())
+            .expect("the old session can be represented as JSON");
+        stored
+            .as_object_mut()
+            .expect("the session is a JSON object")
+            .remove("settings");
+        fs::write(
+            &path,
+            serde_json::to_vec(&stored).expect("the old session can be serialized"),
+        )
+        .expect("the old session can be written");
+
+        let loaded = load(&path)
+            .expect("the old session can be loaded")
+            .expect("the old session exists");
+
+        assert_eq!(loaded.settings, Settings::default());
     }
 
     #[cfg(unix)]

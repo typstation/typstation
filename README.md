@@ -3,8 +3,9 @@
 A [Typst](https://typst.app) editor with live preview, written in Rust.
 
 > **Status: early work in progress.** The multi-document editor, native file
-> operations, project tree, preview workflow, and session recovery are usable.
-> Broader editing features are still in development.
+> operations, project tree, multi-file compilation, preview workflow, and
+> session recovery are usable. Broader editing features are still in
+> development.
 
 ## What works today
 
@@ -12,8 +13,9 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
   [`typst-kit`](https://crates.io/crates/typst-kit).
 - An [Iced](https://iced.rs) interface with movable editor and preview panes.
 - Debounced live compilation in a persistent background worker.
-- A scrollable SVG preview containing every page of the document.
-- Typst errors and warnings attached to their source ranges in the editor.
+- A scrollable SVG preview with separate pages and persistent zoom controls.
+- Typst errors and warnings attached to their source ranges, including errors
+  in imported project files and navigation from the Problems panel.
 - Selection formatting for strong emphasis, emphasis, underline, bullet lists,
   and numbered lists.
 - New, Open, Save, and Save As operations using native file dialogs.
@@ -24,7 +26,12 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
   worker.
 - Unicode-aware search and replace with match navigation, whole-word and case
   options, and single-step undo for Replace All.
-- A recursive Typst project tree and multiple document tabs.
+- A recursive Typst project tree, multiple document tabs, and create, rename,
+  and delete operations for project files.
+- Unsaved open imports compiled as in-memory overlays, without writing them to
+  disk first.
+- Native filesystem notifications through `notify`, debounced before project
+  rescans, external-change checks, and preview recompilation.
 - Automatic reload of clean files changed on disk, with explicit conflict
   handling when local edits exist.
 - Unsaved-change tracking and confirmation before closing a tab or the window.
@@ -35,6 +42,10 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
   download and on-disk caching.
 - Incremental source replacement while reusing fonts, packages, and imported
   file caches.
+- Toolbar commands for undo, redo, line comments, duplication, and line
+  movement.
+- Persistent settings for indentation, automatic pairs, line wrapping, gutter,
+  editor font size, preview zoom, and light/dark theme.
 
 ## Roadmap
 
@@ -45,6 +56,13 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
 - [x] Project file tree and multi-file editing
 - [x] Search and replace
 - [x] Recover open tabs and unsaved drafts after restarting
+- [x] Compile unsaved imported files as overlays
+- [x] Navigate diagnostics from imported project files
+- [x] Create, rename, and delete project files
+- [x] Render and zoom individual preview pages
+- [x] Expose basic editor commands in the toolbar
+- [x] Replace filesystem polling with native notifications
+- [x] Persist editor, preview, and theme settings
 
 ## Building
 

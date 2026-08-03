@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use typst::syntax::VirtualPath;
 use typst_iced_editor::{Action, Content, Diagnostic};
 
 const UNTITLED_NAME: &str = "Sem título.typ";
@@ -122,17 +123,38 @@ impl Document {
             .to_owned()
     }
 
+    /// Returns the Typst project root and the main virtual path.
+    ///
+    /// Documents inside the open workspace share its root, which lets nested
+    /// files import siblings and parent-directory resources. Standalone files
+    /// keep using their own directory as the root.
+    pub fn compiler_location(&self, workspace_root: &Path) -> (PathBuf, String) {
+        if let Some(path) = self.path()
+            && let Ok(vpath) = VirtualPath::virtualize(workspace_root, path)
+        {
+            return (
+                workspace_root.to_path_buf(),
+                vpath.get_without_slash().to_owned(),
+            );
+        }
+
+        (self.directory(workspace_root), self.main_name())
+    }
+
     pub fn content(&self) -> &Content {
         &self.content
     }
 
-    pub fn perform(&mut self, action: Action) {
-        let changed = action.is_edit();
+    pub fn perform(&mut self, action: Action) -> bool {
+        let revision = self.content.buffer().revision();
         self.content.perform(action);
+        let changed = self.content.buffer().revision() != revision;
 
         if changed {
             self.refresh_dirty();
         }
+
+        changed
     }
 
     pub fn edit(&mut self, edit: impl FnOnce(&mut Content) -> bool) -> bool {
@@ -171,6 +193,20 @@ impl Document {
 
     pub fn reveal_search_match(&mut self, index: usize) -> bool {
         self.content.reveal_search_match(index)
+    }
+
+    pub fn reveal_range(&mut self, range: Range<usize>) {
+        let len = self.content.buffer().len();
+        let start = range.start.min(len);
+        let end = range.end.min(len).max(start);
+        self.content.perform(Action::MoveTo(start));
+        self.content.perform(Action::SelectTo(end));
+    }
+
+    pub fn configure_editor(&mut self, tab_width: usize, auto_pairs: bool, auto_indent: bool) {
+        self.content.set_tab_width(tab_width);
+        self.content.set_auto_pairs(auto_pairs);
+        self.content.set_auto_indent(auto_indent);
     }
 
     pub fn selection_text(&self) -> Option<String> {
@@ -262,6 +298,14 @@ impl Document {
         self.storage_revision += 1;
         self.external_change = None;
         self.refresh_dirty();
+    }
+
+    /// Updates the path after a project file is renamed without changing its
+    /// saved or unsaved text snapshots.
+    pub fn relocate(&mut self, path: PathBuf) {
+        self.path = Some(path);
+        self.storage_revision += 1;
+        self.external_change = None;
     }
 
     fn replace_from_disk(&mut self, source: String) {
@@ -357,6 +401,12 @@ impl Documents {
         self.entries.iter().map(|entry| (entry.id, &entry.document))
     }
 
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (DocumentId, &mut Document)> {
+        self.entries
+            .iter_mut()
+            .map(|entry| (entry.id, &mut entry.document))
+    }
+
     pub fn add(&mut self, document: Document) -> DocumentId {
         let id = DocumentId(self.next_id);
         self.next_id += 1;
@@ -422,6 +472,14 @@ mod tests {
         document.perform(Action::Insert("texto".to_owned()));
 
         assert!(document.is_dirty());
+    }
+
+    #[test]
+    fn no_op_editor_action_does_not_report_a_text_change() {
+        let mut document = Document::new();
+
+        assert!(!document.perform(Action::Undo));
+        assert!(!document.is_dirty());
     }
 
     #[test]
@@ -526,5 +584,16 @@ mod tests {
         assert!(!clean.is_dirty());
         assert!(dirty.is_dirty());
         assert_eq!(dirty.saved_text(), Some("salvo"));
+    }
+
+    #[test]
+    fn nested_document_uses_workspace_as_the_typst_root() {
+        let root = PathBuf::from("/project");
+        let document = Document::opened(root.join("chapters").join("one.typ"), String::new());
+
+        let (compiler_root, main_name) = document.compiler_location(&root);
+
+        assert_eq!(compiler_root, root);
+        assert_eq!(main_name, "chapters/one.typ");
     }
 }
