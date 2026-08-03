@@ -48,6 +48,7 @@ struct App {
     preview_status: PreviewStatus,
     file_busy: bool,
     pending_after_save: Option<DestructiveFileAction>,
+    pending_pdf_export: Option<PendingPdfExport>,
     file_status: Option<String>,
 }
 
@@ -67,6 +68,9 @@ enum Message {
     OpenDocument,
     SaveDocument,
     SaveDocumentAs,
+    ExportPdf,
+    PdfPathSelected(PdfPathOutcome),
+    PdfWriteFinished(PdfWriteOutcome),
     CloseRequested(window::Id),
     UnsavedDecision {
         action: DestructiveFileAction,
@@ -85,6 +89,13 @@ enum Pane {
 struct PendingCompile {
     deadline: Instant,
     reset_files: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPdfExport {
+    request_id: u64,
+    revision: u64,
+    path: PathBuf,
 }
 
 enum PreviewStatus {
@@ -122,6 +133,18 @@ enum SaveOutcome {
     Failed(String),
 }
 
+#[derive(Debug, Clone)]
+enum PdfPathOutcome {
+    Cancelled,
+    Selected(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+enum PdfWriteOutcome {
+    Saved(PathBuf),
+    Failed(String),
+}
+
 impl App {
     fn boot() -> Self {
         let workspace_root = std::env::current_dir().unwrap_or_else(|error| {
@@ -147,6 +170,7 @@ impl App {
             preview_status: PreviewStatus::Waiting,
             file_busy: false,
             pending_after_save: None,
+            pending_pdf_export: None,
             file_status: Some("O tutorial inicial ainda não foi salvo".to_owned()),
         }
     }
@@ -236,10 +260,7 @@ impl App {
                 self.dispatch_compile(now);
                 Task::none()
             }
-            Message::Compiler(event) => {
-                self.handle_compiler_event(event);
-                Task::none()
-            }
+            Message::Compiler(event) => self.handle_compiler_event(event),
             Message::NewDocument => self.request_destructive_action(DestructiveFileAction::New),
             Message::OpenDocument => self.request_destructive_action(DestructiveFileAction::Open),
             Message::SaveDocument => {
@@ -255,6 +276,9 @@ impl App {
                 self.pending_after_save = None;
                 self.start_save(true)
             }
+            Message::ExportPdf => self.start_pdf_export(),
+            Message::PdfPathSelected(outcome) => self.handle_pdf_path_selected(outcome),
+            Message::PdfWriteFinished(outcome) => self.handle_pdf_write_finished(outcome),
             Message::CloseRequested(id) => {
                 self.request_destructive_action(DestructiveFileAction::Close(id))
             }
@@ -328,12 +352,18 @@ impl App {
             !self.file_busy && self.document.is_dirty(),
         );
         let save_as = file_button("Salvar como", Message::SaveDocumentAs, !self.file_busy);
+        let export_pdf = file_button(
+            "Exportar PDF",
+            Message::ExportPdf,
+            !self.file_busy && self.compiler.is_some(),
+        );
 
         let toolbar = row![
             new,
             open,
             save,
             save_as,
+            export_pdf,
             button("▶").on_press(Message::CompileNow),
             button("B").on_press(Message::Bold),
             button("I").on_press(Message::Italic),
@@ -413,6 +443,77 @@ impl App {
             save_document_as(directory, file_name, source),
             Message::SaveFinished,
         )
+    }
+
+    fn start_pdf_export(&mut self) -> Task<Message> {
+        if self.file_busy || self.compiler.is_none() {
+            return Task::none();
+        }
+
+        self.file_busy = true;
+        self.file_status = Some("Aguardando o destino do PDF...".to_owned());
+        let directory = self.document.directory(&self.workspace_root);
+        let file_name = pdf_file_name(&self.document.display_name());
+
+        Task::perform(
+            choose_pdf_path(directory, file_name),
+            Message::PdfPathSelected,
+        )
+    }
+
+    fn handle_pdf_path_selected(&mut self, outcome: PdfPathOutcome) -> Task<Message> {
+        let PdfPathOutcome::Selected(path) = outcome else {
+            self.file_busy = false;
+            self.file_status = Some("A exportação de PDF foi cancelada".to_owned());
+            return Task::none();
+        };
+        let Some(sender) = self.compiler.clone() else {
+            self.file_busy = false;
+            self.file_status = Some("O worker de compilação não está disponível".to_owned());
+            return Task::none();
+        };
+        let (revision, source) = self.document.snapshot();
+
+        self.next_request_id += 1;
+        let request_id = self.next_request_id;
+        let request = compiler::Request {
+            id: request_id,
+            revision,
+            source,
+            reset_files: true,
+            purpose: compiler::Purpose::ExportPdf,
+        };
+
+        if sender.unbounded_send(request).is_err() {
+            self.compiler = None;
+            self.file_busy = false;
+            self.file_status = Some("O worker de compilação foi encerrado".to_owned());
+            return Task::none();
+        }
+
+        self.pending_pdf_export = Some(PendingPdfExport {
+            request_id,
+            revision,
+            path,
+        });
+        self.file_status = Some("Gerando PDF...".to_owned());
+        Task::none()
+    }
+
+    fn handle_pdf_write_finished(&mut self, outcome: PdfWriteOutcome) -> Task<Message> {
+        self.file_busy = false;
+
+        match outcome {
+            PdfWriteOutcome::Saved(path) => {
+                self.file_status = Some(format!("PDF exportado: {}", path.display()));
+            }
+            PdfWriteOutcome::Failed(error) => {
+                eprintln!("erro ao exportar PDF: {error}");
+                self.file_status = Some(format!("Erro ao exportar PDF: {error}"));
+            }
+        }
+
+        Task::none()
     }
 
     fn handle_open_finished(&mut self, outcome: OpenOutcome) -> Task<Message> {
@@ -564,6 +665,7 @@ impl App {
             revision,
             source,
             reset_files: pending.reset_files,
+            purpose: compiler::Purpose::Preview,
         };
 
         if sender.unbounded_send(request).is_ok() {
@@ -579,55 +681,98 @@ impl App {
         }
     }
 
-    fn handle_compiler_event(&mut self, event: compiler::Event) {
+    fn handle_compiler_event(&mut self, event: compiler::Event) -> Task<Message> {
         match event {
             compiler::Event::Ready { config, sender } => {
                 if config != self.compiler_config() {
-                    return;
+                    return Task::none();
                 }
 
                 self.compiler = Some(sender);
                 self.dispatch_compile(Instant::now());
+                Task::none()
             }
             compiler::Event::Finished { config, output } => {
                 if config != self.compiler_config() {
-                    return;
+                    return Task::none();
                 }
 
-                let current_revision = self.document.revision();
-
-                if self.latest_request_id != Some(output.id) || current_revision != output.revision
-                {
-                    return;
+                match output.purpose {
+                    compiler::Purpose::Preview => self.handle_preview_output(output),
+                    compiler::Purpose::ExportPdf => self.handle_pdf_output(output),
                 }
-
-                self.document.set_diagnostics(output.diagnostics);
-
-                if output.error_count > 0 {
-                    self.preview_status = PreviewStatus::Failed {
-                        errors: output.error_count,
-                        summary: output
-                            .summary
-                            .unwrap_or_else(|| "Falha ao compilar o documento".to_owned()),
-                    };
-                    return;
-                }
-
-                let Some(svg) = output.svg else {
-                    self.preview_status = PreviewStatus::Failed {
-                        errors: 1,
-                        summary: "A compilação não produziu um preview".to_owned(),
-                    };
-                    return;
-                };
-
-                self.preview = Some(svg::Handle::from_memory(svg));
-                self.preview_status = PreviewStatus::Ready {
-                    pages: output.page_count,
-                    warnings: output.warning_count,
-                };
             }
         }
+    }
+
+    fn handle_preview_output(&mut self, output: compiler::Output) -> Task<Message> {
+        let current_revision = self.document.revision();
+
+        if self.latest_request_id != Some(output.id) || current_revision != output.revision {
+            return Task::none();
+        }
+
+        self.document.set_diagnostics(output.diagnostics);
+
+        if output.error_count > 0 {
+            self.preview_status = PreviewStatus::Failed {
+                errors: output.error_count,
+                summary: output
+                    .summary
+                    .unwrap_or_else(|| "Falha ao compilar o documento".to_owned()),
+            };
+            return Task::none();
+        }
+
+        let Some(svg) = output.svg else {
+            self.preview_status = PreviewStatus::Failed {
+                errors: 1,
+                summary: "A compilação não produziu um preview".to_owned(),
+            };
+            return Task::none();
+        };
+
+        self.preview = Some(svg::Handle::from_memory(svg));
+        self.preview_status = PreviewStatus::Ready {
+            pages: output.page_count,
+            warnings: output.warning_count,
+        };
+        Task::none()
+    }
+
+    fn handle_pdf_output(&mut self, output: compiler::Output) -> Task<Message> {
+        let Some(pending) = self.pending_pdf_export.take() else {
+            return Task::none();
+        };
+
+        if pending.request_id != output.id || pending.revision != output.revision {
+            self.pending_pdf_export = Some(pending);
+            return Task::none();
+        }
+
+        if self.document.revision() == output.revision {
+            self.document.set_diagnostics(output.diagnostics);
+        }
+
+        if output.error_count > 0 {
+            self.file_busy = false;
+            self.file_status = Some(format!(
+                "Falha ao gerar PDF: {}",
+                output
+                    .summary
+                    .unwrap_or_else(|| format!("{} erro(s)", output.error_count))
+            ));
+            return Task::none();
+        }
+
+        let Some(pdf) = output.pdf else {
+            self.file_busy = false;
+            self.file_status = Some("A compilação não produziu um PDF".to_owned());
+            return Task::none();
+        };
+
+        self.file_status = Some("Gravando PDF...".to_owned());
+        Task::perform(write_pdf(pending.path, pdf), Message::PdfWriteFinished)
     }
 
     fn status_text(&self) -> String {
@@ -724,10 +869,25 @@ async fn save_document_as(directory: PathBuf, file_name: String, source: String)
     write_document(with_typst_extension(file.path()), source).await
 }
 
+async fn choose_pdf_path(directory: PathBuf, file_name: String) -> PdfPathOutcome {
+    let Some(file) = AsyncFileDialog::new()
+        .add_filter("Documento PDF", &["pdf"])
+        .set_directory(directory)
+        .set_file_name(file_name)
+        .set_title("Exportar documento como PDF")
+        .save_file()
+        .await
+    else {
+        return PdfPathOutcome::Cancelled;
+    };
+
+    PdfPathOutcome::Selected(with_pdf_extension(file.path()))
+}
+
 async fn write_document(path: PathBuf, source: String) -> SaveOutcome {
     let destination = path.clone();
     let result = tokio::task::spawn_blocking(move || {
-        atomic_write_document(&destination, &source)?;
+        atomic_write_file(&destination, source.as_bytes())?;
         Ok::<_, io::Error>(source)
     })
     .await;
@@ -742,7 +902,21 @@ async fn write_document(path: PathBuf, source: String) -> SaveOutcome {
     }
 }
 
-fn atomic_write_document(path: &Path, source: &str) -> io::Result<()> {
+async fn write_pdf(path: PathBuf, pdf: Vec<u8>) -> PdfWriteOutcome {
+    let destination = path.clone();
+    let result = tokio::task::spawn_blocking(move || atomic_write_file(&destination, &pdf)).await;
+
+    match result {
+        Ok(Ok(())) => PdfWriteOutcome::Saved(path),
+        Ok(Err(error)) => PdfWriteOutcome::Failed(format!("{}: {error}", path.display())),
+        Err(error) => PdfWriteOutcome::Failed(format!(
+            "{}: tarefa de exportação interrompida: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn atomic_write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     let destination = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)?,
         Ok(_) => path.to_path_buf(),
@@ -787,7 +961,7 @@ fn atomic_write_document(path: &Path, source: &str) -> io::Result<()> {
         temporary.as_file().set_permissions(permissions)?;
     }
 
-    temporary.write_all(source.as_bytes())?;
+    temporary.write_all(contents)?;
     temporary.as_file().sync_all()?;
     temporary
         .persist(destination)
@@ -851,6 +1025,25 @@ fn with_typst_extension(path: &Path) -> PathBuf {
     path
 }
 
+fn with_pdf_extension(path: &Path) -> PathBuf {
+    let mut path = path.to_path_buf();
+
+    if path
+        .extension()
+        .is_none_or(|extension| extension.is_empty())
+    {
+        path.set_extension("pdf");
+    }
+
+    path
+}
+
+fn pdf_file_name(document_name: &str) -> String {
+    let mut path = PathBuf::from(document_name);
+    path.set_extension("pdf");
+    path.to_string_lossy().into_owned()
+}
+
 fn truncate(text: &str, limit: usize) -> String {
     let mut characters = text.chars();
     let shortened = characters.by_ref().take(limit).collect::<String>();
@@ -876,6 +1069,11 @@ mod tests {
             with_typst_extension(Path::new("documento.typ")),
             PathBuf::from("documento.typ")
         );
+        assert_eq!(
+            with_pdf_extension(Path::new("documento")),
+            PathBuf::from("documento.pdf")
+        );
+        assert_eq!(pdf_file_name("documento.typ"), "documento.pdf");
     }
 
     #[test]
@@ -980,7 +1178,7 @@ mod tests {
         let path = directory.path().join("document.typ");
         fs::write(&path, "old").expect("the original document can be written");
 
-        atomic_write_document(&path, "new").expect("the document can be replaced atomically");
+        atomic_write_file(&path, b"new").expect("the document can be replaced atomically");
 
         assert_eq!(
             fs::read_to_string(&path).expect("the saved document can be read"),
@@ -1007,7 +1205,7 @@ mod tests {
             .expect("the original permissions can be set");
         symlink(&target, &link).expect("the symbolic link can be created");
 
-        atomic_write_document(&link, "new").expect("the symbolic link target can be saved");
+        atomic_write_file(&link, b"new").expect("the symbolic link target can be saved");
 
         assert!(
             fs::symlink_metadata(&link)

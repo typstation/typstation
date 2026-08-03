@@ -21,6 +21,13 @@ pub struct Request {
     pub revision: u64,
     pub source: String,
     pub reset_files: bool,
+    pub purpose: Purpose,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    Preview,
+    ExportPdf,
 }
 
 #[derive(Debug, Clone)]
@@ -33,7 +40,9 @@ pub enum Event {
 pub struct Output {
     pub id: u64,
     pub revision: u64,
+    pub purpose: Purpose,
     pub svg: Option<Vec<u8>>,
+    pub pdf: Option<Vec<u8>>,
     pub diagnostics: Vec<Diagnostic>,
     pub page_count: usize,
     pub warning_count: usize,
@@ -117,24 +126,56 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
     match result.output {
         Ok(document) if !document.pages().is_empty() => {
             let page_count = document.pages().len();
-            let svg =
-                typst_svg::svg_merged(&document, &typst_svg::SvgOptions::default(), Abs::pt(12.0));
-
-            Output {
+            let mut output = Output {
                 id: request.id,
                 revision: request.revision,
-                svg: Some(svg.into_bytes()),
+                purpose: request.purpose,
+                svg: None,
+                pdf: None,
                 diagnostics,
                 page_count,
                 warning_count,
                 error_count: 0,
                 summary,
+            };
+
+            match request.purpose {
+                Purpose::Preview => {
+                    let svg = typst_svg::svg_merged(
+                        &document,
+                        &typst_svg::SvgOptions::default(),
+                        Abs::pt(12.0),
+                    );
+                    output.svg = Some(svg.into_bytes());
+                }
+                Purpose::ExportPdf => {
+                    match typst_pdf::pdf(&document, &typst_pdf::PdfOptions::default()) {
+                        Ok(pdf) => output.pdf = Some(pdf),
+                        Err(errors) => {
+                            output.error_count = errors.len();
+                            output.summary = errors
+                                .first()
+                                .map(|error| error.message.to_string())
+                                .or(output.summary);
+
+                            for error in &errors {
+                                if let Some(diagnostic) = editor_diagnostic(world, error) {
+                                    output.diagnostics.push(diagnostic);
+                                }
+                            }
+                        }
+                    }
+                }
             }
+
+            output
         }
         Ok(_) => Output {
             id: request.id,
             revision: request.revision,
+            purpose: request.purpose,
             svg: None,
+            pdf: None,
             diagnostics,
             page_count: 0,
             warning_count,
@@ -156,7 +197,9 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
             Output {
                 id: request.id,
                 revision: request.revision,
+                purpose: request.purpose,
                 svg: None,
+                pdf: None,
                 diagnostics,
                 page_count: 0,
                 warning_count,
@@ -193,6 +236,7 @@ mod tests {
                 revision: 4,
                 source: "First page\n#pagebreak()\nSecond page".to_owned(),
                 reset_files: true,
+                purpose: Purpose::Preview,
             },
         );
 
@@ -201,14 +245,35 @@ mod tests {
         assert_eq!(preview.page_count, 2);
         assert_eq!(preview.error_count, 0);
         assert!(preview.svg.is_some());
+        assert!(preview.pdf.is_none());
+
+        let pdf = compile(
+            &mut world,
+            Request {
+                id: 2,
+                revision: 4,
+                source: "Exported page".to_owned(),
+                reset_files: false,
+                purpose: Purpose::ExportPdf,
+            },
+        );
+
+        assert_eq!(pdf.error_count, 0);
+        assert!(pdf.svg.is_none());
+        assert!(
+            pdf.pdf
+                .as_deref()
+                .is_some_and(|bytes| bytes.starts_with(b"%PDF-"))
+        );
 
         let failure = compile(
             &mut world,
             Request {
-                id: 2,
+                id: 3,
                 revision: 5,
                 source: "#let value =".to_owned(),
                 reset_files: false,
+                purpose: Purpose::Preview,
             },
         );
 
