@@ -17,6 +17,9 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
 - Selection formatting for strong emphasis, emphasis, underline, bullet lists,
   and numbered lists.
 - New, Open, Save, and Save As operations using native file dialogs.
+- Keyboard shortcuts for file operations and inline formatting.
+- Atomic document replacement that preserves existing file permissions and
+  symbolic links.
 - Unsaved-change tracking and confirmation before replacing the current
   document.
 - Embedded and system fonts.
@@ -29,6 +32,7 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
 
 - [x] Open and save real files
 - [x] Warn about unsaved changes when closing the window
+- [x] Add keyboard shortcuts and atomic document saves
 - [ ] Export PDF from the interface
 - [ ] Project file tree and multi-file editing
 - [ ] Search and replace

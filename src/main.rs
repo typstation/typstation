@@ -3,6 +3,8 @@ mod document;
 mod formatting;
 
 use std::{
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -11,7 +13,7 @@ use document::Document;
 use iced::{
     Element,
     Length::Fill,
-    Subscription, Task, Theme,
+    Subscription, Task, Theme, event, keyboard,
     time::{self, Instant},
     widget::{button, column, container, pane_grid, row, scrollable, svg, text},
     window,
@@ -242,7 +244,12 @@ impl App {
             Message::OpenDocument => self.request_destructive_action(DestructiveFileAction::Open),
             Message::SaveDocument => {
                 self.pending_after_save = None;
-                self.start_save(false)
+
+                if self.document.is_dirty() {
+                    self.start_save(false)
+                } else {
+                    Task::none()
+                }
             }
             Message::SaveDocumentAs => {
                 self.pending_after_save = None;
@@ -277,15 +284,17 @@ impl App {
     fn subscription(&self) -> Subscription<Message> {
         let compiler = compiler::subscription(self.compiler_config()).map(Message::Compiler);
         let close_requests = window::close_requests().map(Message::CloseRequested);
+        let shortcuts = shortcut_subscription();
 
         if self.pending_compile.is_some() {
             Subscription::batch([
                 compiler,
                 time::every(DEBOUNCE_TICK).map(Message::DebounceTick),
                 close_requests,
+                shortcuts,
             ])
         } else {
-            Subscription::batch([compiler, close_requests])
+            Subscription::batch([compiler, close_requests, shortcuts])
         }
     }
 
@@ -716,9 +725,116 @@ async fn save_document_as(directory: PathBuf, file_name: String, source: String)
 }
 
 async fn write_document(path: PathBuf, source: String) -> SaveOutcome {
-    match tokio::fs::write(&path, source.as_bytes()).await {
-        Ok(()) => SaveOutcome::Saved { path, source },
-        Err(error) => SaveOutcome::Failed(format!("{}: {error}", path.display())),
+    let destination = path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        atomic_write_document(&destination, &source)?;
+        Ok::<_, io::Error>(source)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(source)) => SaveOutcome::Saved { path, source },
+        Ok(Err(error)) => SaveOutcome::Failed(format!("{}: {error}", path.display())),
+        Err(error) => SaveOutcome::Failed(format!(
+            "{}: tarefa de salvamento interrompida: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn atomic_write_document(path: &Path, source: &str) -> io::Result<()> {
+    let destination = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)?,
+        Ok(_) => path.to_path_buf(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(error) => return Err(error),
+    };
+    let directory = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let permissions = match fs::metadata(&destination) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+
+    if permissions.as_ref().is_some_and(fs::Permissions::readonly) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "o arquivo de destino é somente leitura",
+        ));
+    }
+
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".typstation-").suffix(".tmp");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        builder.permissions(
+            permissions
+                .clone()
+                .unwrap_or_else(|| fs::Permissions::from_mode(0o666)),
+        );
+    }
+
+    let mut temporary = builder.tempfile_in(directory)?;
+
+    #[cfg(not(unix))]
+    if let Some(permissions) = permissions {
+        temporary.as_file().set_permissions(permissions)?;
+    }
+
+    temporary.write_all(source.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(destination)
+        .map(|_| ())
+        .map_err(|error| error.error)
+}
+
+fn shortcut_subscription() -> Subscription<Message> {
+    event::listen_with(|event, _status, window| {
+        let iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            repeat,
+            ..
+        }) = event
+        else {
+            return None;
+        };
+
+        if repeat {
+            return None;
+        }
+
+        shortcut_message(key.to_latin(physical_key)?, modifiers, window)
+    })
+}
+
+fn shortcut_message(
+    key: char,
+    modifiers: keyboard::Modifiers,
+    window: window::Id,
+) -> Option<Message> {
+    if !modifiers.command() || modifiers.alt() {
+        return None;
+    }
+
+    match (key.to_ascii_lowercase(), modifiers.shift()) {
+        ('n', false) => Some(Message::NewDocument),
+        ('o', false) => Some(Message::OpenDocument),
+        ('s', false) => Some(Message::SaveDocument),
+        ('s', true) => Some(Message::SaveDocumentAs),
+        ('q', false) => Some(Message::CloseRequested(window)),
+        ('b', false) => Some(Message::Bold),
+        ('i', false) => Some(Message::Italic),
+        ('u', false) => Some(Message::Underline),
+        _ => None,
     }
 }
 
@@ -815,5 +931,101 @@ mod tests {
             Some(DestructiveFileAction::Close(pending_id)) if pending_id == id
         ));
         assert!(app.file_busy);
+    }
+
+    #[test]
+    fn command_shortcuts_reuse_application_messages() {
+        let window = window::Id::unique();
+        let command = keyboard::Modifiers::COMMAND;
+
+        assert!(matches!(
+            shortcut_message('n', command, window),
+            Some(Message::NewDocument)
+        ));
+        assert!(matches!(
+            shortcut_message('o', command, window),
+            Some(Message::OpenDocument)
+        ));
+        assert!(matches!(
+            shortcut_message('s', command, window),
+            Some(Message::SaveDocument)
+        ));
+        assert!(matches!(
+            shortcut_message('s', command | keyboard::Modifiers::SHIFT, window),
+            Some(Message::SaveDocumentAs)
+        ));
+        assert!(matches!(
+            shortcut_message('q', command, window),
+            Some(Message::CloseRequested(id)) if id == window
+        ));
+        assert!(matches!(
+            shortcut_message('b', command, window),
+            Some(Message::Bold)
+        ));
+        assert!(matches!(
+            shortcut_message('i', command, window),
+            Some(Message::Italic)
+        ));
+        assert!(matches!(
+            shortcut_message('u', command, window),
+            Some(Message::Underline)
+        ));
+        assert!(shortcut_message('s', keyboard::Modifiers::NONE, window).is_none());
+        assert!(shortcut_message('n', command | keyboard::Modifiers::SHIFT, window).is_none());
+    }
+
+    #[test]
+    fn atomic_save_replaces_the_document_without_leaving_a_temporary_file() {
+        let directory = tempfile::tempdir().expect("a temporary directory can be created");
+        let path = directory.path().join("document.typ");
+        fs::write(&path, "old").expect("the original document can be written");
+
+        atomic_write_document(&path, "new").expect("the document can be replaced atomically");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("the saved document can be read"),
+            "new"
+        );
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("the directory can be read")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_preserves_permissions_and_symbolic_links() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().expect("a temporary directory can be created");
+        let target = directory.path().join("target.typ");
+        let link = directory.path().join("document.typ");
+        fs::write(&target, "old").expect("the original document can be written");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640))
+            .expect("the original permissions can be set");
+        symlink(&target, &link).expect("the symbolic link can be created");
+
+        atomic_write_document(&link, "new").expect("the symbolic link target can be saved");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("the symbolic link still exists")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(&target).expect("the target can be read"),
+            "new"
+        );
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("the target metadata can be read")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
     }
 }
