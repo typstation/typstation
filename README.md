@@ -28,7 +28,7 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
 ## Roadmap
 
 - [x] Open and save real files
-- [ ] Warn about unsaved changes when closing the window
+- [x] Warn about unsaved changes when closing the window
 - [ ] Export PDF from the interface
 - [ ] Project file tree and multi-file editing
 - [ ] Search and replace

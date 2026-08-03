@@ -14,6 +14,7 @@ use iced::{
     Subscription, Task, Theme,
     time::{self, Instant},
     widget::{button, column, container, pane_grid, row, scrollable, svg, text},
+    window,
 };
 use rfd::{AsyncFileDialog, AsyncMessageDialog, MessageButtons, MessageDialogResult, MessageLevel};
 use typst_iced_editor::{Action, code_editor};
@@ -29,6 +30,7 @@ fn main() -> iced::Result {
         .theme(Theme::Dark)
         .window_size([1200.0, 800.0])
         .centered()
+        .exit_on_close_request(false)
         .run()
 }
 
@@ -63,6 +65,7 @@ enum Message {
     OpenDocument,
     SaveDocument,
     SaveDocumentAs,
+    CloseRequested(window::Id),
     UnsavedDecision {
         action: DestructiveFileAction,
         decision: UnsavedDecision,
@@ -93,6 +96,7 @@ enum PreviewStatus {
 enum DestructiveFileAction {
     New,
     Open,
+    Close(window::Id),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -244,6 +248,9 @@ impl App {
                 self.pending_after_save = None;
                 self.start_save(true)
             }
+            Message::CloseRequested(id) => {
+                self.request_destructive_action(DestructiveFileAction::Close(id))
+            }
             Message::UnsavedDecision { action, decision } => {
                 self.file_busy = false;
 
@@ -269,14 +276,16 @@ impl App {
 
     fn subscription(&self) -> Subscription<Message> {
         let compiler = compiler::subscription(self.compiler_config()).map(Message::Compiler);
+        let close_requests = window::close_requests().map(Message::CloseRequested);
 
         if self.pending_compile.is_some() {
             Subscription::batch([
                 compiler,
                 time::every(DEBOUNCE_TICK).map(Message::DebounceTick),
+                close_requests,
             ])
         } else {
-            compiler
+            Subscription::batch([compiler, close_requests])
         }
     }
 
@@ -369,6 +378,7 @@ impl App {
 
                 Task::perform(open_document(directory), Message::OpenFinished)
             }
+            DestructiveFileAction::Close(id) => window::close(id),
         }
     }
 
@@ -776,5 +786,34 @@ mod tests {
         assert!(source.is_empty());
         assert_ne!(current_editor, previous_editor);
         assert_eq!(app.panes.len(), 2);
+    }
+
+    #[test]
+    fn closing_a_dirty_document_starts_confirmation() {
+        let mut app = App::boot();
+
+        let _ = app.update(Message::CloseRequested(window::Id::unique()));
+
+        assert!(app.document.is_dirty());
+        assert!(app.file_busy);
+        assert!(app.pending_after_save.is_none());
+    }
+
+    #[test]
+    fn saving_before_close_keeps_the_close_action_pending() {
+        let mut app = App::boot();
+        let id = window::Id::unique();
+        app.file_busy = true;
+
+        let _ = app.update(Message::UnsavedDecision {
+            action: DestructiveFileAction::Close(id),
+            decision: UnsavedDecision::Save,
+        });
+
+        assert!(matches!(
+            app.pending_after_save,
+            Some(DestructiveFileAction::Close(pending_id)) if pending_id == id
+        ));
+        assert!(app.file_busy);
     }
 }
