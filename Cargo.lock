@@ -5257,6 +5257,7 @@ name = "typstation"
 version = "0.0.1"
 dependencies = [
  "iced",
+ "regex",
  "rfd",
  "tempfile",
  "tokio",

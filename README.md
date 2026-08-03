@@ -22,6 +22,8 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
   symbolic links.
 - PDF export from the current editor snapshot using the persistent compiler
   worker.
+- Unicode-aware search and replace with match navigation, whole-word and case
+  options, and single-step undo for Replace All.
 - Unsaved-change tracking and confirmation before replacing the current
   document.
 - Embedded and system fonts.
@@ -37,7 +39,7 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
 - [x] Add keyboard shortcuts and atomic document saves
 - [x] Export PDF from the interface
 - [ ] Project file tree and multi-file editing
-- [ ] Search and replace
+- [x] Search and replace
 
 ## Building
 

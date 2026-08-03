@@ -1,6 +1,7 @@
 mod compiler;
 mod document;
 mod formatting;
+mod search;
 
 use std::{
     fs,
@@ -15,7 +16,10 @@ use iced::{
     Length::Fill,
     Subscription, Task, Theme, event, keyboard,
     time::{self, Instant},
-    widget::{button, column, container, pane_grid, row, scrollable, svg, text},
+    widget::{
+        Id, button, checkbox, column, container, operation, pane_grid, row, scrollable, svg, text,
+        text_input,
+    },
     window,
 };
 use rfd::{AsyncFileDialog, AsyncMessageDialog, MessageButtons, MessageDialogResult, MessageLevel};
@@ -49,6 +53,8 @@ struct App {
     file_busy: bool,
     pending_after_save: Option<DestructiveFileAction>,
     pending_pdf_export: Option<PendingPdfExport>,
+    search: SearchState,
+    search_input_id: Id,
     file_status: Option<String>,
 }
 
@@ -64,6 +70,18 @@ enum Message {
     Italic,
     Underline,
     PrefixLines(String),
+    OpenSearch,
+    OpenReplace,
+    CloseSearch,
+    ShowReplace,
+    SearchQueryChanged(String),
+    SearchReplacementChanged(String),
+    SearchCaseChanged(bool),
+    SearchWholeWordChanged(bool),
+    SearchNext,
+    SearchPrevious,
+    ReplaceCurrent,
+    ReplaceAll,
     NewDocument,
     OpenDocument,
     SaveDocument,
@@ -96,6 +114,16 @@ struct PendingPdfExport {
     request_id: u64,
     revision: u64,
     path: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct SearchState {
+    visible: bool,
+    replace_visible: bool,
+    query: String,
+    replacement: String,
+    case_sensitive: bool,
+    whole_word: bool,
 }
 
 enum PreviewStatus {
@@ -171,6 +199,8 @@ impl App {
             file_busy: false,
             pending_after_save: None,
             pending_pdf_export: None,
+            search: SearchState::default(),
+            search_input_id: Id::unique(),
             file_status: Some("O tutorial inicial ainda não foi salvo".to_owned()),
         }
     }
@@ -196,6 +226,7 @@ impl App {
                     self.document.clear_diagnostics();
                     self.file_status = None;
                     self.schedule_compile(DEBOUNCE, false);
+                    self.refresh_search_matches(None, false);
                 }
 
                 Task::none()
@@ -238,6 +269,52 @@ impl App {
                     self.after_formatting();
                 }
 
+                Task::none()
+            }
+            Message::OpenSearch => self.open_search(false),
+            Message::OpenReplace => self.open_search(true),
+            Message::CloseSearch => {
+                self.search.visible = false;
+                self.document.clear_search_matches();
+                Task::none()
+            }
+            Message::ShowReplace => {
+                self.search.replace_visible = true;
+                Task::none()
+            }
+            Message::SearchQueryChanged(query) => {
+                self.search.query = query;
+                self.refresh_search_matches(Some(0), true);
+                Task::none()
+            }
+            Message::SearchReplacementChanged(replacement) => {
+                self.search.replacement = replacement;
+                Task::none()
+            }
+            Message::SearchCaseChanged(case_sensitive) => {
+                self.search.case_sensitive = case_sensitive;
+                self.refresh_search_matches(Some(0), true);
+                Task::none()
+            }
+            Message::SearchWholeWordChanged(whole_word) => {
+                self.search.whole_word = whole_word;
+                self.refresh_search_matches(Some(0), true);
+                Task::none()
+            }
+            Message::SearchNext => {
+                self.move_search_match(false);
+                Task::none()
+            }
+            Message::SearchPrevious => {
+                self.move_search_match(true);
+                Task::none()
+            }
+            Message::ReplaceCurrent => {
+                self.replace_current_match();
+                Task::none()
+            }
+            Message::ReplaceAll => {
+                self.replace_all_matches();
                 Task::none()
             }
             Message::PaneDragged(event) => {
@@ -378,10 +455,69 @@ impl App {
             .width(Fill)
             .padding([5, 8]);
 
-        column![toolbar, panes, status]
+        let mut content = column![toolbar];
+
+        if self.search.visible {
+            content = content.push(self.search_view());
+        }
+
+        content
+            .push(panes)
+            .push(status)
             .width(Fill)
             .height(Fill)
             .into()
+    }
+
+    fn search_view(&self) -> Element<'_, Message> {
+        let matches = self.document.search_matches();
+        let current = self
+            .document
+            .current_search_match()
+            .filter(|index| *index < matches.len())
+            .map_or(0, |index| index + 1);
+        let count = text(format!("{current}/{}", matches.len())).width(60);
+        let query = text_input("Buscar", &self.search.query)
+            .id(self.search_input_id.clone())
+            .on_input(Message::SearchQueryChanged)
+            .on_submit(Message::SearchNext)
+            .width(280);
+        let mut find_row = row![
+            query,
+            button("↑").on_press(Message::SearchPrevious),
+            button("↓").on_press(Message::SearchNext),
+            count,
+            checkbox(self.search.case_sensitive)
+                .label("Maiúsculas")
+                .on_toggle(Message::SearchCaseChanged),
+            checkbox(self.search.whole_word)
+                .label("Palavra inteira")
+                .on_toggle(Message::SearchWholeWordChanged),
+        ]
+        .spacing(6);
+
+        if !self.search.replace_visible {
+            find_row = find_row.push(button("Substituir").on_press(Message::ShowReplace));
+        }
+
+        find_row = find_row.push(button("X").on_press(Message::CloseSearch));
+
+        let mut panel = column![find_row].spacing(4);
+
+        if self.search.replace_visible {
+            let replace_row = row![
+                text_input("Substituir por", &self.search.replacement)
+                    .on_input(Message::SearchReplacementChanged)
+                    .on_submit(Message::ReplaceCurrent)
+                    .width(280),
+                button("Substituir").on_press(Message::ReplaceCurrent),
+                button("Substituir todos").on_press(Message::ReplaceAll),
+            ]
+            .spacing(6);
+            panel = panel.push(replace_row);
+        }
+
+        container(panel).width(Fill).padding([4, 8]).into()
     }
 
     fn request_destructive_action(&mut self, action: DestructiveFileAction) -> Task<Message> {
@@ -578,6 +714,7 @@ impl App {
     }
 
     fn document_replaced(&mut self, previous_config: compiler::Config) {
+        self.search.visible = false;
         self.replace_editor_pane_identity();
         self.preview = None;
         self.latest_request_id = None;
@@ -628,6 +765,111 @@ impl App {
         self.file_status = None;
         self.schedule_compile(Duration::ZERO, false);
         self.dispatch_compile(Instant::now());
+        self.refresh_search_matches(None, false);
+    }
+
+    fn open_search(&mut self, replace_visible: bool) -> Task<Message> {
+        if let Some(selection) = self.document.selection_text()
+            && !selection.is_empty()
+            && !selection.contains(['\n', '\r'])
+        {
+            self.search.query = selection;
+        }
+
+        self.search.visible = true;
+        self.search.replace_visible = replace_visible;
+        self.refresh_search_matches(Some(0), true);
+        operation::focus(self.search_input_id.clone())
+    }
+
+    fn refresh_search_matches(&mut self, preferred: Option<usize>, reveal: bool) {
+        if !self.search.visible {
+            return;
+        }
+
+        let previous = self.document.current_search_match();
+        let matches = {
+            let buffer = self.document.content().buffer();
+            search::find_matches(
+                buffer.text(),
+                &self.search.query,
+                search::Options {
+                    case_sensitive: self.search.case_sensitive,
+                    whole_word: self.search.whole_word,
+                },
+            )
+        };
+        let current = (!matches.is_empty())
+            .then(|| preferred.or(previous).unwrap_or(0).min(matches.len() - 1));
+
+        self.document.set_search_matches(matches, current);
+
+        if reveal && let Some(current) = current {
+            self.document.reveal_search_match(current);
+        }
+    }
+
+    fn move_search_match(&mut self, reverse: bool) {
+        let count = self.document.search_matches().len();
+
+        if count == 0 {
+            return;
+        }
+
+        let current = self.document.current_search_match();
+        let next = match (current, reverse) {
+            (Some(0), true) | (None, true) => count - 1,
+            (Some(index), true) => index - 1,
+            (Some(index), false) => (index + 1) % count,
+            (None, false) => 0,
+        };
+
+        self.document.reveal_search_match(next);
+    }
+
+    fn replace_current_match(&mut self) {
+        let matches = self.document.search_matches();
+        let Some(index) = self.document.current_search_match() else {
+            return;
+        };
+        let Some(range) = matches.get(index).cloned() else {
+            return;
+        };
+        let resume_at = range.start + self.search.replacement.len();
+
+        self.document.perform(Action::Replace {
+            range,
+            text: self.search.replacement.clone(),
+        });
+        self.after_formatting();
+
+        let matches = self.document.search_matches();
+        if let Some(next) = matches
+            .iter()
+            .position(|range| range.start >= resume_at)
+            .or_else(|| (!matches.is_empty()).then_some(0))
+        {
+            self.document.reveal_search_match(next);
+        }
+    }
+
+    fn replace_all_matches(&mut self) {
+        let matches = self.document.search_matches();
+
+        if matches.is_empty() {
+            return;
+        }
+
+        let count = matches.len();
+        let replacement = self.search.replacement.clone();
+        let edits = matches
+            .into_iter()
+            .map(|range| (range, replacement.clone()))
+            .collect();
+
+        self.document.perform(Action::ApplyEdits(edits));
+        self.after_formatting();
+        self.file_status = Some(format!("{count} ocorrência(s) substituída(s)"));
     }
 
     fn schedule_compile(&mut self, delay: Duration, reset_files: bool) {
@@ -986,6 +1228,20 @@ fn shortcut_subscription() -> Subscription<Message> {
             return None;
         }
 
+        match key.as_ref() {
+            keyboard::Key::Named(keyboard::key::Named::F3) => {
+                return Some(if modifiers.shift() {
+                    Message::SearchPrevious
+                } else {
+                    Message::SearchNext
+                });
+            }
+            keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                return Some(Message::CloseSearch);
+            }
+            _ => {}
+        }
+
         shortcut_message(key.to_latin(physical_key)?, modifiers, window)
     })
 }
@@ -1008,6 +1264,8 @@ fn shortcut_message(
         ('b', false) => Some(Message::Bold),
         ('i', false) => Some(Message::Italic),
         ('u', false) => Some(Message::Underline),
+        ('f', false) => Some(Message::OpenSearch),
+        ('h', false) => Some(Message::OpenReplace),
         _ => None,
     }
 }
@@ -1168,8 +1426,48 @@ mod tests {
             shortcut_message('u', command, window),
             Some(Message::Underline)
         ));
+        assert!(matches!(
+            shortcut_message('f', command, window),
+            Some(Message::OpenSearch)
+        ));
+        assert!(matches!(
+            shortcut_message('h', command, window),
+            Some(Message::OpenReplace)
+        ));
         assert!(shortcut_message('s', keyboard::Modifiers::NONE, window).is_none());
         assert!(shortcut_message('n', command | keyboard::Modifiers::SHIFT, window).is_none());
+    }
+
+    #[test]
+    fn replace_all_is_a_single_undoable_edit() {
+        let mut app = App::boot();
+        app.document = Document::opened(PathBuf::from("document.typ"), "cat and cat".to_owned());
+        app.search.visible = true;
+        app.search.query = "cat".to_owned();
+        app.search.replacement = "dog".to_owned();
+        app.refresh_search_matches(Some(0), true);
+
+        app.replace_all_matches();
+
+        assert_eq!(app.document.snapshot().1, "dog and dog");
+        app.document.perform(Action::Undo);
+        assert_eq!(app.document.snapshot().1, "cat and cat");
+    }
+
+    #[test]
+    fn replace_current_advances_to_the_next_match() {
+        let mut app = App::boot();
+        app.document = Document::opened(PathBuf::from("document.typ"), "cat cat".to_owned());
+        app.search.visible = true;
+        app.search.query = "cat".to_owned();
+        app.search.replacement = "dog".to_owned();
+        app.refresh_search_matches(Some(0), true);
+
+        app.replace_current_match();
+
+        assert_eq!(app.document.snapshot().1, "dog cat");
+        assert_eq!(app.document.current_search_match(), Some(0));
+        assert_eq!(app.document.search_matches(), vec![4..7]);
     }
 
     #[test]

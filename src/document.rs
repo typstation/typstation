@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 use typst_iced_editor::{Action, Content, Diagnostic};
 
@@ -103,6 +106,30 @@ impl Document {
 
     pub fn set_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
         self.content.set_diagnostics(diagnostics);
+    }
+
+    pub fn set_search_matches(&mut self, matches: Vec<Range<usize>>, current: Option<usize>) {
+        self.content.set_search_matches(matches, current);
+    }
+
+    pub fn clear_search_matches(&mut self) {
+        self.content.clear_search_matches();
+    }
+
+    pub fn search_matches(&self) -> Vec<Range<usize>> {
+        self.content.search_matches()
+    }
+
+    pub fn current_search_match(&self) -> Option<usize> {
+        self.content.current_search_match()
+    }
+
+    pub fn reveal_search_match(&mut self, index: usize) -> bool {
+        self.content.reveal_search_match(index)
+    }
+
+    pub fn selection_text(&self) -> Option<String> {
+        self.content.selection_text()
     }
 
     pub fn revision(&self) -> u64 {
