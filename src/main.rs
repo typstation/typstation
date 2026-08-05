@@ -1,10 +1,13 @@
 mod compiler;
+mod display;
 mod document;
 mod formatting;
 mod project;
 mod search;
 mod session;
 mod settings;
+mod source_map;
+pub mod ui;
 mod watcher;
 
 use std::{
@@ -13,18 +16,21 @@ use std::{
     io::{self, Write},
     ops::Range,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
     time::Duration,
 };
 
-use document::{Document, DocumentId, Documents, ExternalChangeKind, ExternalUpdate};
+use document::{
+    Document, DocumentId, Documents, ExternalChangeKind, ExternalUpdate, compiler_location_for_path,
+};
 use iced::{
-    Alignment, Element,
+    Alignment, Border, Color, Element,
     Length::{Fill, FillPortion},
-    Subscription, Task, Theme, event, keyboard,
+    Point, Subscription, Task, Theme, event, keyboard, mouse,
     time::{self, Instant},
     widget::{
-        Id, button, checkbox, column, container, operation, pane_grid, row, scrollable, slider,
-        svg, text, text_input, tooltip,
+        Id, Space, Stack, checkbox, column, container, mouse_area, operation, pane_grid,
+        responsive, row, scrollable, slider, svg, text, text_input,
     },
     window,
 };
@@ -38,45 +44,95 @@ const SESSION_DEBOUNCE: Duration = Duration::from_millis(750);
 const SESSION_TICK: Duration = Duration::from_millis(200);
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(150);
 const WATCHER_TICK: Duration = Duration::from_millis(50);
+const PREVIEW_PADDING: f32 = 12.0;
+const PREVIEW_PAGE_SPACING: f32 = 12.0;
+const PREVIEW_LABEL_HEIGHT: f32 = 18.0;
+const PREVIEW_LABEL_SPACING: f32 = 4.0;
+const PREVIEW_HIT_DISTANCE: f32 = 12.0;
+const TYPOGRAPHIC_POINTS_PER_INCH: f32 = 72.0;
+const APP_BAR_HEIGHT: f32 = 40.0;
+const APP_BAR_HORIZONTAL_PADDING: f32 = 4.0;
+const FILE_MENU_TRIGGER_WIDTH: f32 = 72.0;
+const EDIT_MENU_TRIGGER_WIDTH: f32 = 64.0;
+const VIEW_MENU_TRIGGER_WIDTH: f32 = 64.0;
+const HELP_MENU_TRIGGER_WIDTH: f32 = 64.0;
+const PROJECT_CONTEXT_MENU_WIDTH: f32 = 280.0;
+const CONTEXT_MENU_VIEWPORT_MARGIN: f32 = 4.0;
 const DEMO: &str = include_str!("demo.typ");
+
+fn preview_scale(zoom_percent: u16, logical_pixels_per_inch: f32) -> f32 {
+    logical_pixels_per_inch / TYPOGRAPHIC_POINTS_PER_INCH * f32::from(zoom_percent) / 100.0
+}
+
+fn preview_canvas_width(viewport_width: f32, maximum_page_width: f32) -> f32 {
+    viewport_width.max(maximum_page_width + PREVIEW_PADDING * 2.0)
+}
 
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
         .subscription(App::subscription)
         .title(App::title)
         .theme(App::theme)
-        .window_size([1200.0, 800.0])
-        .centered()
-        .exit_on_close_request(false)
+        .window(app_window_settings())
         .run()
+}
+
+fn app_window_settings() -> window::Settings {
+    window::Settings {
+        size: iced::Size::new(1200.0, 800.0),
+        maximized: true,
+        position: window::Position::Centered,
+        exit_on_close_request: false,
+        ..window::Settings::default()
+    }
 }
 
 struct App {
     document: Documents,
     panes: pane_grid::State<Pane>,
     workspace_root: PathBuf,
+    project_main: Option<PathBuf>,
     compiler: Option<compiler::Sender>,
     pending_compile: Option<PendingCompile>,
+    compilation_revision: u64,
     next_request_id: u64,
     latest_request_id: Option<u64>,
     preview: Vec<PreviewPage>,
+    preview_revision: Option<u64>,
     preview_status: PreviewStatus,
+    preview_scroll_id: Id,
+    preview_pointer: Option<PreviewPointer>,
+    preview_highlight: Option<PreviewHighlight>,
+    modifiers: keyboard::Modifiers,
     file_busy: bool,
     pending_after_save: Option<DestructiveFileAction>,
     pending_pdf_export: Option<PendingPdfExport>,
     search: SearchState,
     search_input_id: Id,
-    project_files: Vec<PathBuf>,
+    project_navigation: ProjectNavigation,
+    project_tree: Vec<project::ProjectEntry>,
+    expanded_project_directories: HashSet<PathBuf>,
+    selected_project_entry: Option<PathBuf>,
     selected_project_file: Option<PathBuf>,
+    document_outline: Vec<compiler::DocumentOutlineItem>,
+    collapsed_outline_entries: HashSet<OutlineKey>,
     diagnostics: Vec<compiler::ReportedDiagnostic>,
-    pending_diagnostic_reveal: Option<(PathBuf, Range<usize>)>,
+    pending_source_reveal: Option<PendingSourceReveal>,
     project_scan_busy: bool,
+    detect_project_main_on_scan: bool,
     external_check_busy: bool,
     watcher_deadline: Option<Instant>,
     discarded_on_close: HashSet<DocumentId>,
     session: SessionTracker,
     settings: settings::Settings,
+    preview_logical_ppi: f32,
     settings_visible: bool,
+    open_menu: Option<AppMenu>,
+    menu_focus: usize,
+    menu_bar_drag_active: bool,
+    project_context_menu: Option<ProjectContextMenu>,
+    cursor_position: Point,
+    about_visible: bool,
     file_status: Option<String>,
 }
 
@@ -84,6 +140,32 @@ struct PreviewPage {
     handle: svg::Handle,
     width: f32,
     height: f32,
+    regions: Vec<source_map::SourceRegion>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviewPointer {
+    page: usize,
+    position: Point,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviewHighlight {
+    page: usize,
+    bounds: source_map::SourceBounds,
+}
+
+struct PendingSourceReveal {
+    path: PathBuf,
+    range: Range<usize>,
+    status: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectContextMenu {
+    path: PathBuf,
+    kind: project::EntryKind,
+    position: Point,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +192,14 @@ enum Message {
     PreviewZoomOut,
     PreviewZoomReset,
     PreviewZoomChanged(u16),
+    RevealInPreview,
+    PreviewPointerMoved {
+        page: usize,
+        position: Point,
+    },
+    PreviewPointerLeft(usize),
+    PreviewClicked(usize),
+    ModifiersChanged(keyboard::Modifiers),
     OpenSearch,
     OpenReplace,
     CloseSearch,
@@ -127,10 +217,17 @@ enum Message {
     NewDocument,
     OpenDocument,
     OpenProject,
-    OpenProjectFile(PathBuf),
+    ProjectNavigationSelected(ProjectNavigation),
+    DocumentOutlinePressed {
+        target: source_map::SourceTarget,
+        range: Range<usize>,
+        has_children: bool,
+    },
+    ProjectEntryPressed(PathBuf, project::EntryKind),
+    ProjectEntryContextRequested(PathBuf, project::EntryKind),
     CreateProjectFile,
-    RenameProjectFile,
-    DeleteProjectFile,
+    CreateProjectDirectory,
+    RefreshProjectTree,
     ProjectOperationFinished(project::OperationOutcome),
     OpenDiagnostic(compiler::DiagnosticTarget, Range<usize>),
     ProjectFolderSelected(Option<PathBuf>),
@@ -145,6 +242,18 @@ enum Message {
     SaveDocument,
     SaveDocumentAs,
     ExportPdf,
+    ToggleMenu(AppMenu),
+    MenuBarPointerPressed(AppMenu),
+    MenuBarPointerEntered(AppMenu),
+    MenuBarPointerReleased,
+    DismissMenu,
+    MenuFocused(usize),
+    MenuNavigate(MenuNavigation),
+    MenuCommand(MenuCommand),
+    CursorMoved(Point),
+    EscapePressed,
+    ExitWindowFound(Option<window::Id>),
+    CloseAbout,
     PdfPathSelected(PdfPathOutcome),
     PdfWriteFinished(PdfWriteOutcome),
     CloseRequested(window::Id),
@@ -157,9 +266,129 @@ enum Message {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppMenu {
+    File,
+    Edit,
+    View,
+    Help,
+}
+
+impl AppMenu {
+    const fn next(self) -> Self {
+        match self {
+            Self::File => Self::Edit,
+            Self::Edit => Self::View,
+            Self::View => Self::Help,
+            Self::Help => Self::File,
+        }
+    }
+
+    const fn previous(self) -> Self {
+        match self {
+            Self::File => Self::Help,
+            Self::Edit => Self::File,
+            Self::View => Self::Edit,
+            Self::Help => Self::View,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuNavigation {
+    NextItem,
+    PreviousItem,
+    FirstItem,
+    LastItem,
+    NextMenu,
+    PreviousMenu,
+    Activate,
+}
+
+#[derive(Debug, Clone)]
+enum MenuCommand {
+    NewDocument,
+    OpenDocument,
+    OpenProject,
+    SaveDocument,
+    SaveDocumentAs,
+    ExportPdf,
+    CloseDocument(DocumentId),
+    Exit,
+    Editor(Action),
+    OpenSearch,
+    OpenReplace,
+    ToggleSettings,
+    ShowGutter(bool),
+    WrapLines(bool),
+    ToggleProjectPane,
+    PreviewZoomIn,
+    PreviewZoomOut,
+    PreviewZoomReset,
+    OpenTypstDocumentation,
+    ShowAbout,
+    OpenProjectEntry(PathBuf, project::EntryKind),
+    CreateProjectFileAt(PathBuf),
+    CreateProjectDirectoryAt(PathBuf),
+    RenameProjectEntry(PathBuf, project::EntryKind),
+    DeleteProjectEntry(PathBuf, project::EntryKind),
+    SetProjectMain(PathBuf),
+    ClearProjectMain,
+    RefreshProjectTree,
+}
+
+#[derive(Debug, Clone)]
+enum AppMenuEntry {
+    Item {
+        label: &'static str,
+        value: Option<String>,
+        selected: bool,
+        enabled: bool,
+        command: MenuCommand,
+    },
+    Divider,
+}
+
+impl AppMenuEntry {
+    fn item(
+        label: &'static str,
+        value: Option<String>,
+        selected: bool,
+        enabled: bool,
+        command: MenuCommand,
+    ) -> Self {
+        Self::Item {
+            label,
+            value,
+            selected,
+            enabled,
+            command,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pane {
+    Project,
     Editor,
     Preview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectNavigation {
+    Files,
+    Topics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OutlineKey {
+    target: source_map::SourceTarget,
+    start: usize,
+}
+
+impl OutlineKey {
+    fn new(target: source_map::SourceTarget, start: usize) -> Self {
+        Self { target, start }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -287,22 +516,23 @@ enum PdfWriteOutcome {
 
 impl App {
     fn boot() -> (Self, Task<Message>) {
+        let preview_logical_ppi = display::logical_pixels_per_inch();
         let session_path = session::default_path();
         let stored = match session_path.as_deref() {
             Some(path) => session::load(path),
             None => Ok(None),
         };
         let mut app = match stored {
-            Ok(Some(stored)) => Self::restore(stored, session_path),
-            Ok(None) => Self::fresh(session_path),
+            Ok(Some(stored)) => Self::restore(stored, session_path, preview_logical_ppi),
+            Ok(None) => Self::fresh(session_path, preview_logical_ppi),
             Err(error) => {
                 eprintln!("erro ao restaurar sessão: {error}");
-                let mut app = Self::fresh(session_path);
+                let mut app = Self::fresh(session_path, preview_logical_ppi);
                 app.file_status = Some(format!("Não foi possível restaurar a sessão: {error}"));
                 app
             }
         };
-        let project_scan = app.refresh_project_files();
+        let project_scan = app.refresh_project_tree();
         let external_check = app.check_external_files();
 
         (app, Task::batch([project_scan, external_check]))
@@ -310,27 +540,34 @@ impl App {
 
     #[cfg(test)]
     fn new() -> Self {
-        Self::fresh(None)
+        Self::fresh(None, display::FALLBACK_LOGICAL_PPI)
     }
 
-    fn fresh(session_path: Option<PathBuf>) -> Self {
+    fn fresh(session_path: Option<PathBuf>, preview_logical_ppi: f32) -> Self {
         let workspace_root = std::env::current_dir().unwrap_or_else(|error| {
             eprintln!("erro ao obter diretório atual: {error}");
             PathBuf::from(".")
         });
         let panes = panes_from_layout(session::PaneLayout::default());
 
-        Self::build(
+        let mut app = Self::build(
             Documents::new(Document::draft(DEMO)),
             panes,
             workspace_root,
+            None,
             session_path,
             settings::Settings::default(),
             "O tutorial inicial ainda não foi salvo".to_owned(),
-        )
+        );
+        app.preview_logical_ppi = preview_logical_ppi;
+        app
     }
 
-    fn restore(stored: session::Session, session_path: Option<PathBuf>) -> Self {
+    fn restore(
+        stored: session::Session,
+        session_path: Option<PathBuf>,
+        preview_logical_ppi: f32,
+    ) -> Self {
         let documents = stored
             .documents
             .into_iter()
@@ -339,55 +576,91 @@ impl App {
         let document = Documents::restored(documents, stored.active_document);
         let panes = panes_from_layout(stored.pane_layout);
 
-        Self::build(
+        let mut app = Self::build(
             document,
             panes,
             stored.workspace_root,
+            stored.project_main,
             session_path,
             stored.settings,
             "Sessão anterior restaurada".to_owned(),
-        )
+        );
+        app.preview_logical_ppi = preview_logical_ppi;
+        app
     }
 
     fn build(
         document: Documents,
         panes: pane_grid::State<Pane>,
         workspace_root: PathBuf,
+        project_main: Option<PathBuf>,
         session_path: Option<PathBuf>,
         settings: settings::Settings,
         file_status: String,
     ) -> Self {
+        let expanded_project_directories = HashSet::from([workspace_root.clone()]);
         let mut app = Self {
             document,
             panes,
             workspace_root,
+            project_main,
             compiler: None,
             pending_compile: Some(PendingCompile {
                 deadline: Instant::now(),
                 reset_files: true,
             }),
+            compilation_revision: 0,
             next_request_id: 0,
             latest_request_id: None,
             preview: Vec::new(),
+            preview_revision: None,
             preview_status: PreviewStatus::Waiting,
+            preview_scroll_id: Id::unique(),
+            preview_pointer: None,
+            preview_highlight: None,
+            modifiers: keyboard::Modifiers::NONE,
             file_busy: false,
             pending_after_save: None,
             pending_pdf_export: None,
             search: SearchState::default(),
             search_input_id: Id::unique(),
-            project_files: Vec::new(),
+            project_navigation: ProjectNavigation::Files,
+            project_tree: Vec::new(),
+            expanded_project_directories,
+            selected_project_entry: None,
             selected_project_file: None,
+            document_outline: Vec::new(),
+            collapsed_outline_entries: HashSet::new(),
             diagnostics: Vec::new(),
-            pending_diagnostic_reveal: None,
+            pending_source_reveal: None,
             project_scan_busy: false,
+            detect_project_main_on_scan: false,
             external_check_busy: false,
             watcher_deadline: None,
             discarded_on_close: HashSet::new(),
             session: SessionTracker::new(session_path),
             settings: settings.validate(),
+            preview_logical_ppi: display::FALLBACK_LOGICAL_PPI,
             settings_visible: false,
+            open_menu: None,
+            menu_focus: 0,
+            menu_bar_drag_active: false,
+            project_context_menu: None,
+            cursor_position: Point::ORIGIN,
+            about_visible: false,
             file_status: Some(file_status),
         };
+        let active_project_path = app
+            .document
+            .path()
+            .filter(|path| path.starts_with(&app.workspace_root))
+            .map(Path::to_path_buf);
+        if let Some(path) = active_project_path {
+            app.reveal_project_entry(&path);
+            if path.extension().is_some_and(|extension| extension == "typ") {
+                app.selected_project_file = Some(path);
+            }
+        }
         app.apply_editor_settings();
         app
     }
@@ -404,18 +677,85 @@ impl App {
     }
 
     fn theme(&self) -> Theme {
-        match self.settings.theme {
-            settings::ThemeMode::Dark => Theme::Dark,
-            settings::ThemeMode::Light => Theme::Light,
-        }
+        let scheme = match self.settings.theme {
+            settings::ThemeMode::Dark => ui::tokens::ColorScheme::Dark,
+            settings::ThemeMode::Light => ui::tokens::ColorScheme::Light,
+        };
+
+        ui::spectrum_theme(scheme)
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::ToggleMenu(menu) => {
+                self.menu_bar_drag_active = false;
+                self.toggle_menu(menu);
+                Task::none()
+            }
+            Message::MenuBarPointerPressed(menu) => {
+                self.menu_bar_drag_active = true;
+                self.toggle_menu(menu);
+                Task::none()
+            }
+            Message::MenuBarPointerEntered(menu) => {
+                if self.menu_bar_drag_active || self.open_menu.is_some() {
+                    self.show_menu(menu);
+                }
+                Task::none()
+            }
+            Message::MenuBarPointerReleased => {
+                self.menu_bar_drag_active = false;
+                Task::none()
+            }
+            Message::DismissMenu => {
+                self.open_menu = None;
+                self.project_context_menu = None;
+                self.menu_bar_drag_active = false;
+                Task::none()
+            }
+            Message::MenuFocused(index) => {
+                if self.open_menu.is_some() || self.project_context_menu.is_some() {
+                    self.menu_focus = index;
+                }
+                Task::none()
+            }
+            Message::MenuNavigate(navigation) => self.navigate_menu(navigation),
+            Message::MenuCommand(command) => self.run_menu_command(command),
+            Message::CursorMoved(position) => {
+                self.cursor_position = position;
+                Task::none()
+            }
+            Message::EscapePressed => {
+                self.menu_bar_drag_active = false;
+                if self.project_context_menu.take().is_some() {
+                    return Task::none();
+                }
+                if self.open_menu.take().is_some() {
+                    return Task::none();
+                }
+                if self.about_visible {
+                    self.about_visible = false;
+                    return Task::none();
+                }
+                if self.search.visible {
+                    self.search.visible = false;
+                    self.document.clear_search_matches();
+                }
+                Task::none()
+            }
+            Message::ExitWindowFound(window) => window.map_or_else(Task::none, |window| {
+                self.update(Message::CloseRequested(window))
+            }),
+            Message::CloseAbout => {
+                self.about_visible = false;
+                Task::none()
+            }
             Message::Editor(action) => {
                 if action.is_edit() && self.file_busy {
                     return Task::none();
                 }
+                let reveal_in_preview =
+                    self.modifiers.command() && matches!(action, Action::MoveTo(_));
                 let changed = self.document.perform(action);
 
                 if changed {
@@ -426,7 +766,11 @@ impl App {
                     self.refresh_search_matches(None, false);
                 }
 
-                Task::none()
+                if reveal_in_preview {
+                    self.reveal_cursor_in_preview()
+                } else {
+                    Task::none()
+                }
             }
             Message::Bold => {
                 if self.file_busy {
@@ -541,6 +885,25 @@ impl App {
                 self.settings_changed(false);
                 Task::none()
             }
+            Message::RevealInPreview => self.reveal_cursor_in_preview(),
+            Message::PreviewPointerMoved { page, position } => {
+                self.preview_pointer = Some(PreviewPointer { page, position });
+                Task::none()
+            }
+            Message::PreviewPointerLeft(page) => {
+                if self
+                    .preview_pointer
+                    .is_some_and(|pointer| pointer.page == page)
+                {
+                    self.preview_pointer = None;
+                }
+                Task::none()
+            }
+            Message::PreviewClicked(page) => self.reveal_preview_source(page),
+            Message::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers;
+                Task::none()
+            }
             Message::OpenSearch => self.open_search(false),
             Message::OpenReplace => self.open_search(true),
             Message::CloseSearch => {
@@ -627,10 +990,24 @@ impl App {
             }
             Message::OpenDocument => self.start_open_document(),
             Message::OpenProject => self.start_open_project(),
-            Message::OpenProjectFile(path) => self.open_project_file(path),
+            Message::ProjectNavigationSelected(navigation) => {
+                self.project_navigation = navigation;
+                self.project_context_menu = None;
+                Task::none()
+            }
+            Message::DocumentOutlinePressed {
+                target,
+                range,
+                has_children,
+            } => self.document_outline_pressed(target, range, has_children),
+            Message::ProjectEntryPressed(path, kind) => self.project_entry_pressed(path, kind),
+            Message::ProjectEntryContextRequested(path, kind) => {
+                self.show_project_context_menu(path, kind);
+                Task::none()
+            }
             Message::CreateProjectFile => self.start_create_project_file(),
-            Message::RenameProjectFile => self.start_rename_project_file(),
-            Message::DeleteProjectFile => self.start_delete_project_file(),
+            Message::CreateProjectDirectory => self.start_create_project_directory(),
+            Message::RefreshProjectTree => self.refresh_project_tree(),
             Message::ProjectOperationFinished(outcome) => self.handle_project_operation(outcome),
             Message::OpenDiagnostic(target, range) => self.open_diagnostic(target, range),
             Message::ProjectFolderSelected(path) => self.handle_project_folder_selected(path),
@@ -640,16 +1017,60 @@ impl App {
                 }
 
                 self.project_scan_busy = false;
-                match outcome.files {
-                    Ok(files) => {
+                match outcome.snapshot {
+                    Ok(snapshot) => {
                         if self
-                            .selected_project_file
+                            .selected_project_entry
                             .as_ref()
-                            .is_some_and(|selected| !files.contains(selected) && !selected.exists())
+                            .is_some_and(|selected| {
+                                !snapshot.contains_path(selected) && !selected.exists()
+                            })
                         {
+                            self.selected_project_entry = None;
+                        }
+                        if self.selected_project_file.as_ref().is_some_and(|selected| {
+                            !snapshot.typst_files.contains(selected) && !selected.exists()
+                        }) {
                             self.selected_project_file = None;
                         }
-                        self.project_files = files;
+                        if self.project_context_menu.as_ref().is_some_and(|context| {
+                            context.path != self.workspace_root
+                                && !snapshot.contains_path(&context.path)
+                                && !context.path.exists()
+                        }) {
+                            self.project_context_menu = None;
+                        }
+                        let missing_main = self.project_main.as_ref().is_some_and(|main| {
+                            !snapshot.typst_files.contains(main) && !main.exists()
+                        });
+                        let detected_main =
+                            if self.detect_project_main_on_scan && self.project_main.is_none() {
+                                let candidate = self.workspace_root.join("main.typ");
+                                snapshot
+                                    .typst_files
+                                    .contains(&candidate)
+                                    .then_some(candidate)
+                            } else {
+                                None
+                            };
+                        self.detect_project_main_on_scan = false;
+                        let workspace_root = self.workspace_root.clone();
+                        self.expanded_project_directories.retain(|path| {
+                            path == &workspace_root || snapshot.contains_directory(path)
+                        });
+                        self.project_tree = snapshot.entries;
+
+                        if missing_main {
+                            self.update_project_main(
+                                None,
+                                "O arquivo principal não existe mais; usando a aba ativa",
+                            );
+                        } else if let Some(main) = detected_main {
+                            self.update_project_main(
+                                Some(main),
+                                "main.typ detectado como documento principal",
+                            );
+                        }
                     }
                     Err(error) => {
                         eprintln!("erro ao examinar projeto: {error}");
@@ -730,9 +1151,20 @@ impl App {
     fn subscription(&self) -> Subscription<Message> {
         let compiler = compiler::subscription(self.compiler_config()).map(Message::Compiler);
         let close_requests = window::close_requests().map(Message::CloseRequested);
-        let shortcuts = shortcut_subscription();
+        let shortcuts = if self.open_menu.is_some() || self.project_context_menu.is_some() {
+            menu_keyboard_subscription()
+        } else {
+            shortcut_subscription()
+        };
         let watcher = watcher::subscription(self.workspace_root.clone()).map(Message::Watcher);
-        let mut subscriptions = vec![compiler, close_requests, shortcuts, watcher];
+        let menu_bar_pointer = menu_bar_pointer_subscription();
+        let mut subscriptions = vec![
+            compiler,
+            close_requests,
+            shortcuts,
+            watcher,
+            menu_bar_pointer,
+        ];
 
         if self.pending_compile.is_some() {
             subscriptions.push(time::every(DEBOUNCE_TICK).map(Message::DebounceTick));
@@ -747,176 +1179,904 @@ impl App {
         Subscription::batch(subscriptions)
     }
 
+    fn toggle_menu(&mut self, menu: AppMenu) {
+        if self.open_menu == Some(menu) {
+            self.open_menu = None;
+            return;
+        }
+
+        self.show_menu(menu);
+    }
+
+    fn show_menu(&mut self, menu: AppMenu) {
+        self.project_context_menu = None;
+        self.open_menu = Some(menu);
+        self.menu_focus = first_enabled_menu_item(&self.menu_entries(menu)).unwrap_or(0);
+    }
+
+    fn navigate_menu(&mut self, navigation: MenuNavigation) -> Task<Message> {
+        if self.open_menu.is_none() && self.project_context_menu.is_none() {
+            return Task::none();
+        }
+
+        match navigation {
+            MenuNavigation::NextMenu | MenuNavigation::PreviousMenu => {
+                let Some(current) = self.open_menu else {
+                    return Task::none();
+                };
+                let menu = if navigation == MenuNavigation::NextMenu {
+                    current.next()
+                } else {
+                    current.previous()
+                };
+                self.open_menu = Some(menu);
+                self.menu_focus = first_enabled_menu_item(&self.menu_entries(menu)).unwrap_or(0);
+                Task::none()
+            }
+            MenuNavigation::Activate => {
+                let entries = self.active_menu_entries();
+                let command = menu_command_at(&entries, self.menu_focus);
+                command.map_or_else(Task::none, |command| self.run_menu_command(command))
+            }
+            MenuNavigation::NextItem
+            | MenuNavigation::PreviousItem
+            | MenuNavigation::FirstItem
+            | MenuNavigation::LastItem => {
+                let enabled = enabled_menu_items(&self.active_menu_entries());
+                if enabled.is_empty() {
+                    return Task::none();
+                }
+
+                let current = enabled
+                    .iter()
+                    .position(|index| *index == self.menu_focus)
+                    .unwrap_or(0);
+                self.menu_focus = match navigation {
+                    MenuNavigation::NextItem => enabled[(current + 1) % enabled.len()],
+                    MenuNavigation::PreviousItem => {
+                        enabled[(current + enabled.len() - 1) % enabled.len()]
+                    }
+                    MenuNavigation::FirstItem => enabled[0],
+                    MenuNavigation::LastItem => enabled[enabled.len() - 1],
+                    MenuNavigation::NextMenu
+                    | MenuNavigation::PreviousMenu
+                    | MenuNavigation::Activate => unreachable!(),
+                };
+                Task::none()
+            }
+        }
+    }
+
+    fn run_menu_command(&mut self, command: MenuCommand) -> Task<Message> {
+        self.open_menu = None;
+        self.project_context_menu = None;
+        self.menu_bar_drag_active = false;
+
+        match command {
+            MenuCommand::NewDocument => self.update(Message::NewDocument),
+            MenuCommand::OpenDocument => self.update(Message::OpenDocument),
+            MenuCommand::OpenProject => self.update(Message::OpenProject),
+            MenuCommand::SaveDocument => self.update(Message::SaveDocument),
+            MenuCommand::SaveDocumentAs => self.update(Message::SaveDocumentAs),
+            MenuCommand::ExportPdf => self.update(Message::ExportPdf),
+            MenuCommand::CloseDocument(id) => self.update(Message::CloseDocument(id)),
+            MenuCommand::Exit => window::oldest().map(Message::ExitWindowFound),
+            MenuCommand::Editor(action) => self.update(Message::Editor(action)),
+            MenuCommand::OpenSearch => self.update(Message::OpenSearch),
+            MenuCommand::OpenReplace => self.update(Message::OpenReplace),
+            MenuCommand::ToggleSettings => self.update(Message::ToggleSettings),
+            MenuCommand::ShowGutter(show) => self.update(Message::ShowGutterChanged(show)),
+            MenuCommand::WrapLines(wrap) => self.update(Message::WrapLinesChanged(wrap)),
+            MenuCommand::ToggleProjectPane => {
+                self.toggle_project_pane();
+                Task::none()
+            }
+            MenuCommand::PreviewZoomIn => self.update(Message::PreviewZoomIn),
+            MenuCommand::PreviewZoomOut => self.update(Message::PreviewZoomOut),
+            MenuCommand::PreviewZoomReset => self.update(Message::PreviewZoomReset),
+            MenuCommand::OpenTypstDocumentation => {
+                self.file_status = Some(match open_external_url("https://typst.app/docs/") {
+                    Ok(()) => "Documentação do Typst aberta no navegador".to_owned(),
+                    Err(error) => {
+                        eprintln!("erro ao abrir documentação do Typst: {error}");
+                        format!("Não foi possível abrir a documentação: {error}")
+                    }
+                });
+                Task::none()
+            }
+            MenuCommand::ShowAbout => {
+                self.about_visible = true;
+                Task::none()
+            }
+            MenuCommand::OpenProjectEntry(path, kind) => self.project_entry_pressed(path, kind),
+            MenuCommand::CreateProjectFileAt(directory) => {
+                self.start_create_project_file_at(directory)
+            }
+            MenuCommand::CreateProjectDirectoryAt(directory) => {
+                self.start_create_project_directory_at(directory)
+            }
+            MenuCommand::RenameProjectEntry(path, kind) => {
+                self.start_rename_project_entry(path, kind)
+            }
+            MenuCommand::DeleteProjectEntry(path, kind) => {
+                self.start_delete_project_entry(path, kind)
+            }
+            MenuCommand::SetProjectMain(path) => {
+                self.set_project_main(path);
+                Task::none()
+            }
+            MenuCommand::ClearProjectMain => {
+                self.clear_project_main();
+                Task::none()
+            }
+            MenuCommand::RefreshProjectTree => self.refresh_project_tree(),
+        }
+    }
+
+    fn active_menu_entries(&self) -> Vec<AppMenuEntry> {
+        if let Some(menu) = self.open_menu {
+            self.menu_entries(menu)
+        } else if let Some(context) = self.project_context_menu.as_ref() {
+            self.project_context_entries(context)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn menu_entries(&self, menu: AppMenu) -> Vec<AppMenuEntry> {
+        let can_edit = !self.file_busy;
+
+        match menu {
+            AppMenu::File => vec![
+                AppMenuEntry::item(
+                    "Novo documento",
+                    Some(command_shortcut("N")),
+                    false,
+                    !self.file_busy,
+                    MenuCommand::NewDocument,
+                ),
+                AppMenuEntry::item(
+                    "Abrir arquivo…",
+                    Some(command_shortcut("O")),
+                    false,
+                    !self.file_busy,
+                    MenuCommand::OpenDocument,
+                ),
+                AppMenuEntry::item(
+                    "Abrir projeto…",
+                    Some(command_shift_shortcut("O")),
+                    false,
+                    !self.file_busy,
+                    MenuCommand::OpenProject,
+                ),
+                AppMenuEntry::Divider,
+                AppMenuEntry::item(
+                    "Salvar",
+                    Some(command_shortcut("S")),
+                    false,
+                    !self.file_busy && self.document.is_dirty(),
+                    MenuCommand::SaveDocument,
+                ),
+                AppMenuEntry::item(
+                    "Salvar como…",
+                    Some(command_shift_shortcut("S")),
+                    false,
+                    !self.file_busy,
+                    MenuCommand::SaveDocumentAs,
+                ),
+                AppMenuEntry::item(
+                    "Exportar PDF…",
+                    None,
+                    false,
+                    !self.file_busy && self.compiler.is_some(),
+                    MenuCommand::ExportPdf,
+                ),
+                AppMenuEntry::Divider,
+                AppMenuEntry::item(
+                    "Fechar documento",
+                    None,
+                    false,
+                    !self.file_busy,
+                    MenuCommand::CloseDocument(self.document.active_id()),
+                ),
+                AppMenuEntry::item(
+                    "Sair",
+                    Some(command_shortcut("Q")),
+                    false,
+                    true,
+                    MenuCommand::Exit,
+                ),
+            ],
+            AppMenu::Edit => vec![
+                AppMenuEntry::item(
+                    "Desfazer",
+                    Some(command_shortcut("Z")),
+                    false,
+                    can_edit,
+                    MenuCommand::Editor(Action::Undo),
+                ),
+                AppMenuEntry::item(
+                    "Refazer",
+                    Some(command_shift_shortcut("Z")),
+                    false,
+                    can_edit,
+                    MenuCommand::Editor(Action::Redo),
+                ),
+                AppMenuEntry::Divider,
+                AppMenuEntry::item(
+                    "Buscar…",
+                    Some(command_shortcut("F")),
+                    false,
+                    true,
+                    MenuCommand::OpenSearch,
+                ),
+                AppMenuEntry::item(
+                    "Substituir…",
+                    Some(command_shortcut("H")),
+                    false,
+                    true,
+                    MenuCommand::OpenReplace,
+                ),
+                AppMenuEntry::Divider,
+                AppMenuEntry::item(
+                    "Alternar comentário de linha",
+                    None,
+                    false,
+                    can_edit,
+                    MenuCommand::Editor(Action::ToggleLineComment),
+                ),
+                AppMenuEntry::item(
+                    "Duplicar linha ou seleção",
+                    None,
+                    false,
+                    can_edit,
+                    MenuCommand::Editor(Action::DuplicateLine),
+                ),
+                AppMenuEntry::item(
+                    "Mover linha para cima",
+                    None,
+                    false,
+                    can_edit,
+                    MenuCommand::Editor(Action::MoveLineUp),
+                ),
+                AppMenuEntry::item(
+                    "Mover linha para baixo",
+                    None,
+                    false,
+                    can_edit,
+                    MenuCommand::Editor(Action::MoveLineDown),
+                ),
+                AppMenuEntry::Divider,
+                AppMenuEntry::item(
+                    "Configurações…",
+                    None,
+                    false,
+                    true,
+                    MenuCommand::ToggleSettings,
+                ),
+            ],
+            AppMenu::View => vec![
+                AppMenuEntry::item(
+                    "Mostrar árvore do projeto",
+                    None,
+                    self.project_pane_visible(),
+                    true,
+                    MenuCommand::ToggleProjectPane,
+                ),
+                AppMenuEntry::item(
+                    "Mostrar números de linha",
+                    None,
+                    self.settings.show_gutter,
+                    true,
+                    MenuCommand::ShowGutter(!self.settings.show_gutter),
+                ),
+                AppMenuEntry::item(
+                    "Quebrar linhas",
+                    None,
+                    self.settings.wrap_lines,
+                    true,
+                    MenuCommand::WrapLines(!self.settings.wrap_lines),
+                ),
+                AppMenuEntry::Divider,
+                AppMenuEntry::item(
+                    "Diminuir zoom do preview",
+                    Some(command_shortcut("−")),
+                    false,
+                    self.settings.preview_zoom > 25,
+                    MenuCommand::PreviewZoomOut,
+                ),
+                AppMenuEntry::item(
+                    "Tamanho real do documento",
+                    Some(command_shortcut("0")),
+                    self.settings.preview_zoom == 100,
+                    true,
+                    MenuCommand::PreviewZoomReset,
+                ),
+                AppMenuEntry::item(
+                    "Aumentar zoom do preview",
+                    Some(command_shortcut("+")),
+                    false,
+                    self.settings.preview_zoom < 300,
+                    MenuCommand::PreviewZoomIn,
+                ),
+            ],
+            AppMenu::Help => vec![
+                AppMenuEntry::item(
+                    "Documentação do Typst",
+                    None,
+                    false,
+                    true,
+                    MenuCommand::OpenTypstDocumentation,
+                ),
+                AppMenuEntry::Divider,
+                AppMenuEntry::item(
+                    "Sobre o Typstation",
+                    None,
+                    false,
+                    true,
+                    MenuCommand::ShowAbout,
+                ),
+            ],
+        }
+    }
+
+    fn show_project_context_menu(&mut self, path: PathBuf, kind: project::EntryKind) {
+        if self.file_busy {
+            return;
+        }
+
+        self.open_menu = None;
+        self.menu_bar_drag_active = false;
+        self.selected_project_entry = Some(path.clone());
+        self.selected_project_file =
+            (kind == project::EntryKind::TypstFile).then_some(path.clone());
+        self.project_context_menu = Some(ProjectContextMenu {
+            path,
+            kind,
+            position: self.cursor_position,
+        });
+        self.menu_focus = self
+            .project_context_menu
+            .as_ref()
+            .and_then(|context| first_enabled_menu_item(&self.project_context_entries(context)))
+            .unwrap_or(0);
+    }
+
+    fn project_context_entries(&self, context: &ProjectContextMenu) -> Vec<AppMenuEntry> {
+        let enabled = !self.file_busy;
+        let is_root = context.path == self.workspace_root;
+        let target_directory = match context.kind {
+            project::EntryKind::Directory => context.path.clone(),
+            project::EntryKind::TypstFile | project::EntryKind::File => context
+                .path
+                .parent()
+                .unwrap_or(&self.workspace_root)
+                .to_path_buf(),
+        };
+        let mut entries = Vec::new();
+
+        match context.kind {
+            project::EntryKind::Directory => {
+                let expanded = self.expanded_project_directories.contains(&context.path);
+                entries.push(AppMenuEntry::item(
+                    if expanded {
+                        "Recolher pasta"
+                    } else {
+                        "Expandir pasta"
+                    },
+                    None,
+                    false,
+                    enabled,
+                    MenuCommand::OpenProjectEntry(context.path.clone(), context.kind),
+                ));
+                entries.push(AppMenuEntry::Divider);
+                entries.push(AppMenuEntry::item(
+                    "Novo arquivo Typst…",
+                    None,
+                    false,
+                    enabled,
+                    MenuCommand::CreateProjectFileAt(target_directory.clone()),
+                ));
+                entries.push(AppMenuEntry::item(
+                    "Nova pasta…",
+                    None,
+                    false,
+                    enabled,
+                    MenuCommand::CreateProjectDirectoryAt(target_directory),
+                ));
+
+                if !is_root {
+                    entries.push(AppMenuEntry::Divider);
+                    entries.push(AppMenuEntry::item(
+                        "Renomear…",
+                        None,
+                        false,
+                        enabled,
+                        MenuCommand::RenameProjectEntry(context.path.clone(), context.kind),
+                    ));
+                    entries.push(AppMenuEntry::item(
+                        "Excluir…",
+                        None,
+                        false,
+                        enabled,
+                        MenuCommand::DeleteProjectEntry(context.path.clone(), context.kind),
+                    ));
+                }
+            }
+            project::EntryKind::TypstFile => {
+                entries.push(AppMenuEntry::item(
+                    "Abrir",
+                    None,
+                    false,
+                    enabled,
+                    MenuCommand::OpenProjectEntry(context.path.clone(), context.kind),
+                ));
+                entries.push(AppMenuEntry::Divider);
+                entries.push(AppMenuEntry::item(
+                    "Fixar este arquivo no Preview",
+                    None,
+                    self.project_main.as_deref() == Some(context.path.as_path()),
+                    enabled,
+                    MenuCommand::SetProjectMain(context.path.clone()),
+                ));
+                entries.push(AppMenuEntry::item(
+                    "Acompanhar a aba ativa",
+                    None,
+                    self.project_main.is_none(),
+                    enabled && self.project_main.is_some(),
+                    MenuCommand::ClearProjectMain,
+                ));
+                entries.push(AppMenuEntry::Divider);
+                entries.push(AppMenuEntry::item(
+                    "Renomear…",
+                    None,
+                    false,
+                    enabled,
+                    MenuCommand::RenameProjectEntry(context.path.clone(), context.kind),
+                ));
+                entries.push(AppMenuEntry::item(
+                    "Excluir…",
+                    None,
+                    false,
+                    enabled,
+                    MenuCommand::DeleteProjectEntry(context.path.clone(), context.kind),
+                ));
+            }
+            project::EntryKind::File => {
+                entries.push(AppMenuEntry::item(
+                    "Renomear…",
+                    None,
+                    false,
+                    enabled,
+                    MenuCommand::RenameProjectEntry(context.path.clone(), context.kind),
+                ));
+                entries.push(AppMenuEntry::item(
+                    "Excluir…",
+                    None,
+                    false,
+                    enabled,
+                    MenuCommand::DeleteProjectEntry(context.path.clone(), context.kind),
+                ));
+            }
+        }
+
+        entries.push(AppMenuEntry::Divider);
+        entries.push(AppMenuEntry::item(
+            "Atualizar árvore",
+            None,
+            false,
+            enabled && !self.project_scan_busy,
+            MenuCommand::RefreshProjectTree,
+        ));
+        entries
+    }
+
+    fn project_pane_visible(&self) -> bool {
+        self.panes.iter().any(|(_, pane)| *pane == Pane::Project)
+    }
+
+    fn toggle_project_pane(&mut self) {
+        let project = self
+            .panes
+            .iter()
+            .find_map(|(id, pane)| (*pane == Pane::Project).then_some(*id));
+        if let Some(project) = project {
+            let _ = self.panes.close(project);
+            self.file_status = Some("Árvore do projeto ocultada".to_owned());
+            self.mark_session_changed();
+            return;
+        }
+
+        let editor = self
+            .panes
+            .iter()
+            .find_map(|(id, pane)| (*pane == Pane::Editor).then_some(*id));
+        let Some(editor) = editor else {
+            self.file_status = Some("Não foi possível restaurar a árvore do projeto".to_owned());
+            return;
+        };
+
+        if let Some((project, split)) =
+            self.panes
+                .split(pane_grid::Axis::Vertical, editor, Pane::Project)
+        {
+            self.panes.swap(editor, project);
+            self.panes.resize(split, 0.24);
+            self.file_status = Some("Árvore do projeto exibida".to_owned());
+            self.mark_session_changed();
+        }
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let panes = pane_grid(&self.panes, |_id, pane, _is_maximized| {
+            let title = match pane {
+                Pane::Project => "Projeto",
+                Pane::Editor => "Editor",
+                Pane::Preview => "Preview",
+            };
             let content: Element<'_, Message> = match pane {
-                Pane::Editor => code_editor(self.document.content())
-                    .on_action(Message::Editor)
-                    .wrap(self.settings.wrap_lines)
-                    .gutter(self.settings.show_gutter)
-                    .size(f32::from(self.settings.editor_font_size))
-                    .into(),
+                Pane::Project => self.project_view(),
+                Pane::Editor => self.editor_view(),
                 Pane::Preview => self.preview_view(),
             };
 
             pane_grid::Content::new(content)
+                .title_bar(pane_grid::TitleBar::new(text(title).size(13)).padding([4, 8]))
         })
-        .spacing(8)
+        .width(Fill)
+        .height(Fill)
+        .spacing(0)
         .min_size(200)
         .on_drag(Message::PaneDragged)
         .on_resize(10, Message::PaneResized);
-
-        let new = file_button("Novo", Message::NewDocument, !self.file_busy);
-        let open = file_button("Abrir", Message::OpenDocument, !self.file_busy);
-        let open_project = file_button("Abrir pasta", Message::OpenProject, !self.file_busy);
-        let save = file_button(
-            "Salvar",
-            Message::SaveDocument,
-            !self.file_busy && self.document.is_dirty(),
-        );
-        let save_as = file_button("Salvar como", Message::SaveDocumentAs, !self.file_busy);
-        let export_pdf = file_button(
-            "Exportar PDF",
-            Message::ExportPdf,
-            !self.file_busy && self.compiler.is_some(),
-        );
-
-        let file_toolbar = row![
-            new,
-            open,
-            open_project,
-            save,
-            save_as,
-            export_pdf,
-            button("▶").on_press(Message::CompileNow),
-            button("Buscar").on_press(Message::OpenSearch),
-            button("Configurações").on_press(Message::ToggleSettings),
-        ]
-        .spacing(4)
-        .padding(4);
-        let edit_toolbar = row![
-            command_button("↶", "Desfazer", Action::Undo, !self.file_busy),
-            command_button("↷", "Refazer", Action::Redo, !self.file_busy),
-            command_button(
-                "//",
-                "Alternar comentário de linha",
-                Action::ToggleLineComment,
-                !self.file_busy,
-            ),
-            command_button(
-                "⧉",
-                "Duplicar linha ou seleção",
-                Action::DuplicateLine,
-                !self.file_busy,
-            ),
-            command_button(
-                "↑",
-                "Mover linha para cima",
-                Action::MoveLineUp,
-                !self.file_busy,
-            ),
-            command_button(
-                "↓",
-                "Mover linha para baixo",
-                Action::MoveLineDown,
-                !self.file_busy,
-            ),
-            file_button("B", Message::Bold, !self.file_busy),
-            file_button("I", Message::Italic, !self.file_busy),
-            file_button("U", Message::Underline, !self.file_busy),
-            file_button("Lista", Message::PrefixLines("- ".into()), !self.file_busy,),
-            file_button(
-                "Numeração",
-                Message::PrefixLines("+ ".into()),
-                !self.file_busy,
-            ),
-        ]
-        .spacing(4)
-        .padding([0, 4]);
 
         let status = container(text(self.status_text()).size(13))
             .width(Fill)
             .padding([5, 8]);
 
-        let tabs = self.tabs_view();
-        let workspace = row![self.project_view(), panes].height(Fill);
-        let mut content = column![file_toolbar, edit_toolbar];
+        let mut content = column![self.app_bar_view(), self.text_action_bar_view()];
 
         if self.settings_visible {
             content = content.push(self.settings_view());
         }
 
-        content = content.push(tabs);
-
-        if self.document.external_change().is_some() {
-            content = content.push(self.external_change_view());
-        }
-
-        if self.search.visible {
-            content = content.push(self.search_view());
-        }
-
-        content
-            .push(workspace)
+        let base: Element<'_, Message> = content
+            .push(panes)
             .push(status)
             .width(Fill)
             .height(Fill)
+            .into();
+        let mut layers = Stack::new().width(Fill).height(Fill).push(base);
+
+        if let Some(menu) = self.open_menu {
+            let dismiss = column![
+                Space::new().height(iced::Length::Fixed(APP_BAR_HEIGHT)),
+                mouse_area(Space::new().width(Fill).height(Fill)).on_press(Message::DismissMenu),
+            ]
+            .width(Fill)
+            .height(Fill);
+            layers = layers.push(dismiss).push(self.menu_overlay(menu));
+        }
+
+        if let Some(context) = self.project_context_menu.as_ref() {
+            let dismiss =
+                mouse_area(Space::new().width(Fill).height(Fill)).on_press(Message::DismissMenu);
+            layers = layers
+                .push(dismiss)
+                .push(self.project_context_menu_overlay(context));
+        }
+
+        if self.about_visible {
+            let backdrop = mouse_area(
+                container(Space::new())
+                    .width(Fill)
+                    .height(Fill)
+                    .style(modal_backdrop_style),
+            )
+            .on_press(Message::CloseAbout);
+            layers = layers.push(backdrop).push(self.about_overlay());
+        }
+
+        layers.into()
+    }
+
+    fn app_bar_view(&self) -> Element<'_, Message> {
+        let file = ui::menu_bar_button(
+            "Arquivo",
+            FILE_MENU_TRIGGER_WIDTH,
+            Message::ToggleMenu(AppMenu::File),
+            Message::MenuBarPointerPressed(AppMenu::File),
+            Message::MenuBarPointerEntered(AppMenu::File),
+            self.open_menu == Some(AppMenu::File),
+        );
+        let edit = ui::menu_bar_button(
+            "Editar",
+            EDIT_MENU_TRIGGER_WIDTH,
+            Message::ToggleMenu(AppMenu::Edit),
+            Message::MenuBarPointerPressed(AppMenu::Edit),
+            Message::MenuBarPointerEntered(AppMenu::Edit),
+            self.open_menu == Some(AppMenu::Edit),
+        );
+        let view = ui::menu_bar_button(
+            "Exibir",
+            VIEW_MENU_TRIGGER_WIDTH,
+            Message::ToggleMenu(AppMenu::View),
+            Message::MenuBarPointerPressed(AppMenu::View),
+            Message::MenuBarPointerEntered(AppMenu::View),
+            self.open_menu == Some(AppMenu::View),
+        );
+        let help = ui::menu_bar_button(
+            "Ajuda",
+            HELP_MENU_TRIGGER_WIDTH,
+            Message::ToggleMenu(AppMenu::Help),
+            Message::MenuBarPointerPressed(AppMenu::Help),
+            Message::MenuBarPointerEntered(AppMenu::Help),
+            self.open_menu == Some(AppMenu::Help),
+        );
+        let menus = row![file, edit, view, help]
+            .align_y(Alignment::Center)
+            .spacing(0);
+        let title = if self.document.is_dirty() {
+            format!("{} *", self.document.display_name())
+        } else {
+            self.document.display_name()
+        };
+        let title = container(
+            text(title)
+                .size(ui::tokens::typography::FONT_SIZE_100)
+                .wrapping(text::Wrapping::None),
+        )
+        .width(Fill)
+        .center_x(Fill);
+        let save = ui::spectrum_button(
+            "Salvar",
+            (!self.file_busy && self.document.is_dirty())
+                .then_some(Message::MenuCommand(MenuCommand::SaveDocument)),
+            ui::ButtonOptions::ACCENT.size(ui::ButtonSize::Medium),
+        );
+        let export = ui::spectrum_button(
+            "Exportar PDF",
+            (!self.file_busy && self.compiler.is_some())
+                .then_some(Message::MenuCommand(MenuCommand::ExportPdf)),
+            ui::ButtonOptions::SECONDARY.size(ui::ButtonSize::Medium),
+        );
+        let actions = container(row![save, export].align_y(Alignment::Center).spacing(6))
+            .width(iced::Length::Fixed(
+                FILE_MENU_TRIGGER_WIDTH
+                    + EDIT_MENU_TRIGGER_WIDTH
+                    + VIEW_MENU_TRIGGER_WIDTH
+                    + HELP_MENU_TRIGGER_WIDTH,
+            ))
+            .align_x(iced::alignment::Horizontal::Right);
+        let bar = row![menus, title, actions]
+            .align_y(Alignment::Center)
+            .width(Fill)
+            .height(Fill);
+
+        container(bar)
+            .width(Fill)
+            .height(iced::Length::Fixed(APP_BAR_HEIGHT))
+            .padding([4.0, APP_BAR_HORIZONTAL_PADDING])
+            .style(app_bar_style)
+            .into()
+    }
+
+    fn menu_overlay(&self, menu: AppMenu) -> Element<'_, Message> {
+        let popup = menu_popup(
+            self.menu_entries(menu),
+            self.menu_focus,
+            menu_popup_width(menu),
+        );
+
+        column![
+            Space::new().height(iced::Length::Fixed(APP_BAR_HEIGHT)),
+            row![
+                Space::new().width(iced::Length::Fixed(menu_horizontal_offset(menu))),
+                popup,
+            ],
+        ]
+        .width(Fill)
+        .height(Fill)
+        .into()
+    }
+
+    fn project_context_menu_overlay(&self, context: &ProjectContextMenu) -> Element<'_, Message> {
+        let definitions = self.project_context_entries(context);
+        let popup_height = menu_popup_height(&definitions);
+        let position = context.position;
+        let menu_focus = self.menu_focus;
+
+        responsive(move |viewport| {
+            let maximum_x =
+                (viewport.width - PROJECT_CONTEXT_MENU_WIDTH - CONTEXT_MENU_VIEWPORT_MARGIN)
+                    .max(CONTEXT_MENU_VIEWPORT_MARGIN);
+            let maximum_y = (viewport.height - popup_height - CONTEXT_MENU_VIEWPORT_MARGIN)
+                .max(CONTEXT_MENU_VIEWPORT_MARGIN);
+            let x = position.x.clamp(CONTEXT_MENU_VIEWPORT_MARGIN, maximum_x);
+            let y = position.y.clamp(CONTEXT_MENU_VIEWPORT_MARGIN, maximum_y);
+            let popup = menu_popup(definitions.clone(), menu_focus, PROJECT_CONTEXT_MENU_WIDTH);
+
+            column![
+                Space::new().height(iced::Length::Fixed(y)),
+                row![Space::new().width(iced::Length::Fixed(x)), popup],
+            ]
+            .width(Fill)
+            .height(Fill)
+            .into()
+        })
+        .into()
+    }
+
+    fn about_overlay(&self) -> Element<'_, Message> {
+        let close = ui::spectrum_button(
+            "Fechar",
+            Some(Message::CloseAbout),
+            ui::ButtonOptions::SECONDARY.size(ui::ButtonSize::Small),
+        );
+        let dialog = container(
+            column![
+                text("Typstation")
+                    .size(ui::tokens::typography::FONT_SIZE_300)
+                    .font(iced::Font {
+                        weight: iced::font::Weight::Bold,
+                        ..iced::Font::DEFAULT
+                    }),
+                text(format!("Versão {}", env!("CARGO_PKG_VERSION")))
+                    .size(ui::tokens::typography::FONT_SIZE_100),
+                text("Editor de documentos Typst construído com Iced.")
+                    .size(ui::tokens::typography::FONT_SIZE_100),
+                row![Space::new().width(Fill), close],
+            ]
+            .spacing(12),
+        )
+        .width(iced::Length::Fixed(380.0))
+        .padding(24)
+        .style(modal_dialog_style);
+
+        container(dialog)
+            .width(Fill)
+            .height(Fill)
+            .center_x(Fill)
+            .center_y(Fill)
             .into()
     }
 
     fn preview_view(&self) -> Element<'_, Message> {
-        if self.preview.is_empty() {
-            return container(text("Preview indisponível"))
-                .center_x(Fill)
-                .center_y(Fill)
-                .into();
-        }
-
-        let zoom = f32::from(self.settings.preview_zoom) / 100.0;
+        let scale = preview_scale(self.settings.preview_zoom, self.preview_logical_ppi);
         let controls = row![
-            file_button(
+            message_icon_button(
+                "▶",
+                "Compilar agora",
+                Message::CompileNow,
+                self.compiler.is_some(),
+            ),
+            message_icon_button(
                 "−",
+                "Diminuir zoom",
                 Message::PreviewZoomOut,
                 self.settings.preview_zoom > 25,
             ),
-            button(text(format!("{}%", self.settings.preview_zoom)))
-                .on_press(Message::PreviewZoomReset),
-            file_button(
+            ui::action_button(
+                format!("{}%", self.settings.preview_zoom),
+                Some(Message::PreviewZoomReset),
+                ui::ActionButtonOptions::STANDARD,
+            ),
+            message_icon_button(
                 "+",
+                "Aumentar zoom",
                 Message::PreviewZoomIn,
                 self.settings.preview_zoom < 300,
             ),
+            message_action_button(
+                "Localizar",
+                Message::RevealInPreview,
+                self.preview_navigation_ready(),
+            ),
+            text(format!("Principal: {}", self.compilation_display_name())).size(13),
             text(format!("{} página(s)", self.preview.len())).size(13),
         ]
         .align_y(Alignment::Center)
         .spacing(4)
         .padding([4, 8]);
-        let mut pages = column![].align_x(Alignment::Center).spacing(12);
+        let content: Element<'_, Message> = if self.preview.is_empty() {
+            container(text("Preview indisponível"))
+                .center_x(Fill)
+                .center_y(Fill)
+                .into()
+        } else {
+            responsive(move |viewport| self.preview_canvas_view(scale, viewport.width)).into()
+        };
+
+        column![controls, content].width(Fill).height(Fill).into()
+    }
+
+    fn preview_canvas_view(&self, scale: f32, viewport_width: f32) -> Element<'_, Message> {
+        let maximum_page_width = self
+            .preview
+            .iter()
+            .map(|page| (page.width * scale).max(1.0))
+            .fold(0.0_f32, f32::max);
+        let canvas_width = preview_canvas_width(viewport_width, maximum_page_width);
+        let mut pages = column![]
+            .align_x(Alignment::Center)
+            .spacing(PREVIEW_PAGE_SPACING)
+            .width(Fill);
 
         for (index, page) in self.preview.iter().enumerate() {
-            let width = (page.width * zoom).max(1.0);
-            let height = (page.height * zoom).max(1.0);
-            pages = pages.push(
-                column![
-                    text(format!("Página {}", index + 1)).size(12),
+            let width = (page.width * scale).max(1.0);
+            let height = (page.height * scale).max(1.0);
+            let mut page_layers = Stack::new()
+                .width(iced::Length::Fixed(width))
+                .height(iced::Length::Fixed(height))
+                .push(
                     svg(page.handle.clone())
                         .width(iced::Length::Fixed(width))
                         .height(iced::Length::Fixed(height)),
+                );
+
+            if let Some(highlight) = self
+                .preview_highlight
+                .filter(|highlight| highlight.page == index)
+            {
+                let bounds = highlight.bounds;
+                let x = (bounds.x * scale).clamp(0.0, width);
+                let y = (bounds.y * scale).clamp(0.0, height);
+                let marker_width = (bounds.width * scale).max(2.0).min((width - x).max(0.0));
+                let marker_height = (bounds.height * scale).max(2.0).min((height - y).max(0.0));
+                let marker = container(Space::new())
+                    .width(iced::Length::Fixed(marker_width))
+                    .height(iced::Length::Fixed(marker_height))
+                    .style(|_theme: &Theme| {
+                        iced::widget::container::Style::default()
+                            .background(Color::from_rgba8(0x18, 0x9A, 0xD3, 0.20))
+                            .border(
+                                Border::default()
+                                    .color(Color::from_rgb8(0x00, 0x70, 0xA8))
+                                    .width(1),
+                            )
+                    });
+                let highlight_layer: Element<'_, Message> = column![
+                    Space::new().height(iced::Length::Fixed(y)),
+                    row![Space::new().width(iced::Length::Fixed(x)), marker],
+                ]
+                .width(iced::Length::Fixed(width))
+                .height(iced::Length::Fixed(height))
+                .into();
+                page_layers = page_layers.push(highlight_layer);
+            }
+
+            let interactive_page = mouse_area(page_layers)
+                .on_move(move |position| Message::PreviewPointerMoved {
+                    page: index,
+                    position,
+                })
+                .on_exit(Message::PreviewPointerLeft(index))
+                .on_press(Message::PreviewClicked(index))
+                .interaction(mouse::Interaction::Pointer);
+            pages = pages.push(
+                column![
+                    container(text(format!("Página {}", index + 1)).size(12))
+                        .height(iced::Length::Fixed(PREVIEW_LABEL_HEIGHT))
+                        .center_y(iced::Length::Fill),
+                    interactive_page,
                 ]
                 .align_x(Alignment::Center)
-                .spacing(4),
+                .spacing(PREVIEW_LABEL_SPACING),
             );
         }
 
-        column![
-            controls,
-            scrollable(container(pages).padding(12))
-                .direction(scrollable::Direction::Both {
-                    vertical: scrollable::Scrollbar::default(),
-                    horizontal: scrollable::Scrollbar::default(),
-                })
-                .height(Fill),
-        ]
+        scrollable(
+            container(pages)
+                .width(iced::Length::Fixed(canvas_width))
+                .align_x(Alignment::Center)
+                .padding(PREVIEW_PADDING),
+        )
+        .id(self.preview_scroll_id.clone())
+        .direction(scrollable::Direction::Both {
+            vertical: scrollable::Scrollbar::default(),
+            horizontal: scrollable::Scrollbar::default(),
+        })
+        .width(Fill)
         .height(Fill)
         .into()
     }
@@ -976,7 +2136,7 @@ impl App {
             checkbox(self.settings.theme == settings::ThemeMode::Light)
                 .label("Tema claro")
                 .on_toggle(Message::LightThemeChanged),
-            button("Fechar").on_press(Message::ToggleSettings),
+            message_action_button("Fechar", Message::ToggleSettings, true),
         ]
         .align_y(Alignment::Center)
         .spacing(10);
@@ -987,12 +2147,93 @@ impl App {
             .into()
     }
 
-    fn tabs_view(&self) -> Element<'_, Message> {
+    fn text_action_bar_view(&self) -> Element<'_, Message> {
+        let can_edit = !self.file_busy;
+        let options = ui::ActionButtonOptions::STANDARD
+            .size(ui::ActionButtonSize::Medium)
+            .emphasized(true);
+        let history = ui::compact_action_group(
+            [
+                ui::ActionGroupItem::symbol(
+                    "↶",
+                    "Desfazer",
+                    can_edit.then_some(Message::Editor(Action::Undo)),
+                ),
+                ui::ActionGroupItem::symbol(
+                    "↷",
+                    "Refazer",
+                    can_edit.then_some(Message::Editor(Action::Redo)),
+                ),
+            ],
+            options,
+        );
+        let text_style = ui::compact_action_group(
+            [
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::TextBold,
+                    "Negrito",
+                    can_edit.then_some(Message::Bold),
+                ),
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::TextItalic,
+                    "Itálico",
+                    can_edit.then_some(Message::Italic),
+                ),
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::TextUnderline,
+                    "Sublinhado",
+                    can_edit.then_some(Message::Underline),
+                ),
+            ],
+            options,
+        );
+        let lists = ui::compact_action_group(
+            [
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::TextBulleted,
+                    "Lista com marcadores",
+                    can_edit.then_some(Message::PrefixLines("- ".into())),
+                ),
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::TextNumbered,
+                    "Lista numerada",
+                    can_edit.then_some(Message::PrefixLines("+ ".into())),
+                ),
+            ],
+            options,
+        );
+        let comment = ui::icon_action_button(
+            "//",
+            "Alternar comentário de linha",
+            can_edit.then_some(Message::Editor(Action::ToggleLineComment)),
+            options,
+        );
+
+        container(
+            row![history, text_style, lists, comment]
+                .align_y(Alignment::Center)
+                .spacing(ui::tokens::spacing::BASE_GAP_MEDIUM),
+        )
+        .width(Fill)
+        .height(iced::Length::Fixed(APP_BAR_HEIGHT))
+        .padding([4, 8])
+        .style(action_bar_style)
+        .into()
+    }
+
+    fn editor_view(&self) -> Element<'_, Message> {
         let active = self.document.active_id();
-        let mut tabs = row![].spacing(2).padding([0, 4]);
+        let mut tabs = Vec::new();
 
         for (id, document) in self.document.iter() {
             let mut label = document.display_name();
+            if self
+                .project_main
+                .as_deref()
+                .is_some_and(|main| document.path() == Some(main))
+            {
+                label.push_str(" [principal]");
+            }
             if document.is_dirty() {
                 label.push_str(" *");
             }
@@ -1000,49 +2241,75 @@ impl App {
                 label.push_str(" !");
             }
 
-            let select = button(text(label));
-            let select = if id != active && !self.file_busy {
-                select.on_press(Message::ActivateDocument(id))
-            } else {
-                select
-            };
-            let close = button("X");
-            let close = if self.file_busy {
-                close
-            } else {
-                close.on_press(Message::CloseDocument(id))
-            };
-
-            tabs = tabs.push(row![select, close].spacing(1));
+            tabs.push(
+                ui::TabItem::new(
+                    label,
+                    (!self.file_busy).then_some(Message::ActivateDocument(id)),
+                    (!self.file_busy).then_some(Message::CloseDocument(id)),
+                )
+                .selected(id == active),
+            );
         }
 
-        scrollable(tabs)
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::default(),
-            ))
-            .into()
+        let editor: Element<'_, Message> = code_editor(self.document.content())
+            .on_action(Message::Editor)
+            .wrap(self.settings.wrap_lines)
+            .gutter(self.settings.show_gutter)
+            .size(f32::from(self.settings.editor_font_size))
+            .into();
+        let mut panel = column![].width(Fill).height(Fill);
+
+        if self.document.external_change().is_some() {
+            panel = panel.push(self.external_change_view());
+        }
+
+        if self.search.visible {
+            panel = panel.push(self.search_view());
+        }
+
+        panel = panel.push(editor);
+
+        ui::Tabs::new(tabs, panel).into()
     }
 
     fn project_view(&self) -> Element<'_, Message> {
-        let mut files = column![].spacing(2);
+        let navigation: Element<'_, Message> = ui::SideNavigation::new(vec![
+            ui::SideNavigationItem::new(
+                "Arquivos",
+                ui::WorkflowIcon::FolderOpen,
+                Some(Message::ProjectNavigationSelected(ProjectNavigation::Files)),
+            )
+            .selected(self.project_navigation == ProjectNavigation::Files),
+            ui::SideNavigationItem::new(
+                "Tópicos",
+                ui::WorkflowIcon::TextBulleted,
+                Some(Message::ProjectNavigationSelected(
+                    ProjectNavigation::Topics,
+                )),
+            )
+            .selected(self.project_navigation == ProjectNavigation::Topics),
+        ])
+        .into();
+        let divider = container(Space::new())
+            .width(iced::Length::Fixed(1.0))
+            .height(Fill)
+            .style(project_navigation_divider_style);
+        let panel = match self.project_navigation {
+            ProjectNavigation::Files => self.project_files_view(),
+            ProjectNavigation::Topics => self.document_outline_view(),
+        };
 
-        for path in &self.project_files {
-            let relative = path.strip_prefix(&self.workspace_root).unwrap_or(path);
-            let selected = self.selected_project_file.as_deref() == Some(path.as_path());
-            let marker = if selected { "› " } else { "" };
-            let item = button(text(format!("{marker}{}", relative.to_string_lossy()))).width(Fill);
-            let item = if self.file_busy {
-                item
-            } else {
-                item.on_press(Message::OpenProjectFile(path.clone()))
-            };
-            files = files.push(item);
-        }
+        row![navigation, divider, panel]
+            .width(Fill)
+            .height(Fill)
+            .into()
+    }
 
+    fn project_files_view(&self) -> Element<'_, Message> {
         let mut diagnostics = column![].spacing(2);
         for diagnostic in &self.diagnostics {
             let location = match &diagnostic.target {
-                compiler::DiagnosticTarget::Main => self.document.display_name(),
+                compiler::DiagnosticTarget::Main => self.compilation_display_name(),
                 compiler::DiagnosticTarget::ProjectFile(path) => path
                     .strip_prefix(&self.workspace_root)
                     .unwrap_or(path)
@@ -1057,24 +2324,39 @@ impl App {
                 "{severity} em {location}: {}",
                 truncate(&diagnostic.message, 70)
             );
-            diagnostics = diagnostics.push(button(text(label).size(12)).width(Fill).on_press(
-                Message::OpenDiagnostic(diagnostic.target.clone(), diagnostic.range.clone()),
-            ));
+            diagnostics = diagnostics.push(
+                ui::action_button(
+                    label,
+                    Some(Message::OpenDiagnostic(
+                        diagnostic.target.clone(),
+                        diagnostic.range.clone(),
+                    )),
+                    ui::ActionButtonOptions::QUIET.size(ui::ActionButtonSize::Small),
+                )
+                .width(Fill),
+            );
         }
 
-        let root = truncate(&self.workspace_root.to_string_lossy(), 28);
-        let has_selection = self.selected_project_file.is_some();
+        let action_options = ui::ActionButtonOptions::QUIET.size(ui::ActionButtonSize::Small);
         let actions = row![
-            file_button("Novo arquivo", Message::CreateProjectFile, !self.file_busy),
-            file_button(
-                "Renomear",
-                Message::RenameProjectFile,
-                !self.file_busy && has_selection,
+            Space::new().width(Fill),
+            ui::workflow_icon_action_button(
+                ui::WorkflowIcon::FileAdd,
+                "Novo arquivo Typst",
+                (!self.file_busy).then_some(Message::CreateProjectFile),
+                action_options,
             ),
-            file_button(
-                "Excluir",
-                Message::DeleteProjectFile,
-                !self.file_busy && has_selection,
+            ui::workflow_icon_action_button(
+                ui::WorkflowIcon::FolderAdd,
+                "Nova pasta",
+                (!self.file_busy).then_some(Message::CreateProjectDirectory),
+                action_options,
+            ),
+            ui::workflow_icon_action_button(
+                ui::WorkflowIcon::Refresh,
+                "Atualizar árvore do projeto",
+                (!self.file_busy && !self.project_scan_busy).then_some(Message::RefreshProjectTree),
+                action_options,
             ),
         ]
         .spacing(2);
@@ -1083,25 +2365,224 @@ impl App {
         } else {
             FillPortion(2)
         };
-        let mut content = column![
-            text("Projeto").size(16),
-            text(root).size(12),
-            actions,
-            scrollable(files).height(file_height),
-        ]
-        .spacing(6);
+        let tree: Element<'_, Message> =
+            ui::TreeView::new(vec![self.project_tree_root_item()]).into();
+        let header = container(actions.width(Fill)).width(Fill).padding([6, 8]);
+        let mut content = column![header, scrollable(tree).height(file_height)]
+            .spacing(0)
+            .width(Fill)
+            .height(Fill);
 
         if !self.diagnostics.is_empty() {
-            content = content
-                .push(text(format!("Problemas ({})", self.diagnostics.len())).size(14))
-                .push(scrollable(diagnostics).height(FillPortion(1)));
+            content = content.push(
+                container(
+                    column![
+                        text(format!("Problemas ({})", self.diagnostics.len())).size(14),
+                        scrollable(diagnostics).height(FillPortion(1)),
+                    ]
+                    .spacing(4),
+                )
+                .width(Fill)
+                .height(FillPortion(1))
+                .padding([6, 8]),
+            );
         }
 
-        container(content)
-            .width(280)
-            .height(Fill)
-            .padding([6, 8])
-            .into()
+        container(content).width(Fill).height(Fill).into()
+    }
+
+    fn document_outline_view(&self) -> Element<'_, Message> {
+        let header = container(
+            text(self.compilation_display_name())
+                .size(ui::tokens::typography::FONT_SIZE_75)
+                .wrapping(text::Wrapping::None),
+        )
+        .width(Fill)
+        .padding([10, 8]);
+        let body: Element<'_, Message> = if self.document_outline.is_empty() {
+            let status = match self.preview_status {
+                PreviewStatus::Waiting | PreviewStatus::Compiling => {
+                    "Aguardando a compilação do documento"
+                }
+                PreviewStatus::Ready { .. } => "O documento não possui tópicos",
+                PreviewStatus::Failed { .. } => "Nenhum tópico disponível",
+            };
+
+            container(text(status).size(ui::tokens::typography::FONT_SIZE_75))
+                .width(Fill)
+                .padding([12, 10])
+                .into()
+        } else {
+            let selected = self.current_outline_key();
+            let tree: Element<'_, Message> = ui::TreeView::new(
+                self.document_outline_items(&self.document_outline, selected.as_ref()),
+            )
+            .reserve_icon_space(false)
+            .into();
+
+            scrollable(tree).width(Fill).height(Fill).into()
+        };
+
+        column![header, body].width(Fill).height(Fill).into()
+    }
+
+    fn document_outline_items(
+        &self,
+        entries: &[compiler::DocumentOutlineItem],
+        selected: Option<&OutlineKey>,
+    ) -> Vec<ui::TreeViewItem<Message>> {
+        entries
+            .iter()
+            .map(|entry| {
+                let key = OutlineKey::new(entry.target.clone(), entry.range.start);
+                let has_children = !entry.children.is_empty();
+                let expanded = has_children && !self.collapsed_outline_entries.contains(&key);
+                let children = if expanded {
+                    self.document_outline_items(&entry.children, selected)
+                } else {
+                    Vec::new()
+                };
+
+                ui::TreeViewItem::new(
+                    entry.title.clone(),
+                    None,
+                    Some(Message::DocumentOutlinePressed {
+                        target: entry.target.clone(),
+                        range: entry.range.clone(),
+                        has_children,
+                    }),
+                )
+                .expanded(expanded)
+                .selected(selected == Some(&key))
+                .has_children(has_children)
+                .children(children)
+            })
+            .collect()
+    }
+
+    fn current_outline_key(&self) -> Option<OutlineKey> {
+        let target = self.active_source_target()?;
+        let cursor = self.document.cursor_offset();
+        let mut selected = None;
+
+        find_current_outline_key(&self.document_outline, &target, cursor, &mut selected);
+        selected
+    }
+
+    fn project_tree_root_item(&self) -> ui::TreeViewItem<Message> {
+        let expanded = self
+            .expanded_project_directories
+            .contains(&self.workspace_root);
+        let selected = self.selected_project_entry.as_deref() == Some(&self.workspace_root);
+        let on_press = (!self.file_busy).then(|| {
+            Message::ProjectEntryPressed(self.workspace_root.clone(), project::EntryKind::Directory)
+        });
+        let children = if !expanded {
+            Vec::new()
+        } else if self.project_tree.is_empty() {
+            let status = if self.project_scan_busy {
+                "Examinando a pasta do projeto..."
+            } else {
+                "A pasta do projeto está vazia"
+            };
+            vec![ui::TreeViewItem::new(status, None, None)]
+        } else {
+            self.project_tree_items(&self.project_tree)
+        };
+
+        ui::TreeViewItem::new(
+            project_display_name(&self.workspace_root),
+            Some(ui::WorkflowIcon::Project),
+            on_press,
+        )
+        .expanded(expanded)
+        .selected(selected)
+        .on_context_menu(Message::ProjectEntryContextRequested(
+            self.workspace_root.clone(),
+            project::EntryKind::Directory,
+        ))
+        .has_children(true)
+        .children(children)
+    }
+
+    fn project_tree_items(
+        &self,
+        entries: &[project::ProjectEntry],
+    ) -> Vec<ui::TreeViewItem<Message>> {
+        entries
+            .iter()
+            .map(|entry| {
+                let label = entry
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let expanded = entry.kind == project::EntryKind::Directory
+                    && self.expanded_project_directories.contains(&entry.path);
+                let icon = match entry.kind {
+                    project::EntryKind::Directory if expanded => ui::WorkflowIcon::FolderOpen,
+                    project::EntryKind::Directory => ui::WorkflowIcon::Folder,
+                    project::EntryKind::TypstFile => ui::WorkflowIcon::FileCode,
+                    project::EntryKind::File => ui::WorkflowIcon::Document,
+                };
+                let selected = self.selected_project_entry.as_deref() == Some(entry.path.as_path());
+                let on_press = (!self.file_busy)
+                    .then(|| Message::ProjectEntryPressed(entry.path.clone(), entry.kind));
+                let children = if expanded {
+                    self.project_tree_items(&entry.children)
+                } else {
+                    Vec::new()
+                };
+                let mut item = ui::TreeViewItem::new(label, Some(icon), on_press)
+                    .expanded(expanded)
+                    .selected(selected)
+                    .has_children(!entry.children.is_empty())
+                    .children(children)
+                    .on_context_menu(Message::ProjectEntryContextRequested(
+                        entry.path.clone(),
+                        entry.kind,
+                    ));
+
+                if self.preview_project_path() == Some(entry.path.as_path()) {
+                    item = item.status_icon(ui::WorkflowIcon::Preview, "Exibido no Preview");
+                }
+
+                item
+            })
+            .collect()
+    }
+
+    fn preview_project_path(&self) -> Option<&Path> {
+        self.project_main.as_deref().or_else(|| {
+            self.document
+                .path()
+                .filter(|path| path.starts_with(&self.workspace_root))
+        })
+    }
+
+    fn project_entry_kind(&self, path: &Path) -> Option<project::EntryKind> {
+        if path == self.workspace_root {
+            Some(project::EntryKind::Directory)
+        } else {
+            find_project_entry_kind(&self.project_tree, path)
+        }
+    }
+
+    fn selected_project_target_directory(&self) -> PathBuf {
+        let Some(path) = self.selected_project_entry.as_deref() else {
+            return self.workspace_root.clone();
+        };
+
+        match self.project_entry_kind(path) {
+            Some(project::EntryKind::Directory) => path.to_path_buf(),
+            Some(project::EntryKind::TypstFile | project::EntryKind::File) => path
+                .parent()
+                .filter(|parent| parent.starts_with(&self.workspace_root))
+                .unwrap_or(&self.workspace_root)
+                .to_path_buf(),
+            None => self.workspace_root.clone(),
+        }
     }
 
     fn external_change_view(&self) -> Element<'_, Message> {
@@ -1111,16 +2592,24 @@ impl App {
             Some(ExternalChangeKind::Deleted) => "O arquivo foi removido fora do Typstation",
             None => "",
         };
-        let mut actions = row![text(message)]
-            .spacing(8)
-            .push(button("Manter local").on_press(Message::KeepLocalAfterExternal));
+        let mut actions = row![text(message)].spacing(8).push(ui::spectrum_button(
+            "Manter local",
+            Some(Message::KeepLocalAfterExternal),
+            ui::ButtonOptions::SECONDARY,
+        ));
 
         if kind == Some(ExternalChangeKind::Modified) {
-            actions = actions.push(button("Recarregar").on_press(Message::ReloadExternal));
+            actions = actions.push(ui::spectrum_button(
+                "Recarregar",
+                Some(Message::ReloadExternal),
+                ui::ButtonOptions::PRIMARY,
+            ));
         } else {
-            actions = actions.push(
-                button("Fechar aba").on_press(Message::CloseDocument(self.document.active_id())),
-            );
+            actions = actions.push(ui::spectrum_button(
+                "Fechar aba",
+                Some(Message::CloseDocument(self.document.active_id())),
+                ui::ButtonOptions::NEGATIVE,
+            ));
         }
 
         container(actions).width(Fill).padding([4, 8]).into()
@@ -1141,8 +2630,8 @@ impl App {
             .width(280);
         let mut find_row = row![
             query,
-            button("↑").on_press(Message::SearchPrevious),
-            button("↓").on_press(Message::SearchNext),
+            message_icon_button("↑", "Resultado anterior", Message::SearchPrevious, true),
+            message_icon_button("↓", "Próximo resultado", Message::SearchNext, true),
             count,
             checkbox(self.search.case_sensitive)
                 .label("Maiúsculas")
@@ -1154,10 +2643,19 @@ impl App {
         .spacing(6);
 
         if !self.search.replace_visible {
-            find_row = find_row.push(button("Substituir").on_press(Message::ShowReplace));
+            find_row = find_row.push(message_action_button(
+                "Substituir",
+                Message::ShowReplace,
+                true,
+            ));
         }
 
-        find_row = find_row.push(button("X").on_press(Message::CloseSearch));
+        find_row = find_row.push(message_icon_button(
+            "×",
+            "Fechar busca",
+            Message::CloseSearch,
+            true,
+        ));
 
         let mut panel = column![find_row].spacing(4);
 
@@ -1167,8 +2665,16 @@ impl App {
                     .on_input(Message::SearchReplacementChanged)
                     .on_submit(Message::ReplaceCurrent)
                     .width(280),
-                button("Substituir").on_press(Message::ReplaceCurrent),
-                button("Substituir todos").on_press(Message::ReplaceAll),
+                ui::spectrum_button(
+                    "Substituir",
+                    Some(Message::ReplaceCurrent),
+                    ui::ButtonOptions::PRIMARY,
+                ),
+                ui::spectrum_button(
+                    "Substituir todos",
+                    Some(Message::ReplaceAll),
+                    ui::ButtonOptions::SECONDARY,
+                ),
             ]
             .spacing(6);
             panel = panel.push(replace_row);
@@ -1243,7 +2749,20 @@ impl App {
         let previous_config = self.compiler_config();
         self.document.clear_search_matches();
         self.document.activate(id);
-        self.document_replaced(previous_config);
+        let project_path = self
+            .document
+            .path()
+            .filter(|path| path.starts_with(&self.workspace_root))
+            .map(Path::to_path_buf);
+        if let Some(path) = project_path {
+            self.reveal_project_entry(&path);
+            self.selected_project_file = Some(path);
+        }
+        if self.project_main.is_some() {
+            self.active_document_replaced();
+        } else {
+            self.document_replaced(previous_config);
+        }
         true
     }
 
@@ -1252,7 +2771,11 @@ impl App {
         self.document.clear_search_matches();
         self.document.add(Document::new());
         self.file_status = Some("Novo documento criado".to_owned());
-        self.document_replaced(previous_config);
+        if self.project_main.is_some() {
+            self.active_document_replaced();
+        } else {
+            self.document_replaced(previous_config);
+        }
     }
 
     fn close_document(&mut self, id: DocumentId) {
@@ -1261,14 +2784,31 @@ impl App {
         };
         let name = document.display_name();
         let was_active = self.document.active_id() == id;
-        let previous_config = was_active.then(|| self.compiler_config());
+        let affects_fixed_preview = self.project_main.is_some()
+            && document.is_dirty()
+            && document
+                .path()
+                .is_some_and(|path| path.starts_with(&self.workspace_root));
+        let affects_compilation = if self.project_main.is_some() {
+            affects_fixed_preview
+        } else {
+            was_active
+        };
+        let previous_config = affects_compilation.then(|| self.compiler_config());
 
         self.document.remove(id);
         self.discarded_on_close.remove(&id);
         self.file_status = Some(format!("Aba fechada: {name}"));
 
         if let Some(previous_config) = previous_config {
-            self.document_replaced(previous_config);
+            if was_active {
+                self.active_document_replaced();
+            } else {
+                self.mark_session_changed();
+            }
+            self.restart_compilation(previous_config, self.project_main.is_none());
+        } else if was_active {
+            self.active_document_replaced();
         } else {
             self.mark_session_changed();
         }
@@ -1310,18 +2850,70 @@ impl App {
         };
 
         let previous_config = self.compiler_config();
+        let project_changed = self.workspace_root != path;
         self.workspace_root = path;
-        self.project_files.clear();
+        if project_changed {
+            self.project_main = None;
+        }
+        self.detect_project_main_on_scan = true;
+        self.project_tree.clear();
+        self.expanded_project_directories.clear();
+        self.expanded_project_directories
+            .insert(self.workspace_root.clone());
+        self.selected_project_entry = None;
         self.selected_project_file = None;
+        self.project_context_menu = None;
         self.project_scan_busy = false;
         self.file_status = Some(format!("Projeto aberto: {}", self.workspace_root.display()));
         self.mark_session_changed();
-        self.refresh_compiler_config(previous_config);
-        self.schedule_compile(Duration::ZERO, true);
+        self.restart_compilation(previous_config, true);
 
-        let scan = self.refresh_project_files();
-        self.dispatch_compile(Instant::now());
-        scan
+        self.refresh_project_tree()
+    }
+
+    fn project_entry_pressed(&mut self, path: PathBuf, kind: project::EntryKind) -> Task<Message> {
+        if self.file_busy {
+            return Task::none();
+        }
+
+        self.selected_project_entry = Some(path.clone());
+        match kind {
+            project::EntryKind::Directory => {
+                self.selected_project_file = None;
+                let expanded = if self.expanded_project_directories.remove(&path) {
+                    false
+                } else {
+                    self.expanded_project_directories.insert(path.clone());
+                    true
+                };
+                if path == self.workspace_root {
+                    self.file_status = Some(format!(
+                        "Projeto {}: {}",
+                        project_display_name(&path),
+                        if expanded { "expandido" } else { "recolhido" }
+                    ));
+                } else {
+                    let name = path
+                        .strip_prefix(&self.workspace_root)
+                        .unwrap_or(&path)
+                        .to_string_lossy();
+                    self.file_status = Some(format!(
+                        "Pasta {name}: {}",
+                        if expanded { "expandida" } else { "recolhida" }
+                    ));
+                }
+                Task::none()
+            }
+            project::EntryKind::TypstFile => self.open_project_file(path),
+            project::EntryKind::File => {
+                self.selected_project_file = None;
+                self.file_status = Some(format!(
+                    "{} não é um documento Typst editável",
+                    path.display()
+                ));
+                Task::none()
+            }
+        }
     }
 
     fn open_project_file(&mut self, path: PathBuf) -> Task<Message> {
@@ -1329,6 +2921,7 @@ impl App {
             return Task::none();
         }
 
+        self.reveal_project_entry(&path);
         self.selected_project_file = Some(path.clone());
 
         if let Some(id) = self.document.find_path(&path) {
@@ -1342,7 +2935,77 @@ impl App {
         Task::perform(read_document(path), Message::OpenFinished)
     }
 
+    fn reveal_project_entry(&mut self, path: &Path) {
+        self.selected_project_entry = Some(path.to_path_buf());
+        if path.starts_with(&self.workspace_root) {
+            self.expanded_project_directories
+                .insert(self.workspace_root.clone());
+        }
+        let mut parent = path.parent();
+
+        while let Some(directory) = parent {
+            if directory == self.workspace_root {
+                break;
+            }
+            if !directory.starts_with(&self.workspace_root) {
+                break;
+            }
+
+            self.expanded_project_directories
+                .insert(directory.to_path_buf());
+            parent = directory.parent();
+        }
+    }
+
+    fn set_project_main(&mut self, path: PathBuf) {
+        if self.file_busy {
+            return;
+        }
+        if !path.starts_with(&self.workspace_root)
+            || path.extension().is_none_or(|extension| extension != "typ")
+        {
+            self.file_status = Some("Selecione um arquivo Typst do projeto".to_owned());
+            return;
+        }
+        let name = path
+            .strip_prefix(&self.workspace_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+
+        self.update_project_main(Some(path), &format!("Documento principal definido: {name}"));
+    }
+
+    fn clear_project_main(&mut self) {
+        if self.file_busy || self.project_main.is_none() {
+            return;
+        }
+
+        self.update_project_main(None, "O preview voltou a acompanhar a aba ativa");
+    }
+
+    fn update_project_main(&mut self, project_main: Option<PathBuf>, status: &str) {
+        let project_main = project_main.filter(|path| {
+            path.starts_with(&self.workspace_root)
+                && path.extension().is_some_and(|extension| extension == "typ")
+        });
+        if self.project_main == project_main {
+            return;
+        }
+
+        let previous_config = self.compiler_config();
+        self.project_main = project_main;
+        self.mark_session_changed();
+        self.restart_compilation(previous_config, true);
+        self.file_status = Some(status.to_owned());
+    }
+
     fn start_create_project_file(&mut self) -> Task<Message> {
+        let directory = self.selected_project_target_directory();
+        self.start_create_project_file_at(directory)
+    }
+
+    fn start_create_project_file_at(&mut self, directory: PathBuf) -> Task<Message> {
         if self.file_busy {
             return Task::none();
         }
@@ -1350,51 +3013,78 @@ impl App {
         self.file_busy = true;
         self.file_status = Some("Escolha o nome do novo arquivo Typst...".to_owned());
         Task::perform(
-            project::create_file(self.workspace_root.clone()),
+            project::create_file(self.workspace_root.clone(), directory),
             Message::ProjectOperationFinished,
         )
     }
 
-    fn start_rename_project_file(&mut self) -> Task<Message> {
+    fn start_create_project_directory(&mut self) -> Task<Message> {
+        let directory = self.selected_project_target_directory();
+        self.start_create_project_directory_at(directory)
+    }
+
+    fn start_create_project_directory_at(&mut self, directory: PathBuf) -> Task<Message> {
         if self.file_busy {
             return Task::none();
         }
-        let Some(path) = self.selected_project_file.clone() else {
-            self.file_status = Some("Selecione um arquivo do projeto para renomear".to_owned());
+
+        self.file_busy = true;
+        self.file_status = Some("Escolha o nome da nova pasta...".to_owned());
+        Task::perform(
+            project::create_directory(self.workspace_root.clone(), directory),
+            Message::ProjectOperationFinished,
+        )
+    }
+
+    fn start_rename_project_entry(
+        &mut self,
+        path: PathBuf,
+        kind: project::EntryKind,
+    ) -> Task<Message> {
+        if self.file_busy {
             return Task::none();
-        };
+        }
+        if path == self.workspace_root || !path.starts_with(&self.workspace_root) {
+            self.file_status = Some("A raiz do projeto não pode ser renomeada".to_owned());
+            return Task::none();
+        }
 
         self.file_busy = true;
         self.file_status = Some(format!("Renomeando {}...", path.display()));
         Task::perform(
-            project::rename_file(self.workspace_root.clone(), path),
+            project::rename_entry(self.workspace_root.clone(), path, kind),
             Message::ProjectOperationFinished,
         )
     }
 
-    fn start_delete_project_file(&mut self) -> Task<Message> {
+    fn start_delete_project_entry(
+        &mut self,
+        path: PathBuf,
+        kind: project::EntryKind,
+    ) -> Task<Message> {
         if self.file_busy {
             return Task::none();
         }
-        let Some(path) = self.selected_project_file.clone() else {
-            self.file_status = Some("Selecione um arquivo do projeto para excluir".to_owned());
+        if path == self.workspace_root || !path.starts_with(&self.workspace_root) {
+            self.file_status = Some("A raiz do projeto não pode ser excluída".to_owned());
             return Task::none();
-        };
-        if self
-            .document
-            .find_path(&path)
-            .and_then(|id| self.document.get(id))
-            .is_some_and(Document::is_dirty)
-        {
-            self.file_status =
-                Some("Salve ou feche a aba antes de excluir esse arquivo".to_owned());
+        }
+        if self.document.iter().any(|(_, document)| {
+            document.is_dirty()
+                && document.path().is_some_and(|document_path| {
+                    project_entry_contains_path(&path, kind, document_path)
+                })
+        }) {
+            self.file_status = Some(
+                "Salve ou feche os documentos alterados antes de excluir esse item".to_owned(),
+            );
             return Task::none();
         }
 
         self.file_busy = true;
         self.file_status = Some(format!("Confirmando exclusão de {}...", path.display()));
         Task::perform(
-            project::delete_file(path),
+            project::delete_entry(self.workspace_root.clone(), path, kind),
             Message::ProjectOperationFinished,
         )
     }
@@ -1410,54 +3100,143 @@ impl App {
                 eprintln!("erro em operação de projeto: {error}");
                 self.file_status = Some(format!("Erro no projeto: {error}"));
             }
-            project::OperationOutcome::Created(path) => {
-                let previous_config = self.compiler_config();
-                self.selected_project_file = Some(path.clone());
-                self.document.clear_search_matches();
-                self.document
-                    .add(Document::opened(path.clone(), String::new()));
-                self.file_status = Some(format!("Arquivo criado: {}", path.display()));
-                self.document_replaced(previous_config);
-            }
-            project::OperationOutcome::Renamed { from, to } => {
-                let previous_config = self.compiler_config();
-                let renamed = self.document.find_path(&from);
-                let active_renamed = renamed == Some(self.document.active_id());
-
-                if let Some(id) = renamed
-                    && let Some(document) = self.document.get_mut(id)
-                {
-                    document.relocate(to.clone());
+            project::OperationOutcome::Created { path, kind } => {
+                self.reveal_project_entry(&path);
+                match kind {
+                    project::EntryKind::Directory => {
+                        self.expanded_project_directories.insert(path.clone());
+                        self.selected_project_file = None;
+                        self.file_status = Some(format!("Pasta criada: {}", path.display()));
+                    }
+                    project::EntryKind::TypstFile => {
+                        let previous_config = self.compiler_config();
+                        self.selected_project_file = Some(path.clone());
+                        self.document.clear_search_matches();
+                        self.document
+                            .add(Document::opened(path.clone(), String::new()));
+                        self.file_status = Some(format!("Arquivo criado: {}", path.display()));
+                        if self.project_main.is_some() {
+                            self.active_document_replaced();
+                        } else {
+                            self.document_replaced(previous_config);
+                        }
+                    }
+                    project::EntryKind::File => {
+                        self.selected_project_file = None;
+                        self.file_status = Some(format!("Arquivo criado: {}", path.display()));
+                    }
                 }
+            }
+            project::OperationOutcome::Renamed { from, to, kind } => {
+                let previous_config = self.compiler_config();
+                let active_renamed = self
+                    .document
+                    .path()
+                    .is_some_and(|path| project_entry_contains_path(&from, kind, path));
 
-                self.selected_project_file = Some(to.clone());
+                for (_, document) in self.document.iter_mut() {
+                    let Some(path) = document.path() else {
+                        continue;
+                    };
+                    if let Some(relocated) = remap_project_path(path, &from, &to, kind) {
+                        document.relocate(relocated);
+                    }
+                }
+                let renamed_main = self
+                    .project_main
+                    .as_deref()
+                    .and_then(|main| remap_project_path(main, &from, &to, kind));
+                if let Some(main) = renamed_main {
+                    self.project_main = Some(main);
+                }
+                self.expanded_project_directories =
+                    std::mem::take(&mut self.expanded_project_directories)
+                        .into_iter()
+                        .map(|directory| {
+                            remap_project_path(&directory, &from, &to, kind).unwrap_or(directory)
+                        })
+                        .collect();
+
+                self.reveal_project_entry(&to);
+                self.selected_project_file =
+                    (kind == project::EntryKind::TypstFile).then_some(to.clone());
+                let noun = if kind == project::EntryKind::Directory {
+                    "Pasta"
+                } else {
+                    "Arquivo"
+                };
                 self.file_status = Some(format!(
-                    "Arquivo renomeado: {} -> {}",
+                    "{noun} renomeado: {} -> {}",
                     from.display(),
                     to.display()
                 ));
                 if active_renamed {
-                    self.document_replaced(previous_config);
-                } else {
-                    self.mark_session_changed();
-                    self.schedule_compile(Duration::ZERO, true);
-                    self.dispatch_compile(Instant::now());
+                    self.apply_editor_settings();
+                    self.replace_editor_pane_identity();
                 }
+                self.mark_session_changed();
+                self.restart_compilation(previous_config, true);
             }
-            project::OperationOutcome::Deleted(path) => {
-                if let Some(id) = self.document.find_path(&path) {
-                    self.close_document(id);
+            project::OperationOutcome::Deleted { path, kind } => {
+                let previous_config = self.compiler_config();
+                let deleted_main = self
+                    .project_main
+                    .as_deref()
+                    .is_some_and(|main| project_entry_contains_path(&path, kind, main));
+                if deleted_main {
+                    self.project_main = None;
+                }
+
+                let removed = self
+                    .document
+                    .iter()
+                    .filter_map(|(id, document)| {
+                        document
+                            .path()
+                            .is_some_and(|document_path| {
+                                project_entry_contains_path(&path, kind, document_path)
+                            })
+                            .then_some(id)
+                    })
+                    .collect::<Vec<_>>();
+                let active_removed = removed.contains(&self.document.active_id());
+                for id in removed {
+                    self.document.remove(id);
+                    self.discarded_on_close.remove(&id);
+                }
+                if active_removed {
+                    self.active_document_replaced();
                 } else {
                     self.mark_session_changed();
-                    self.schedule_compile(Duration::ZERO, true);
-                    self.dispatch_compile(Instant::now());
+                }
+                self.expanded_project_directories
+                    .retain(|directory| !project_entry_contains_path(&path, kind, directory));
+                self.restart_compilation(previous_config, true);
+                if self
+                    .selected_project_entry
+                    .as_deref()
+                    .is_some_and(|selected| project_entry_contains_path(&path, kind, selected))
+                {
+                    self.selected_project_entry = None;
                 }
                 self.selected_project_file = None;
-                self.file_status = Some(format!("Arquivo excluído: {}", path.display()));
+                let noun = if kind == project::EntryKind::Directory {
+                    "Pasta excluída"
+                } else {
+                    "Arquivo excluído"
+                };
+                self.file_status = Some(if deleted_main {
+                    format!(
+                        "{noun}: {}; o Preview agora acompanha a aba ativa",
+                        path.display()
+                    )
+                } else {
+                    format!("{noun}: {}", path.display())
+                });
             }
         }
 
-        self.refresh_project_files()
+        self.refresh_project_tree()
     }
 
     fn open_diagnostic(
@@ -1465,29 +3244,70 @@ impl App {
         target: compiler::DiagnosticTarget,
         range: Range<usize>,
     ) -> Task<Message> {
+        self.reveal_source_target(target, range, "Diagnóstico revelado no editor")
+    }
+
+    fn document_outline_pressed(
+        &mut self,
+        target: source_map::SourceTarget,
+        range: Range<usize>,
+        has_children: bool,
+    ) -> Task<Message> {
+        if has_children {
+            let key = OutlineKey::new(target.clone(), range.start);
+
+            if !self.collapsed_outline_entries.insert(key.clone()) {
+                self.collapsed_outline_entries.remove(&key);
+            }
+        }
+
+        self.reveal_source_target(target, range, "Tópico revelado no editor")
+    }
+
+    fn reveal_source_target(
+        &mut self,
+        target: source_map::SourceTarget,
+        range: Range<usize>,
+        status: &str,
+    ) -> Task<Message> {
+        let target = match target {
+            source_map::SourceTarget::Main => self
+                .project_main
+                .clone()
+                .map(source_map::SourceTarget::ProjectFile)
+                .unwrap_or(source_map::SourceTarget::Main),
+            target => target,
+        };
+
         match target {
-            compiler::DiagnosticTarget::Main => {
+            source_map::SourceTarget::Main => {
                 self.document.reveal_range(range);
+                self.file_status = Some(status.to_owned());
                 Task::none()
             }
-            compiler::DiagnosticTarget::ProjectFile(path) => {
+            source_map::SourceTarget::ProjectFile(path) => {
                 if let Some(id) = self.document.find_path(&path) {
                     self.activate_document(id);
                     if let Some(document) = self.document.get_mut(id) {
                         document.reveal_range(range);
                     }
+                    self.file_status = Some(status.to_owned());
                     Task::none()
                 } else if self.file_busy {
                     Task::none()
                 } else {
-                    self.pending_diagnostic_reveal = Some((path.clone(), range));
+                    self.pending_source_reveal = Some(PendingSourceReveal {
+                        path: path.clone(),
+                        range,
+                        status: status.to_owned(),
+                    });
                     self.open_project_file(path)
                 }
             }
         }
     }
 
-    fn refresh_project_files(&mut self) -> Task<Message> {
+    fn refresh_project_tree(&mut self) -> Task<Message> {
         if self.project_scan_busy {
             return Task::none();
         }
@@ -1544,7 +3364,7 @@ impl App {
         self.schedule_compile(Duration::ZERO, true);
         self.dispatch_compile(now);
 
-        Task::batch([self.refresh_project_files(), self.check_external_files()])
+        Task::batch([self.refresh_project_tree(), self.check_external_files()])
     }
 
     fn check_external_files(&mut self) -> Task<Message> {
@@ -1796,6 +3616,7 @@ impl App {
 
         session::Session::new(
             self.workspace_root.clone(),
+            self.project_main.clone(),
             active_document.unwrap_or(0),
             documents,
             self.pane_layout(),
@@ -1804,25 +3625,9 @@ impl App {
     }
 
     fn pane_layout(&self) -> session::PaneLayout {
-        let pane_grid::Node::Split { axis, ratio, a, .. } = self.panes.layout() else {
-            return session::PaneLayout::default();
-        };
-        let first = first_pane(a)
-            .and_then(|pane| self.panes.get(pane))
-            .copied()
-            .unwrap_or(Pane::Editor);
-
-        session::PaneLayout {
-            axis: match axis {
-                pane_grid::Axis::Horizontal => session::Axis::Horizontal,
-                pane_grid::Axis::Vertical => session::Axis::Vertical,
-            },
-            ratio: *ratio,
-            first: match first {
-                Pane::Editor => session::Pane::Editor,
-                Pane::Preview => session::Pane::Preview,
-            },
-        }
+        pane_node_from_layout(self.panes.layout(), &self.panes)
+            .map(session::PaneLayout::from_tree)
+            .unwrap_or_default()
     }
 
     fn start_save(&mut self, save_as: bool) -> Task<Message> {
@@ -1860,8 +3665,8 @@ impl App {
 
         self.file_busy = true;
         self.file_status = Some("Aguardando o destino do PDF...".to_owned());
-        let directory = self.document.directory(&self.workspace_root);
-        let file_name = pdf_file_name(&self.document.display_name());
+        let directory = self.compilation_directory();
+        let file_name = pdf_file_name(&self.compilation_display_name());
 
         Task::perform(
             choose_pdf_path(directory, file_name),
@@ -1880,7 +3685,8 @@ impl App {
             self.file_status = Some("O worker de compilação não está disponível".to_owned());
             return Task::none();
         };
-        let (revision, source) = self.document.snapshot();
+        let revision = self.compilation_revision;
+        let source = self.compilation_source();
 
         self.next_request_id += 1;
         let request_id = self.next_request_id;
@@ -1930,15 +3736,19 @@ impl App {
 
         match outcome {
             OpenOutcome::Cancelled => {
-                self.pending_diagnostic_reveal = None;
+                self.pending_source_reveal = None;
                 self.file_status = Some("A abertura foi cancelada".to_owned());
             }
             OpenOutcome::Failed(error) => {
-                self.pending_diagnostic_reveal = None;
+                self.pending_source_reveal = None;
                 eprintln!("erro ao abrir documento: {error}");
                 self.file_status = Some(format!("Erro ao abrir: {error}"));
             }
             OpenOutcome::Loaded { path, source } => {
+                if path.starts_with(&self.workspace_root) {
+                    self.reveal_project_entry(&path);
+                    self.selected_project_file = Some(path.clone());
+                }
                 if let Some(id) = self.document.find_path(&path) {
                     self.activate_document(id);
                     self.file_status = Some(format!("Aba ativada: {}", path.display()));
@@ -1947,15 +3757,20 @@ impl App {
                     self.document.clear_search_matches();
                     self.document.add(Document::opened(path.clone(), source));
                     self.file_status = Some(format!("Aberto: {}", path.display()));
-                    self.document_replaced(previous_config);
+                    if self.project_main.is_some() {
+                        self.active_document_replaced();
+                    } else {
+                        self.document_replaced(previous_config);
+                    }
                 }
 
-                if let Some((reveal_path, range)) = self.pending_diagnostic_reveal.take()
-                    && reveal_path == path
+                if let Some(reveal) = self.pending_source_reveal.take()
+                    && reveal.path == path
                     && let Some(id) = self.document.find_path(&path)
                     && let Some(document) = self.document.get_mut(id)
                 {
-                    document.reveal_range(range);
+                    document.reveal_range(reveal.range);
+                    self.file_status = Some(reveal.status);
                 }
             }
         }
@@ -2005,8 +3820,16 @@ impl App {
                 path,
                 source,
             } => {
-                let is_active = self.document.active_id() == document_id;
-                let previous_config = is_active.then(|| self.compiler_config());
+                let previous_config = self.compiler_config();
+                let old_path = self
+                    .document
+                    .get(document_id)
+                    .and_then(Document::path)
+                    .map(Path::to_path_buf);
+                let was_main = self
+                    .project_main
+                    .as_deref()
+                    .is_some_and(|main| old_path.as_deref() == Some(main));
                 let Some(document) = self.document.get_mut(document_id) else {
                     self.pending_after_save = None;
                     return Task::none();
@@ -2014,9 +3837,21 @@ impl App {
 
                 document.mark_saved(path.clone(), source);
                 let still_dirty = document.is_dirty();
+                let path_changed = old_path.as_deref() != Some(path.as_path());
+                if was_main {
+                    self.project_main = (path.starts_with(&self.workspace_root)
+                        && path.extension().is_some_and(|extension| extension == "typ"))
+                    .then_some(path.clone());
+                }
+                let main_released = was_main && self.project_main.is_none();
                 self.mark_session_changed();
 
-                self.file_status = Some(if still_dirty {
+                self.file_status = Some(if main_released {
+                    format!(
+                        "Salvo em {}; fora do projeto, o preview agora acompanha a aba ativa",
+                        path.display()
+                    )
+                } else if still_dirty {
                     format!(
                         "Versão salva em {}; há alterações mais recentes",
                         path.display()
@@ -2025,8 +3860,8 @@ impl App {
                     format!("Salvo em {}", path.display())
                 });
 
-                if let Some(previous_config) = previous_config {
-                    self.refresh_compiler_config(previous_config);
+                if path_changed {
+                    self.restart_compilation(previous_config, true);
                 }
 
                 if let Some(action) = self.pending_after_save.take() {
@@ -2040,13 +3875,36 @@ impl App {
 
     fn document_replaced(&mut self, previous_config: compiler::Config) {
         self.search.visible = false;
-        self.clear_compile_diagnostics();
         self.apply_editor_settings();
         self.replace_editor_pane_identity();
-        self.preview.clear();
-        self.latest_request_id = None;
         self.mark_session_changed();
-        self.refresh_compiler_config(previous_config);
+        self.restart_compilation(previous_config, true);
+    }
+
+    fn active_document_replaced(&mut self) {
+        self.search.visible = false;
+        self.apply_editor_settings();
+        self.replace_editor_pane_identity();
+        self.preview_highlight = None;
+        self.mark_session_changed();
+    }
+
+    fn restart_compilation(&mut self, previous_config: compiler::Config, clear_preview: bool) {
+        if previous_config != self.compiler_config() {
+            self.compiler = None;
+        }
+        self.latest_request_id = None;
+        self.clear_compile_diagnostics();
+
+        if clear_preview {
+            self.preview.clear();
+            self.preview_revision = None;
+            self.preview_pointer = None;
+            self.preview_highlight = None;
+            self.document_outline.clear();
+            self.collapsed_outline_entries.clear();
+        }
+
         self.schedule_compile(Duration::ZERO, true);
         self.dispatch_compile(Instant::now());
     }
@@ -2073,17 +3931,64 @@ impl App {
         debug_assert!(removed.is_some_and(|(_, sibling)| sibling == replacement));
     }
 
-    fn refresh_compiler_config(&mut self, previous_config: compiler::Config) {
-        if previous_config != self.compiler_config() {
-            self.compiler = None;
-            self.latest_request_id = None;
-            self.schedule_compile(Duration::ZERO, true);
+    fn compiler_config(&self) -> compiler::Config {
+        if let Some(path) = self.project_main.as_deref()
+            && let Some((root, main_name)) = compiler_location_for_path(&self.workspace_root, path)
+        {
+            return compiler::Config::new(root, main_name);
+        }
+
+        let (root, main_name) = self.document.compiler_location(&self.workspace_root);
+        compiler::Config::new(root, main_name)
+    }
+
+    fn compilation_main_document_id(&self) -> Option<DocumentId> {
+        match self.project_main.as_deref() {
+            Some(path) => self.document.find_path(path),
+            None => Some(self.document.active_id()),
         }
     }
 
-    fn compiler_config(&self) -> compiler::Config {
-        let (root, main_name) = self.document.compiler_location(&self.workspace_root);
-        compiler::Config::new(root, main_name)
+    fn compilation_source(&self) -> Option<String> {
+        self.compilation_main_document_id()
+            .and_then(|id| self.document.get(id))
+            .map(|document| document.snapshot().1)
+    }
+
+    fn compilation_main_path(&self) -> Option<&Path> {
+        self.project_main
+            .as_deref()
+            .or_else(|| self.document.path())
+    }
+
+    fn compilation_display_name(&self) -> String {
+        self.compilation_main_path()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.document.display_name())
+    }
+
+    fn compilation_directory(&self) -> PathBuf {
+        self.compilation_main_path()
+            .and_then(Path::parent)
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(&self.workspace_root)
+            .to_path_buf()
+    }
+
+    fn active_source_target(&self) -> Option<source_map::SourceTarget> {
+        let Some(main) = self.project_main.as_deref() else {
+            return Some(source_map::SourceTarget::Main);
+        };
+        let path = self.document.path()?;
+
+        if path == main {
+            Some(source_map::SourceTarget::Main)
+        } else if path.starts_with(&self.workspace_root) {
+            Some(source_map::SourceTarget::ProjectFile(path.to_path_buf()))
+        } else {
+            None
+        }
     }
 
     fn apply_editor_settings(&mut self) {
@@ -2109,13 +4014,129 @@ impl App {
         self.settings_changed(false);
     }
 
+    fn preview_map_ready(&self) -> bool {
+        matches!(self.preview_status, PreviewStatus::Ready { .. })
+            && self.preview_revision == Some(self.compilation_revision)
+            && self.preview.iter().any(|page| !page.regions.is_empty())
+    }
+
+    fn preview_navigation_ready(&self) -> bool {
+        let Some(target) = self.active_source_target() else {
+            return false;
+        };
+
+        self.preview_map_ready()
+            && self
+                .preview
+                .iter()
+                .flat_map(|page| &page.regions)
+                .any(|region| region.target == target)
+    }
+
+    fn reveal_cursor_in_preview(&mut self) -> Task<Message> {
+        if !self.preview_navigation_ready() {
+            self.file_status =
+                Some("Aguarde um preview atualizado antes de localizar o cursor".to_owned());
+            return Task::none();
+        }
+
+        let offset = self.document.cursor_offset();
+        let Some(target) = self.active_source_target() else {
+            self.file_status = Some("A aba ativa não pertence ao preview principal".to_owned());
+            return Task::none();
+        };
+        let Some((page_index, region)) = find_source_region(&self.preview, &target, offset) else {
+            self.file_status = Some("O cursor não produziu uma região no preview".to_owned());
+            return Task::none();
+        };
+        let scroll_offset = self.preview_scroll_offset(page_index, region.bounds);
+
+        self.preview_highlight = Some(PreviewHighlight {
+            page: page_index,
+            bounds: region.bounds,
+        });
+        self.file_status = Some(format!(
+            "Cursor localizado no preview, página {}",
+            page_index + 1
+        ));
+
+        operation::scroll_to(self.preview_scroll_id.clone(), scroll_offset)
+    }
+
+    fn reveal_preview_source(&mut self, page_index: usize) -> Task<Message> {
+        if !self.preview_map_ready() {
+            self.file_status =
+                Some("Aguarde um preview atualizado antes de navegar para o texto".to_owned());
+            return Task::none();
+        }
+        let Some(pointer) = self
+            .preview_pointer
+            .filter(|pointer| pointer.page == page_index)
+        else {
+            return Task::none();
+        };
+        let Some(page) = self.preview.get(page_index) else {
+            return Task::none();
+        };
+        let scale = preview_scale(self.settings.preview_zoom, self.preview_logical_ppi);
+        let x = pointer.position.x / scale;
+        let y = pointer.position.y / scale;
+        let Some(region) = find_preview_region(page, x, y) else {
+            self.file_status = Some("Nenhuma origem encontrada nessa posição".to_owned());
+            return Task::none();
+        };
+
+        self.preview_highlight = Some(PreviewHighlight {
+            page: page_index,
+            bounds: region.bounds,
+        });
+        self.reveal_source_target(
+            region.target,
+            region.range,
+            "Origem do preview revelada no editor",
+        )
+    }
+
+    fn preview_scroll_offset(
+        &self,
+        page_index: usize,
+        bounds: source_map::SourceBounds,
+    ) -> scrollable::AbsoluteOffset {
+        let scale = preview_scale(self.settings.preview_zoom, self.preview_logical_ppi);
+        let widest_page = self
+            .preview
+            .iter()
+            .map(|page| page.width * scale)
+            .fold(0.0_f32, f32::max);
+        let page = &self.preview[page_index];
+        let page_left = PREVIEW_PADDING + (widest_page - page.width * scale) / 2.0;
+        let previous_height = self
+            .preview
+            .iter()
+            .take(page_index)
+            .map(|page| {
+                PREVIEW_LABEL_HEIGHT
+                    + PREVIEW_LABEL_SPACING
+                    + page.height * scale
+                    + PREVIEW_PAGE_SPACING
+            })
+            .sum::<f32>();
+        let page_top =
+            PREVIEW_PADDING + previous_height + PREVIEW_LABEL_HEIGHT + PREVIEW_LABEL_SPACING;
+
+        scrollable::AbsoluteOffset {
+            x: (page_left + bounds.x * scale - 32.0).max(0.0),
+            y: (page_top + bounds.y * scale - 32.0).max(0.0),
+        }
+    }
+
     fn source_overlays(&self) -> Vec<SourceOverlay> {
-        let active = self.document.active_id();
+        let main = self.compilation_main_document_id();
         let config = self.compiler_config();
 
         self.document
             .iter()
-            .filter(|(id, document)| *id != active && document.is_dirty())
+            .filter(|(id, document)| Some(*id) != main && document.is_dirty())
             .filter_map(|(_id, document)| {
                 let path = document.path()?.to_path_buf();
                 path.starts_with(config.root()).then(|| SourceOverlay {
@@ -2143,13 +4164,13 @@ impl App {
     }
 
     fn install_diagnostics(&mut self, diagnostics: Vec<compiler::ReportedDiagnostic>) {
-        let active = self.document.active_id();
+        let main = self.compilation_main_document_id();
 
         for (id, document) in self.document.iter_mut() {
             let editor_diagnostics = diagnostics
                 .iter()
                 .filter(|diagnostic| match &diagnostic.target {
-                    compiler::DiagnosticTarget::Main => id == active,
+                    compiler::DiagnosticTarget::Main => Some(id) == main,
                     compiler::DiagnosticTarget::ProjectFile(path) => {
                         document.path() == Some(path.as_path())
                     }
@@ -2160,6 +4181,14 @@ impl App {
         }
 
         self.diagnostics = diagnostics;
+    }
+
+    fn install_document_outline(&mut self, outline: Vec<compiler::DocumentOutlineItem>) {
+        let mut available = HashSet::new();
+        collect_outline_keys(&outline, &mut available);
+        self.collapsed_outline_entries
+            .retain(|key| available.contains(key));
+        self.document_outline = outline;
     }
 
     fn open_search(&mut self, replace_visible: bool) -> Task<Message> {
@@ -2284,6 +4313,8 @@ impl App {
             deadline: Instant::now() + delay,
             reset_files,
         });
+        self.compilation_revision = self.compilation_revision.wrapping_add(1);
+        self.preview_highlight = None;
         self.preview_status = PreviewStatus::Waiting;
     }
 
@@ -2300,7 +4331,8 @@ impl App {
             return;
         };
 
-        let (revision, source) = self.document.snapshot();
+        let revision = self.compilation_revision;
+        let source = self.compilation_source();
 
         self.next_request_id += 1;
         let request_id = self.next_request_id;
@@ -2351,7 +4383,7 @@ impl App {
     }
 
     fn handle_preview_output(&mut self, output: compiler::Output) -> Task<Message> {
-        let current_revision = self.document.revision();
+        let current_revision = self.compilation_revision;
 
         if self.latest_request_id != Some(output.id) || current_revision != output.revision {
             return Task::none();
@@ -2377,6 +4409,7 @@ impl App {
             return Task::none();
         }
 
+        self.install_document_outline(output.outline);
         self.preview = output
             .pages
             .into_iter()
@@ -2384,8 +4417,12 @@ impl App {
                 handle: svg::Handle::from_memory(page.svg),
                 width: page.width,
                 height: page.height,
+                regions: page.regions,
             })
             .collect();
+        self.preview_revision = Some(output.revision);
+        self.preview_pointer = None;
+        self.preview_highlight = None;
         self.preview_status = PreviewStatus::Ready {
             pages: output.page_count,
             warnings: output.warning_count,
@@ -2403,7 +4440,7 @@ impl App {
             return Task::none();
         }
 
-        if self.document.revision() == output.revision {
+        if self.compilation_revision == output.revision {
             self.install_diagnostics(output.diagnostics);
         }
 
@@ -2454,68 +4491,334 @@ impl App {
     }
 }
 
-fn panes_from_layout(layout: session::PaneLayout) -> pane_grid::State<Pane> {
-    let first = match layout.first {
-        session::Pane::Editor => Pane::Editor,
-        session::Pane::Preview => Pane::Preview,
-    };
-    let second = match first {
-        Pane::Editor => Pane::Preview,
-        Pane::Preview => Pane::Editor,
-    };
-    let axis = match layout.axis {
-        session::Axis::Horizontal => pane_grid::Axis::Horizontal,
-        session::Axis::Vertical => pane_grid::Axis::Vertical,
-    };
-
-    pane_grid::State::with_configuration(pane_grid::Configuration::Split {
-        axis,
-        ratio: layout.ratio.clamp(0.1, 0.9),
-        a: Box::new(pane_grid::Configuration::Pane(first)),
-        b: Box::new(pane_grid::Configuration::Pane(second)),
-    })
+fn find_source_region(
+    pages: &[PreviewPage],
+    target: &source_map::SourceTarget,
+    offset: usize,
+) -> Option<(usize, source_map::SourceRegion)> {
+    pages
+        .iter()
+        .enumerate()
+        .flat_map(|(page_index, page)| {
+            page.regions
+                .iter()
+                .filter(move |region| &region.target == target)
+                .map(move |region| (page_index, region))
+        })
+        .min_by(|(_, left), (_, right)| source_map::compare_source_candidates(left, right, offset))
+        .map(|(page_index, region)| (page_index, region.clone()))
 }
 
-fn first_pane(node: &pane_grid::Node) -> Option<pane_grid::Pane> {
-    match node {
-        pane_grid::Node::Pane(pane) => Some(*pane),
-        pane_grid::Node::Split { a, .. } => first_pane(a),
+fn collect_outline_keys(entries: &[compiler::DocumentOutlineItem], keys: &mut HashSet<OutlineKey>) {
+    for entry in entries {
+        keys.insert(OutlineKey::new(entry.target.clone(), entry.range.start));
+        collect_outline_keys(&entry.children, keys);
     }
 }
 
-fn file_button<'a>(
+fn find_current_outline_key(
+    entries: &[compiler::DocumentOutlineItem],
+    target: &source_map::SourceTarget,
+    cursor: usize,
+    selected: &mut Option<OutlineKey>,
+) {
+    for entry in entries {
+        if &entry.target == target
+            && entry.range.start <= cursor
+            && selected
+                .as_ref()
+                .is_none_or(|current| current.start <= entry.range.start)
+        {
+            *selected = Some(OutlineKey::new(entry.target.clone(), entry.range.start));
+        }
+
+        find_current_outline_key(&entry.children, target, cursor, selected);
+    }
+}
+
+fn find_preview_region(page: &PreviewPage, x: f32, y: f32) -> Option<source_map::SourceRegion> {
+    let maximum_distance = PREVIEW_HIT_DISTANCE * PREVIEW_HIT_DISTANCE;
+
+    page.regions
+        .iter()
+        .filter(|region| region.bounds.distance_squared(x, y) <= maximum_distance)
+        .min_by(|left, right| {
+            let left_exact = left.bounds.contains(x, y, 1.5);
+            let right_exact = right.bounds.contains(x, y, 1.5);
+
+            right_exact
+                .cmp(&left_exact)
+                .then_with(|| {
+                    left.bounds
+                        .distance_squared(x, y)
+                        .partial_cmp(&right.bounds.distance_squared(x, y))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.kind.hit_priority().cmp(&right.kind.hit_priority()))
+                .then_with(|| {
+                    left.bounds
+                        .area()
+                        .partial_cmp(&right.bounds.area())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        })
+        .cloned()
+}
+
+fn panes_from_layout(layout: session::PaneLayout) -> pane_grid::State<Pane> {
+    pane_grid::State::with_configuration(pane_configuration(layout.into_tree()))
+}
+
+fn pane_configuration(node: session::PaneNode) -> pane_grid::Configuration<Pane> {
+    match node {
+        session::PaneNode::Pane { pane } => pane_grid::Configuration::Pane(match pane {
+            session::Pane::Project => Pane::Project,
+            session::Pane::Editor => Pane::Editor,
+            session::Pane::Preview => Pane::Preview,
+        }),
+        session::PaneNode::Split { axis, ratio, a, b } => pane_grid::Configuration::Split {
+            axis: match axis {
+                session::Axis::Horizontal => pane_grid::Axis::Horizontal,
+                session::Axis::Vertical => pane_grid::Axis::Vertical,
+            },
+            ratio,
+            a: Box::new(pane_configuration(*a)),
+            b: Box::new(pane_configuration(*b)),
+        },
+    }
+}
+
+fn pane_node_from_layout(
+    node: &pane_grid::Node,
+    panes: &pane_grid::State<Pane>,
+) -> Option<session::PaneNode> {
+    match node {
+        pane_grid::Node::Pane(id) => panes.get(*id).copied().map(|pane| {
+            session::PaneNode::pane(match pane {
+                Pane::Project => session::Pane::Project,
+                Pane::Editor => session::Pane::Editor,
+                Pane::Preview => session::Pane::Preview,
+            })
+        }),
+        pane_grid::Node::Split {
+            axis, ratio, a, b, ..
+        } => Some(session::PaneNode::split(
+            match axis {
+                pane_grid::Axis::Horizontal => session::Axis::Horizontal,
+                pane_grid::Axis::Vertical => session::Axis::Vertical,
+            },
+            *ratio,
+            pane_node_from_layout(a, panes)?,
+            pane_node_from_layout(b, panes)?,
+        )),
+    }
+}
+
+fn menu_popup(
+    definitions: Vec<AppMenuEntry>,
+    menu_focus: usize,
+    width: f32,
+) -> Element<'static, Message> {
+    let mut item_index = 0;
+    let mut entries = Vec::new();
+
+    for entry in definitions {
+        match entry {
+            AppMenuEntry::Divider => entries.push(ui::MenuEntry::Divider),
+            AppMenuEntry::Item {
+                label,
+                value,
+                selected,
+                enabled,
+                command,
+            } => {
+                let mut item =
+                    ui::MenuItem::new(label, enabled.then_some(Message::MenuCommand(command)))
+                        .selected(selected)
+                        .focused(item_index == menu_focus);
+                if enabled {
+                    item = item.on_focus(Message::MenuFocused(item_index));
+                }
+                if let Some(value) = value {
+                    item = item.value(value);
+                }
+                entries.push(ui::MenuEntry::Item(item));
+                item_index += 1;
+            }
+        }
+    }
+
+    ui::Menu::new(entries).width(width).into()
+}
+
+fn menu_popup_height(entries: &[AppMenuEntry]) -> f32 {
+    let content = entries
+        .iter()
+        .map(|entry| match entry {
+            AppMenuEntry::Item { .. } => ui::tokens::dimension::MENU_ITEM_HEIGHT_MEDIUM,
+            AppMenuEntry::Divider => ui::tokens::dimension::MENU_SECTION_DIVIDER_HEIGHT,
+        })
+        .sum::<f32>();
+
+    content + ui::tokens::spacing::MENU_POPOVER_PADDING * 2.0
+}
+
+fn enabled_menu_items(entries: &[AppMenuEntry]) -> Vec<usize> {
+    let mut item_index = 0;
+    let mut enabled = Vec::new();
+
+    for entry in entries {
+        if let AppMenuEntry::Item {
+            enabled: item_enabled,
+            ..
+        } = entry
+        {
+            if *item_enabled {
+                enabled.push(item_index);
+            }
+            item_index += 1;
+        }
+    }
+
+    enabled
+}
+
+fn first_enabled_menu_item(entries: &[AppMenuEntry]) -> Option<usize> {
+    enabled_menu_items(entries).into_iter().next()
+}
+
+fn menu_command_at(entries: &[AppMenuEntry], target: usize) -> Option<MenuCommand> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            AppMenuEntry::Item {
+                enabled: true,
+                command,
+                ..
+            } => Some(Some(command.clone())),
+            AppMenuEntry::Item { .. } => Some(None),
+            AppMenuEntry::Divider => None,
+        })
+        .nth(target)
+        .flatten()
+}
+
+fn menu_horizontal_offset(menu: AppMenu) -> f32 {
+    APP_BAR_HORIZONTAL_PADDING
+        + match menu {
+            AppMenu::File => 0.0,
+            AppMenu::Edit => FILE_MENU_TRIGGER_WIDTH,
+            AppMenu::View => FILE_MENU_TRIGGER_WIDTH + EDIT_MENU_TRIGGER_WIDTH,
+            AppMenu::Help => {
+                FILE_MENU_TRIGGER_WIDTH + EDIT_MENU_TRIGGER_WIDTH + VIEW_MENU_TRIGGER_WIDTH
+            }
+        }
+}
+
+fn menu_popup_width(menu: AppMenu) -> f32 {
+    match menu {
+        AppMenu::File => 280.0,
+        AppMenu::Edit => 304.0,
+        AppMenu::View => 320.0,
+        AppMenu::Help => 256.0,
+    }
+}
+
+fn command_shortcut(key: &str) -> String {
+    #[cfg(target_os = "macos")]
+    let modifier = "⌘";
+    #[cfg(not(target_os = "macos"))]
+    let modifier = "Ctrl+";
+
+    format!("{modifier}{key}")
+}
+
+fn command_shift_shortcut(key: &str) -> String {
+    #[cfg(target_os = "macos")]
+    let modifier = "⇧⌘";
+    #[cfg(not(target_os = "macos"))]
+    let modifier = "Ctrl+Shift+";
+
+    format!("{modifier}{key}")
+}
+
+fn app_bar_style(theme: &Theme) -> iced::widget::container::Style {
+    let colors = ui::tokens::SpectrumColors::from_theme(theme);
+
+    iced::widget::container::Style::default()
+        .background(colors.gray.gray_50)
+        .border(Border {
+            color: colors.gray.gray_300,
+            width: 1.0,
+            ..Border::default()
+        })
+}
+
+fn action_bar_style(theme: &Theme) -> iced::widget::container::Style {
+    let colors = ui::tokens::SpectrumColors::from_theme(theme);
+
+    iced::widget::container::Style::default()
+        .background(colors.gray.gray_50)
+        .border(Border {
+            color: colors.gray.gray_300,
+            width: 1.0,
+            ..Border::default()
+        })
+}
+
+fn project_navigation_divider_style(theme: &Theme) -> iced::widget::container::Style {
+    let colors = ui::tokens::SpectrumColors::from_theme(theme);
+
+    iced::widget::container::Style::default().background(colors.gray.gray_300)
+}
+
+fn modal_backdrop_style(_theme: &Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style::default().background(Color::from_rgba(0.0, 0.0, 0.0, 0.32))
+}
+
+fn modal_dialog_style(theme: &Theme) -> iced::widget::container::Style {
+    let colors = ui::tokens::SpectrumColors::from_theme(theme);
+
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(colors.gray.gray_50)),
+        border: Border {
+            color: colors.gray.gray_300,
+            width: 1.0,
+            radius: ui::tokens::dimension::CORNER_RADIUS_500.into(),
+        },
+        shadow: iced::Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.24),
+            offset: iced::Vector::new(0.0, 4.0),
+            blur_radius: 12.0,
+        },
+        ..iced::widget::container::Style::default()
+    }
+}
+
+fn message_action_button<'a>(
     label: &'a str,
     message: Message,
     enabled: bool,
 ) -> iced::widget::Button<'a, Message> {
-    let button = button(label);
-
-    if enabled {
-        button.on_press(message)
-    } else {
-        button
-    }
+    ui::action_button(
+        label,
+        enabled.then_some(message),
+        ui::ActionButtonOptions::STANDARD,
+    )
 }
 
-fn command_button<'a>(
+fn message_icon_button<'a>(
     symbol: &'a str,
     description: &'a str,
-    action: Action,
+    message: Message,
     enabled: bool,
 ) -> Element<'a, Message> {
-    let button = button(text(symbol).width(24).align_x(Alignment::Center));
-    let button = if enabled {
-        button.on_press(Message::Editor(action))
-    } else {
-        button
-    };
-
-    tooltip(
-        button,
-        container(text(description).size(12)).padding([4, 6]),
-        tooltip::Position::Bottom,
+    ui::icon_action_button(
+        symbol,
+        description,
+        enabled.then_some(message),
+        ui::ActionButtonOptions::STANDARD,
     )
-    .into()
 }
 
 async fn confirm_unsaved(name: String) -> UnsavedDecision {
@@ -2753,17 +5056,40 @@ fn atomic_write_file_with_mode(
     Ok(())
 }
 
+fn menu_bar_pointer_subscription() -> Subscription<Message> {
+    event::listen_with(|event, _status, _window| match event {
+        iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
+            Some(Message::CursorMoved(position))
+        }
+        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+        | iced::Event::Mouse(mouse::Event::CursorLeft)
+        | iced::Event::Touch(iced::touch::Event::FingerLifted { .. })
+        | iced::Event::Touch(iced::touch::Event::FingerLost { .. }) => {
+            Some(Message::MenuBarPointerReleased)
+        }
+        _ => None,
+    })
+}
+
 fn shortcut_subscription() -> Subscription<Message> {
     event::listen_with(|event, _status, window| {
-        let iced::Event::Keyboard(keyboard::Event::KeyPressed {
+        let iced::Event::Keyboard(event) = event else {
+            return None;
+        };
+        let keyboard::Event::KeyPressed {
             key,
             physical_key,
             modifiers,
             repeat,
             ..
-        }) = event
+        } = event
         else {
-            return None;
+            return match event {
+                keyboard::Event::ModifiersChanged(modifiers) => {
+                    Some(Message::ModifiersChanged(modifiers))
+                }
+                _ => None,
+            };
         };
 
         if repeat {
@@ -2779,12 +5105,47 @@ fn shortcut_subscription() -> Subscription<Message> {
                 });
             }
             keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                return Some(Message::CloseSearch);
+                return Some(Message::EscapePressed);
             }
             _ => {}
         }
 
         shortcut_message(key.to_latin(physical_key)?, modifiers, window)
+    })
+}
+
+fn menu_keyboard_subscription() -> Subscription<Message> {
+    event::listen_with(|event, _status, _window| {
+        let iced::Event::Keyboard(event) = event else {
+            return None;
+        };
+        let keyboard::Event::KeyPressed { key, repeat, .. } = event else {
+            return match event {
+                keyboard::Event::ModifiersChanged(modifiers) => {
+                    Some(Message::ModifiersChanged(modifiers))
+                }
+                _ => None,
+            };
+        };
+        let keyboard::Key::Named(key) = key else {
+            return None;
+        };
+
+        let navigation = match key {
+            keyboard::key::Named::ArrowDown => MenuNavigation::NextItem,
+            keyboard::key::Named::ArrowUp => MenuNavigation::PreviousItem,
+            keyboard::key::Named::Home => MenuNavigation::FirstItem,
+            keyboard::key::Named::End => MenuNavigation::LastItem,
+            keyboard::key::Named::ArrowRight => MenuNavigation::NextMenu,
+            keyboard::key::Named::ArrowLeft => MenuNavigation::PreviousMenu,
+            keyboard::key::Named::Enter | keyboard::key::Named::Space if !repeat => {
+                MenuNavigation::Activate
+            }
+            keyboard::key::Named::Escape if !repeat => return Some(Message::DismissMenu),
+            _ => return None,
+        };
+
+        Some(Message::MenuNavigate(navigation))
     })
 }
 
@@ -2803,6 +5164,7 @@ fn shortcut_message(
         ('0', _) => Some(Message::PreviewZoomReset),
         ('n', false) => Some(Message::NewDocument),
         ('o', false) => Some(Message::OpenDocument),
+        ('o', true) => Some(Message::OpenProject),
         ('s', false) => Some(Message::SaveDocument),
         ('s', true) => Some(Message::SaveDocumentAs),
         ('q', false) => Some(Message::CloseRequested(window)),
@@ -2811,7 +5173,36 @@ fn shortcut_message(
         ('u', false) => Some(Message::Underline),
         ('f', false) => Some(Message::OpenSearch),
         ('h', false) => Some(Message::OpenReplace),
+        ('j', false) => Some(Message::RevealInPreview),
         _ => None,
+    }
+}
+
+fn open_external_url(url: &str) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        ProcessCommand::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .map(|_| ())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        ProcessCommand::new("open").arg(url).spawn().map(|_| ())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        ProcessCommand::new("xdg-open").arg(url).spawn().map(|_| ())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "sistema operacional sem abridor de URL configurado",
+        ))
     }
 }
 
@@ -2847,6 +5238,51 @@ fn pdf_file_name(document_name: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
+fn project_display_name(root: &Path) -> String {
+    root.file_name()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned())
+}
+
+fn find_project_entry_kind(
+    entries: &[project::ProjectEntry],
+    path: &Path,
+) -> Option<project::EntryKind> {
+    entries.iter().find_map(|entry| {
+        if entry.path == path {
+            Some(entry.kind)
+        } else {
+            find_project_entry_kind(&entry.children, path)
+        }
+    })
+}
+
+fn project_entry_contains_path(entry: &Path, kind: project::EntryKind, candidate: &Path) -> bool {
+    if kind == project::EntryKind::Directory {
+        candidate.starts_with(entry)
+    } else {
+        candidate == entry
+    }
+}
+
+fn remap_project_path(
+    path: &Path,
+    from: &Path,
+    to: &Path,
+    kind: project::EntryKind,
+) -> Option<PathBuf> {
+    if !project_entry_contains_path(from, kind, path) {
+        return None;
+    }
+
+    if kind == project::EntryKind::Directory {
+        path.strip_prefix(from).ok().map(|suffix| to.join(suffix))
+    } else {
+        Some(to.to_path_buf())
+    }
+}
+
 fn truncate(text: &str, limit: usize) -> String {
     let mut characters = text.chars();
     let shortened = characters.by_ref().take(limit).collect::<String>();
@@ -2861,6 +5297,65 @@ fn truncate(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn menu_labels(entries: &[AppMenuEntry]) -> Vec<&'static str> {
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                AppMenuEntry::Item { label, .. } => Some(*label),
+                AppMenuEntry::Divider => None,
+            })
+            .collect()
+    }
+
+    fn mapped_preview_page(regions: Vec<source_map::SourceRegion>) -> PreviewPage {
+        PreviewPage {
+            handle: svg::Handle::from_memory(
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"/>"#,
+            ),
+            width: 100.0,
+            height: 100.0,
+            regions,
+        }
+    }
+
+    fn mapped_region(
+        target: source_map::SourceTarget,
+        range: Range<usize>,
+        bounds: source_map::SourceBounds,
+        kind: source_map::SourceRegionKind,
+    ) -> source_map::SourceRegion {
+        source_map::SourceRegion {
+            target,
+            range,
+            bounds,
+            kind,
+        }
+    }
+
+    #[test]
+    fn application_window_starts_maximized() {
+        let settings = app_window_settings();
+
+        assert!(settings.maximized);
+        assert_eq!(settings.size, iced::Size::new(1200.0, 800.0));
+        assert!(matches!(settings.position, window::Position::Centered));
+        assert!(!settings.exit_on_close_request);
+    }
+
+    #[test]
+    fn preview_canvas_fills_the_viewport_and_grows_for_wide_pages() {
+        assert_eq!(preview_canvas_width(700.0, 580.0), 700.0);
+        assert_eq!(preview_canvas_width(700.0, 900.0), 924.0);
+    }
+
+    #[test]
+    fn preview_at_100_percent_uses_the_detected_monitor_density() {
+        const TOLERANCE: f32 = 0.000_001;
+        const MONITOR_PPI: f32 = 92.36;
+
+        assert!((preview_scale(100, MONITOR_PPI) - MONITOR_PPI / 72.0).abs() < TOLERANCE);
+    }
 
     #[test]
     fn save_as_adds_the_typst_extension_when_missing() {
@@ -2903,7 +5398,78 @@ mod tests {
         assert!(app.document.get(first).is_some_and(Document::is_dirty));
         assert_eq!(app.document.iter().count(), 2);
         assert_ne!(current_editor, previous_editor);
-        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.panes.len(), 3);
+        assert_eq!(
+            app.panes
+                .iter()
+                .filter(|(_, pane)| matches!(pane, Pane::Project))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fixed_main_keeps_the_preview_target_while_an_import_is_edited() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let main_path = directory.path().join("main.typ");
+        let part_path = directory.path().join("part.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.document = Documents::new(Document::opened(
+            main_path.clone(),
+            "#include \"part.typ\"".to_owned(),
+        ));
+        let main = app.document.active_id();
+        let part = app
+            .document
+            .add(Document::opened(part_path.clone(), "Saved".to_owned()));
+        app.project_main = Some(main_path);
+        app.document.activate(main);
+        app.preview = vec![mapped_preview_page(Vec::new())];
+        let config = app.compiler_config();
+        let revision = app.compilation_revision;
+
+        assert!(app.activate_document(part));
+        let _ = app.update(Message::Editor(Action::Insert("Unsaved ".to_owned())));
+
+        assert_eq!(app.compiler_config(), config);
+        assert_eq!(
+            app.compilation_source().as_deref(),
+            Some("#include \"part.typ\"")
+        );
+        assert!(app.compilation_revision > revision);
+        assert_eq!(app.preview.len(), 1);
+        assert_eq!(
+            app.active_source_target(),
+            Some(source_map::SourceTarget::ProjectFile(part_path.clone()))
+        );
+        assert_eq!(
+            app.source_overlays(),
+            vec![SourceOverlay {
+                path: part_path,
+                text: "Unsaved Saved".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_closed_fixed_main_falls_back_to_its_disk_source() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let main_path = directory.path().join("main.typ");
+        let part_path = directory.path().join("part.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.document = Documents::new(Document::opened(main_path.clone(), "Main".to_owned()));
+        let main = app.document.active_id();
+        app.document
+            .add(Document::opened(part_path, "Part".to_owned()));
+        app.project_main = Some(main_path.clone());
+
+        app.close_document(main);
+
+        assert_eq!(app.project_main.as_deref(), Some(main_path.as_path()));
+        assert_eq!(app.compilation_source(), None);
+        assert_eq!(app.compilation_display_name(), "main.typ");
     }
 
     #[test]
@@ -3019,6 +5585,10 @@ mod tests {
             Some(Message::OpenDocument)
         ));
         assert!(matches!(
+            shortcut_message('o', command | keyboard::Modifiers::SHIFT, window),
+            Some(Message::OpenProject)
+        ));
+        assert!(matches!(
             shortcut_message('s', command, window),
             Some(Message::SaveDocument)
         ));
@@ -3050,8 +5620,293 @@ mod tests {
             shortcut_message('h', command, window),
             Some(Message::OpenReplace)
         ));
+        assert!(matches!(
+            shortcut_message('j', command, window),
+            Some(Message::RevealInPreview)
+        ));
         assert!(shortcut_message('s', keyboard::Modifiers::NONE, window).is_none());
         assert!(shortcut_message('n', command | keyboard::Modifiers::SHIFT, window).is_none());
+    }
+
+    #[test]
+    fn menu_navigation_skips_disabled_items_and_dividers() {
+        let entries = vec![
+            AppMenuEntry::item(
+                "Desabilitado",
+                None,
+                false,
+                false,
+                MenuCommand::SaveDocument,
+            ),
+            AppMenuEntry::Divider,
+            AppMenuEntry::item("Primeiro", None, false, true, MenuCommand::OpenSearch),
+            AppMenuEntry::item("Segundo", None, false, true, MenuCommand::OpenReplace),
+        ];
+
+        assert_eq!(enabled_menu_items(&entries), vec![1, 2]);
+        assert_eq!(first_enabled_menu_item(&entries), Some(1));
+        assert!(menu_command_at(&entries, 0).is_none());
+        assert!(matches!(
+            menu_command_at(&entries, 1),
+            Some(MenuCommand::OpenSearch)
+        ));
+    }
+
+    #[test]
+    fn project_pane_can_be_hidden_and_restored() {
+        let mut app = App::new();
+        assert!(app.project_pane_visible());
+        assert_eq!(app.panes.iter().count(), 3);
+
+        app.toggle_project_pane();
+        assert!(!app.project_pane_visible());
+        assert_eq!(app.panes.iter().count(), 2);
+
+        app.toggle_project_pane();
+        assert!(app.project_pane_visible());
+        assert_eq!(app.panes.iter().count(), 3);
+    }
+
+    #[test]
+    fn application_menus_cycle_in_both_directions() {
+        assert_eq!(AppMenu::File.previous(), AppMenu::Help);
+        assert_eq!(AppMenu::File.next(), AppMenu::Edit);
+        assert_eq!(AppMenu::Help.next(), AppMenu::File);
+        assert_eq!(AppMenu::Help.previous(), AppMenu::View);
+    }
+
+    #[test]
+    fn pointer_drag_switches_between_menu_bar_submenus() {
+        let mut app = App::new();
+
+        let _ = app.update(Message::MenuBarPointerEntered(AppMenu::Edit));
+        assert_eq!(app.open_menu, None);
+
+        let _ = app.update(Message::MenuBarPointerPressed(AppMenu::File));
+        assert_eq!(app.open_menu, Some(AppMenu::File));
+        assert!(app.menu_bar_drag_active);
+
+        let _ = app.update(Message::MenuBarPointerEntered(AppMenu::View));
+        assert_eq!(app.open_menu, Some(AppMenu::View));
+
+        let _ = app.update(Message::MenuBarPointerReleased);
+        assert!(!app.menu_bar_drag_active);
+        assert_eq!(app.open_menu, Some(AppMenu::View));
+
+        let _ = app.update(Message::MenuBarPointerEntered(AppMenu::Help));
+        assert_eq!(app.open_menu, Some(AppMenu::Help));
+
+        let _ = app.update(Message::DismissMenu);
+        let _ = app.update(Message::MenuBarPointerEntered(AppMenu::File));
+        assert_eq!(app.open_menu, None);
+    }
+
+    #[test]
+    fn source_navigation_selects_the_page_matching_the_cursor() {
+        let pages = vec![
+            mapped_preview_page(vec![mapped_region(
+                source_map::SourceTarget::Main,
+                40..45,
+                source_map::SourceBounds {
+                    x: 10.0,
+                    y: 10.0,
+                    width: 5.0,
+                    height: 10.0,
+                },
+                source_map::SourceRegionKind::Text,
+            )]),
+            mapped_preview_page(vec![mapped_region(
+                source_map::SourceTarget::Main,
+                10..20,
+                source_map::SourceBounds {
+                    x: 20.0,
+                    y: 30.0,
+                    width: 8.0,
+                    height: 10.0,
+                },
+                source_map::SourceRegionKind::Text,
+            )]),
+        ];
+
+        let (page, region) = find_source_region(&pages, &source_map::SourceTarget::Main, 15)
+            .expect("the cursor has a mapped preview region");
+
+        assert_eq!(page, 1);
+        assert_eq!(region.range, 10..20);
+    }
+
+    #[test]
+    fn preview_hit_testing_prefers_text_over_an_overlapping_shape() {
+        let bounds = source_map::SourceBounds {
+            x: 10.0,
+            y: 10.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        let page = mapped_preview_page(vec![
+            mapped_region(
+                source_map::SourceTarget::Main,
+                0..5,
+                bounds,
+                source_map::SourceRegionKind::Shape,
+            ),
+            mapped_region(
+                source_map::SourceTarget::Main,
+                8..9,
+                bounds,
+                source_map::SourceRegionKind::Text,
+            ),
+        ]);
+
+        let region = find_preview_region(&page, 15.0, 15.0)
+            .expect("the click intersects both mapped regions");
+
+        assert_eq!(region.kind, source_map::SourceRegionKind::Text);
+        assert_eq!(region.range, 8..9);
+    }
+
+    #[test]
+    fn editor_to_preview_navigation_rejects_a_stale_map() {
+        let mut app = App::new();
+        app.preview = vec![mapped_preview_page(vec![mapped_region(
+            source_map::SourceTarget::Main,
+            0..4,
+            source_map::SourceBounds {
+                x: 10.0,
+                y: 10.0,
+                width: 20.0,
+                height: 10.0,
+            },
+            source_map::SourceRegionKind::Text,
+        )])];
+        app.preview_revision = Some(app.compilation_revision + 1);
+        app.preview_status = PreviewStatus::Ready {
+            pages: 1,
+            warnings: 0,
+        };
+
+        let _ = app.reveal_cursor_in_preview();
+
+        assert!(app.preview_highlight.is_none());
+        assert!(
+            app.file_status
+                .as_deref()
+                .is_some_and(|status| status.contains("preview atualizado"))
+        );
+    }
+
+    #[test]
+    fn command_click_in_the_editor_reveals_the_mapped_preview_region() {
+        let mut app = App::new();
+        app.preview = vec![mapped_preview_page(vec![mapped_region(
+            source_map::SourceTarget::Main,
+            5..10,
+            source_map::SourceBounds {
+                x: 12.0,
+                y: 24.0,
+                width: 8.0,
+                height: 10.0,
+            },
+            source_map::SourceRegionKind::Text,
+        )])];
+        app.preview_revision = Some(app.compilation_revision);
+        app.preview_status = PreviewStatus::Ready {
+            pages: 1,
+            warnings: 0,
+        };
+        app.modifiers = keyboard::Modifiers::COMMAND;
+
+        let _ = app.update(Message::Editor(Action::MoveTo(7)));
+
+        assert!(app.preview_highlight.is_some_and(|highlight| {
+            highlight.page == 0 && highlight.bounds.x == 12.0 && highlight.bounds.y == 24.0
+        }));
+    }
+
+    #[test]
+    fn fixed_main_locates_the_active_import_in_the_preview() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let main_path = directory.path().join("main.typ");
+        let part_path = directory.path().join("part.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.document = Documents::new(Document::opened(main_path.clone(), "main".to_owned()));
+        app.document.add(Document::opened(
+            part_path.clone(),
+            "imported text".to_owned(),
+        ));
+        app.project_main = Some(main_path);
+        app.document.perform(Action::MoveTo(5));
+        app.preview = vec![mapped_preview_page(vec![mapped_region(
+            source_map::SourceTarget::ProjectFile(part_path),
+            2..8,
+            source_map::SourceBounds {
+                x: 18.0,
+                y: 26.0,
+                width: 12.0,
+                height: 10.0,
+            },
+            source_map::SourceRegionKind::Text,
+        )])];
+        app.preview_revision = Some(app.compilation_revision);
+        app.preview_status = PreviewStatus::Ready {
+            pages: 1,
+            warnings: 0,
+        };
+
+        let _ = app.reveal_cursor_in_preview();
+
+        assert!(app.preview_highlight.is_some_and(|highlight| {
+            highlight.page == 0 && highlight.bounds.x == 18.0 && highlight.bounds.y == 26.0
+        }));
+    }
+
+    #[test]
+    fn preview_click_uses_zoom_and_activates_an_imported_source() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let main_path = directory.path().join("main.typ");
+        let part_path = directory.path().join("part.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.document = Documents::new(Document::opened(main_path.clone(), "main".to_owned()));
+        app.project_main = Some(main_path);
+        let part = app.document.add(Document::opened(
+            part_path.clone(),
+            "imported text".to_owned(),
+        ));
+        let main = app
+            .document
+            .iter()
+            .find_map(|(id, document)| (document.path() != Some(&part_path)).then_some(id))
+            .expect("the main document is open");
+        app.document.activate(main);
+        app.settings.preview_zoom = 200;
+        app.preview = vec![mapped_preview_page(vec![mapped_region(
+            source_map::SourceTarget::ProjectFile(part_path),
+            2..8,
+            source_map::SourceBounds {
+                x: 10.0,
+                y: 20.0,
+                width: 20.0,
+                height: 10.0,
+            },
+            source_map::SourceRegionKind::Text,
+        )])];
+        app.preview_revision = Some(app.compilation_revision);
+        app.preview_status = PreviewStatus::Ready {
+            pages: 1,
+            warnings: 0,
+        };
+        let scale = preview_scale(200, app.preview_logical_ppi);
+        app.preview_pointer = Some(PreviewPointer {
+            page: 0,
+            position: Point::new(15.0 * scale, 25.0 * scale),
+        });
+
+        let _ = app.reveal_preview_source(0);
+
+        assert_eq!(app.document.active_id(), part);
+        assert_eq!(app.document.content().selection(), 2..8);
     }
 
     #[test]
@@ -3116,11 +5971,495 @@ mod tests {
 
         let _ = app.update(Message::ProjectScanned(project::ScanOutcome {
             root: PathBuf::from("/projeto/antigo"),
-            files: Ok(vec![PathBuf::from("/projeto/antigo/main.typ")]),
+            snapshot: Ok(project::ProjectSnapshot {
+                entries: Vec::new(),
+                typst_files: vec![PathBuf::from("/projeto/antigo/main.typ")],
+            }),
         }));
 
-        assert!(app.project_files.is_empty());
+        assert!(app.project_tree.is_empty());
         assert!(app.project_scan_busy);
+    }
+
+    #[test]
+    fn project_side_navigation_switches_between_files_and_topics() {
+        let mut app = App::new();
+
+        assert_eq!(app.project_navigation, ProjectNavigation::Files);
+
+        let _ = app.update(Message::ProjectNavigationSelected(
+            ProjectNavigation::Topics,
+        ));
+
+        assert_eq!(app.project_navigation, ProjectNavigation::Topics);
+    }
+
+    #[test]
+    fn document_outline_tracks_the_cursor_and_toggles_branches() {
+        let source = "= Introdução\nTexto\n== Detalhes\nMais texto";
+        let details_start = source.find("== Detalhes").expect("the heading exists");
+        let mut app = App::new();
+        app.document = Documents::new(Document::draft(source));
+        app.install_document_outline(vec![compiler::DocumentOutlineItem {
+            title: "Introdução".to_owned(),
+            target: source_map::SourceTarget::Main,
+            range: 0.."= Introdução".len(),
+            children: vec![compiler::DocumentOutlineItem {
+                title: "Detalhes".to_owned(),
+                target: source_map::SourceTarget::Main,
+                range: details_start..details_start + "== Detalhes".len(),
+                children: Vec::new(),
+            }],
+        }]);
+
+        let _ = app
+            .document
+            .perform(Action::MoveTo(details_start + "== Detalhes".len()));
+        assert_eq!(
+            app.current_outline_key(),
+            Some(OutlineKey::new(
+                source_map::SourceTarget::Main,
+                details_start
+            ))
+        );
+
+        let _ = app.update(Message::DocumentOutlinePressed {
+            target: source_map::SourceTarget::Main,
+            range: 0.."= Introdução".len(),
+            has_children: true,
+        });
+        let root_key = OutlineKey::new(source_map::SourceTarget::Main, 0);
+        assert!(app.collapsed_outline_entries.contains(&root_key));
+        assert_eq!(
+            app.document.selection_text().as_deref(),
+            Some("= Introdução")
+        );
+        assert!(
+            app.document_outline_items(&app.document_outline, None)[0]
+                .children
+                .is_empty()
+        );
+
+        let _ = app.update(Message::DocumentOutlinePressed {
+            target: source_map::SourceTarget::Main,
+            range: 0.."= Introdução".len(),
+            has_children: true,
+        });
+        assert!(!app.collapsed_outline_entries.contains(&root_key));
+        assert_eq!(
+            app.document_outline_items(&app.document_outline, None)[0]
+                .children
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn imported_outline_heading_opens_its_source_document() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let main_path = directory.path().join("main.typ");
+        let chapter_path = directory.path().join("chapter.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.project_main = Some(main_path.clone());
+        app.document = Documents::new(Document::opened(
+            main_path,
+            "#include \"chapter.typ\"".to_owned(),
+        ));
+        let main = app.document.active_id();
+        app.document.add(Document::opened(
+            chapter_path.clone(),
+            "= Capítulo\nTexto".to_owned(),
+        ));
+        app.document.activate(main);
+
+        let _ = app.update(Message::DocumentOutlinePressed {
+            target: source_map::SourceTarget::ProjectFile(chapter_path.clone()),
+            range: 0.."= Capítulo".len(),
+            has_children: false,
+        });
+
+        assert_eq!(app.document.path(), Some(chapter_path.as_path()));
+        assert_eq!(app.document.selection_text().as_deref(), Some("= Capítulo"));
+    }
+
+    #[test]
+    fn project_tree_displays_an_expandable_named_root() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let root = directory.path().to_path_buf();
+        let mut app = App::build(
+            Documents::new(Document::new()),
+            panes_from_layout(session::PaneLayout::default()),
+            root.clone(),
+            None,
+            None,
+            settings::Settings::default(),
+            "Projeto aberto".to_owned(),
+        );
+
+        let root_item = app.project_tree_root_item();
+        assert_eq!(root_item.label, project_display_name(&root));
+        assert_eq!(root_item.icon, Some(ui::WorkflowIcon::Project));
+        assert!(root_item.expanded);
+        assert!(root_item.has_children);
+        assert_eq!(root_item.children.len(), 1);
+
+        app.project_scan_busy = true;
+        let _ = app.update(Message::ProjectScanned(project::ScanOutcome {
+            root: root.clone(),
+            snapshot: Ok(project::ProjectSnapshot {
+                entries: Vec::new(),
+                typst_files: Vec::new(),
+            }),
+        }));
+        assert!(app.expanded_project_directories.contains(&root));
+
+        let _ = app.update(Message::ProjectEntryPressed(
+            root.clone(),
+            project::EntryKind::Directory,
+        ));
+        let root_item = app.project_tree_root_item();
+        assert!(root_item.selected);
+        assert!(!root_item.expanded);
+        assert!(root_item.children.is_empty());
+        assert!(
+            app.file_status
+                .as_deref()
+                .is_some_and(|status| status.contains("Projeto") && status.contains("recolhido"))
+        );
+    }
+
+    #[test]
+    fn project_tree_keeps_hierarchy_and_toggles_directories() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let chapters = directory.path().join("chapters");
+        let chapter = chapters.join("one.typ");
+        let entries = vec![project::ProjectEntry {
+            path: chapters.clone(),
+            kind: project::EntryKind::Directory,
+            children: vec![project::ProjectEntry {
+                path: chapter.clone(),
+                kind: project::EntryKind::TypstFile,
+                children: Vec::new(),
+            }],
+        }];
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.project_scan_busy = true;
+
+        let _ = app.update(Message::ProjectScanned(project::ScanOutcome {
+            root: directory.path().to_path_buf(),
+            snapshot: Ok(project::ProjectSnapshot {
+                entries: entries.clone(),
+                typst_files: vec![chapter],
+            }),
+        }));
+
+        assert_eq!(app.project_tree, entries);
+        assert!(!app.project_scan_busy);
+
+        let _ = app.update(Message::ProjectEntryPressed(
+            chapters.clone(),
+            project::EntryKind::Directory,
+        ));
+        assert_eq!(app.selected_project_entry, Some(chapters.clone()));
+        assert!(app.expanded_project_directories.contains(&chapters));
+        assert!(app.selected_project_file.is_none());
+
+        let _ = app.update(Message::ProjectEntryPressed(
+            chapters.clone(),
+            project::EntryKind::Directory,
+        ));
+        assert!(!app.expanded_project_directories.contains(&chapters));
+    }
+
+    #[test]
+    fn project_context_menu_selects_without_opening_the_entry() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let path = directory.path().join("main.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.cursor_position = Point::new(120.0, 240.0);
+
+        app.show_project_context_menu(path.clone(), project::EntryKind::TypstFile);
+
+        assert_eq!(app.selected_project_entry, Some(path.clone()));
+        assert_eq!(app.selected_project_file, Some(path.clone()));
+        assert!(app.document.find_path(&path).is_none());
+        let context = app
+            .project_context_menu
+            .expect("the context menu should be open");
+        assert_eq!(context.path, path);
+        assert_eq!(context.position, Point::new(120.0, 240.0));
+    }
+
+    #[test]
+    fn project_context_menu_protects_the_root_and_exposes_directory_operations() {
+        let app = App::new();
+        let root = app.workspace_root.clone();
+        let root_context = ProjectContextMenu {
+            path: root.clone(),
+            kind: project::EntryKind::Directory,
+            position: Point::ORIGIN,
+        };
+        let root_labels = menu_labels(&app.project_context_entries(&root_context));
+
+        assert!(root_labels.contains(&"Novo arquivo Typst…"));
+        assert!(root_labels.contains(&"Nova pasta…"));
+        assert!(root_labels.contains(&"Atualizar árvore"));
+        assert!(!root_labels.contains(&"Renomear…"));
+        assert!(!root_labels.contains(&"Excluir…"));
+
+        let folder_context = ProjectContextMenu {
+            path: root.join("capitulos"),
+            kind: project::EntryKind::Directory,
+            position: Point::ORIGIN,
+        };
+        let folder_labels = menu_labels(&app.project_context_entries(&folder_context));
+
+        assert!(folder_labels.contains(&"Renomear…"));
+        assert!(folder_labels.contains(&"Excluir…"));
+    }
+
+    #[test]
+    fn creation_toolbar_targets_the_selected_directory_or_file_parent() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let chapters = directory.path().join("chapters");
+        let chapter = chapters.join("one.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.project_tree = vec![project::ProjectEntry {
+            path: chapters.clone(),
+            kind: project::EntryKind::Directory,
+            children: vec![project::ProjectEntry {
+                path: chapter.clone(),
+                kind: project::EntryKind::TypstFile,
+                children: Vec::new(),
+            }],
+        }];
+
+        app.selected_project_entry = Some(chapters.clone());
+        assert_eq!(app.selected_project_target_directory(), chapters);
+
+        app.selected_project_entry = Some(chapter);
+        assert_eq!(app.selected_project_target_directory(), chapters);
+
+        app.selected_project_entry = None;
+        assert_eq!(app.selected_project_target_directory(), directory.path());
+    }
+
+    #[test]
+    fn preview_icon_follows_the_effective_compilation_document() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let active = directory.path().join("active.typ");
+        let fixed = directory.path().join("fixed.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.document = Documents::new(Document::opened(active.clone(), String::new()));
+        app.project_tree = vec![
+            project::ProjectEntry {
+                path: active.clone(),
+                kind: project::EntryKind::TypstFile,
+                children: Vec::new(),
+            },
+            project::ProjectEntry {
+                path: fixed.clone(),
+                kind: project::EntryKind::TypstFile,
+                children: Vec::new(),
+            },
+        ];
+
+        let items = app.project_tree_items(&app.project_tree);
+        assert_eq!(items[0].status_icon, Some(ui::WorkflowIcon::Preview));
+        assert_eq!(items[1].status_icon, None);
+
+        app.project_main = Some(fixed);
+        let items = app.project_tree_items(&app.project_tree);
+        assert_eq!(items[0].status_icon, None);
+        assert_eq!(items[1].status_icon, Some(ui::WorkflowIcon::Preview));
+    }
+
+    #[test]
+    fn selecting_a_non_typst_file_disables_typst_file_operations() {
+        let mut app = App::new();
+        app.selected_project_file = Some(PathBuf::from("main.typ"));
+        let readme = app.workspace_root.join("README.md");
+
+        let _ = app.update(Message::ProjectEntryPressed(
+            readme.clone(),
+            project::EntryKind::File,
+        ));
+
+        assert_eq!(app.selected_project_entry, Some(readme));
+        assert!(app.selected_project_file.is_none());
+        assert!(
+            app.file_status
+                .as_deref()
+                .is_some_and(|status| status.contains("não é um documento Typst"))
+        );
+    }
+
+    #[test]
+    fn restored_active_document_is_revealed_in_the_project_tree() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let chapters = directory.path().join("chapters");
+        let path = chapters.join("main.typ");
+        let app = App::build(
+            Documents::new(Document::opened(path.clone(), "Main".to_owned())),
+            panes_from_layout(session::PaneLayout::default()),
+            directory.path().to_path_buf(),
+            None,
+            None,
+            settings::Settings::default(),
+            "Sessão restaurada".to_owned(),
+        );
+
+        assert_eq!(app.selected_project_entry, Some(path.clone()));
+        assert_eq!(app.selected_project_file, Some(path));
+        assert!(app.expanded_project_directories.contains(&chapters));
+    }
+
+    #[test]
+    fn project_scan_detects_a_root_main_file_automatically() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let main = directory.path().join("main.typ");
+        let chapter = directory.path().join("chapter.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.project_scan_busy = true;
+        app.detect_project_main_on_scan = true;
+
+        let _ = app.update(Message::ProjectScanned(project::ScanOutcome {
+            root: directory.path().to_path_buf(),
+            snapshot: Ok(project::ProjectSnapshot {
+                entries: Vec::new(),
+                typst_files: vec![chapter, main.clone()],
+            }),
+        }));
+
+        assert_eq!(app.project_main, Some(main));
+        assert!(app.pending_compile.is_some());
+        assert!(
+            app.file_status
+                .as_deref()
+                .is_some_and(|status| status.contains("detectado"))
+        );
+    }
+
+    #[test]
+    fn explicit_active_tab_mode_is_not_undone_by_later_scans() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let main = directory.path().join("main.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.project_main = Some(main.clone());
+
+        app.clear_project_main();
+        app.project_scan_busy = true;
+        let _ = app.update(Message::ProjectScanned(project::ScanOutcome {
+            root: directory.path().to_path_buf(),
+            snapshot: Ok(project::ProjectSnapshot {
+                entries: Vec::new(),
+                typst_files: vec![main],
+            }),
+        }));
+
+        assert_eq!(app.project_main, None);
+        assert!(!app.detect_project_main_on_scan);
+    }
+
+    #[test]
+    fn renaming_and_deleting_the_fixed_main_updates_project_state() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let from = directory.path().join("main.typ");
+        let to = directory.path().join("book.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.document = Documents::new(Document::opened(from.clone(), "Main".to_owned()));
+        app.project_main = Some(from.clone());
+        app.selected_project_file = Some(from.clone());
+
+        let _ = app.handle_project_operation(project::OperationOutcome::Renamed {
+            from,
+            to: to.clone(),
+            kind: project::EntryKind::TypstFile,
+        });
+
+        assert_eq!(app.project_main.as_deref(), Some(to.as_path()));
+        assert_eq!(app.document.path(), Some(to.as_path()));
+
+        let _ = app.handle_project_operation(project::OperationOutcome::Deleted {
+            path: to.clone(),
+            kind: project::EntryKind::TypstFile,
+        });
+
+        assert_eq!(app.project_main, None);
+        assert!(app.document.find_path(&to).is_none());
+        assert!(
+            app.file_status
+                .as_deref()
+                .is_some_and(|status| status.contains("acompanha a aba ativa"))
+        );
+    }
+
+    #[test]
+    fn renaming_a_directory_remaps_open_documents_main_and_expansion() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let from = directory.path().join("chapters");
+        let to = directory.path().join("sections");
+        let first = from.join("one.typ");
+        let second = from.join("nested/two.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.document = Documents::new(Document::opened(first, String::new()));
+        app.document.add(Document::opened(second, String::new()));
+        app.project_main = Some(from.join("one.typ"));
+        app.expanded_project_directories = HashSet::from([
+            directory.path().to_path_buf(),
+            from.clone(),
+            from.join("nested"),
+        ]);
+
+        let _ = app.handle_project_operation(project::OperationOutcome::Renamed {
+            from,
+            to: to.clone(),
+            kind: project::EntryKind::Directory,
+        });
+
+        let paths = app
+            .document
+            .iter()
+            .filter_map(|(_, document)| document.path().map(Path::to_path_buf))
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&to.join("one.typ")));
+        assert!(paths.contains(&to.join("nested/two.typ")));
+        assert_eq!(app.project_main, Some(to.join("one.typ")));
+        assert!(app.expanded_project_directories.contains(&to));
+        assert!(
+            app.expanded_project_directories
+                .contains(&to.join("nested"))
+        );
+    }
+
+    #[test]
+    fn deleting_a_directory_with_dirty_documents_is_blocked_before_confirmation() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let folder = directory.path().join("chapters");
+        let path = folder.join("one.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.document = Documents::new(Document::opened(path, "texto".to_owned()));
+        app.document.perform(Action::MoveTo(5));
+        app.document.perform(Action::Insert(" alterado".to_owned()));
+
+        let _ = app.start_delete_project_entry(folder, project::EntryKind::Directory);
+
+        assert!(!app.file_busy);
+        assert!(
+            app.file_status
+                .as_deref()
+                .is_some_and(|status| status.contains("documentos alterados"))
+        );
     }
 
     #[test]
@@ -3138,7 +6477,10 @@ mod tests {
     #[test]
     fn session_snapshot_restores_tab_order_active_draft_and_pane_layout() {
         let directory = tempfile::tempdir().expect("a temporary directory can be created");
-        let mut app = App::fresh(Some(directory.path().join("session.json")));
+        let mut app = App::fresh(
+            Some(directory.path().join("session.json")),
+            display::FALLBACK_LOGICAL_PPI,
+        );
         *app.document.active_mut() =
             Document::opened(PathBuf::from("/project/main.typ"), "saved".to_owned());
         app.document.perform(Action::MoveTo("saved".len()));
@@ -3146,16 +6488,24 @@ mod tests {
         app.new_document();
         app.document.perform(Action::Insert("draft".to_owned()));
         app.workspace_root = PathBuf::from("/project");
-        app.panes = panes_from_layout(session::PaneLayout {
-            axis: session::Axis::Horizontal,
-            ratio: 0.7,
-            first: session::Pane::Preview,
-        });
+        app.project_main = Some(PathBuf::from("/project/main.typ"));
+        let pane_layout = session::PaneLayout::from_tree(session::PaneNode::split(
+            session::Axis::Horizontal,
+            0.7,
+            session::PaneNode::pane(session::Pane::Preview),
+            session::PaneNode::split(
+                session::Axis::Vertical,
+                0.35,
+                session::PaneNode::pane(session::Pane::Project),
+                session::PaneNode::pane(session::Pane::Editor),
+            ),
+        ));
+        app.panes = panes_from_layout(pane_layout.clone());
         app.settings.wrap_lines = true;
         app.settings.preview_zoom = 135;
 
         let stored = app.session_snapshot(false);
-        let restored = App::restore(stored, None);
+        let restored = App::restore(stored, None, display::FALLBACK_LOGICAL_PPI);
         let documents = restored
             .document
             .iter()
@@ -3165,16 +6515,13 @@ mod tests {
         assert_eq!(documents, vec!["saved local", "draft"]);
         assert_eq!(restored.document.snapshot().1, "draft");
         assert_eq!(restored.workspace_root, PathBuf::from("/project"));
+        assert_eq!(
+            restored.project_main,
+            Some(PathBuf::from("/project/main.typ"))
+        );
         assert!(restored.settings.wrap_lines);
         assert_eq!(restored.settings.preview_zoom, 135);
-        assert_eq!(
-            restored.pane_layout(),
-            session::PaneLayout {
-                axis: session::Axis::Horizontal,
-                ratio: 0.7,
-                first: session::Pane::Preview,
-            }
-        );
+        assert_eq!(restored.pane_layout(), pane_layout);
     }
 
     #[test]
@@ -3206,7 +6553,10 @@ mod tests {
     #[test]
     fn editing_schedules_a_debounced_session_write() {
         let directory = tempfile::tempdir().expect("a temporary directory can be created");
-        let mut app = App::fresh(Some(directory.path().join("session.json")));
+        let mut app = App::fresh(
+            Some(directory.path().join("session.json")),
+            display::FALLBACK_LOGICAL_PPI,
+        );
 
         let _ = app.update(Message::Editor(Action::Insert("edit".to_owned())));
 
@@ -3218,7 +6568,10 @@ mod tests {
     #[test]
     fn stale_session_write_is_repeated_before_window_close() {
         let directory = tempfile::tempdir().expect("a temporary directory can be created");
-        let mut app = App::fresh(Some(directory.path().join("session.json")));
+        let mut app = App::fresh(
+            Some(directory.path().join("session.json")),
+            display::FALLBACK_LOGICAL_PPI,
+        );
         let window = window::Id::unique();
         app.file_busy = true;
         app.session.revision = 2;
@@ -3238,7 +6591,10 @@ mod tests {
     #[test]
     fn current_session_write_completes_window_close_cleanup() {
         let directory = tempfile::tempdir().expect("a temporary directory can be created");
-        let mut app = App::fresh(Some(directory.path().join("session.json")));
+        let mut app = App::fresh(
+            Some(directory.path().join("session.json")),
+            display::FALLBACK_LOGICAL_PPI,
+        );
         let window = window::Id::unique();
         let document = app.document.active_id();
         app.discarded_on_close.insert(document);
@@ -3317,6 +6673,46 @@ mod tests {
             app.document
                 .get(main)
                 .expect("the main document is open")
+                .content()
+                .diagnostics()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn main_diagnostics_stay_on_the_fixed_main_while_an_import_is_active() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let main_path = directory.path().join("main.typ");
+        let part_path = directory.path().join("part.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.document = Documents::new(Document::opened(main_path.clone(), "broken".to_owned()));
+        let main = app.document.active_id();
+        let part = app
+            .document
+            .add(Document::opened(part_path, "import".to_owned()));
+        app.project_main = Some(main_path);
+
+        app.install_diagnostics(vec![compiler::ReportedDiagnostic {
+            target: compiler::DiagnosticTarget::Main,
+            range: 0..6,
+            severity: compiler::DiagnosticSeverity::Error,
+            message: "erro principal".to_owned(),
+        }]);
+
+        assert_eq!(
+            app.document
+                .get(main)
+                .expect("the main document is open")
+                .content()
+                .diagnostics()
+                .len(),
+            1
+        );
+        assert!(
+            app.document
+                .get(part)
+                .expect("the import is active")
                 .content()
                 .diagnostics()
                 .is_empty()

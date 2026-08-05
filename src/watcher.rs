@@ -5,7 +5,7 @@ use iced::{
     futures::{SinkExt, Stream, StreamExt, channel::mpsc},
     stream,
 };
-use notify::{RecursiveMode, Watcher};
+use notify::{EventKind, RecursiveMode, Watcher, event::ModifyKind};
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -60,6 +60,10 @@ fn worker(root: &Path) -> impl Stream<Item = Event> + use<> {
         while let Some(event) = events.next().await {
             let message = match event {
                 Ok(event) => {
+                    if !changes_project(&event.kind) {
+                        continue;
+                    }
+
                     let paths = event
                         .paths
                         .into_iter()
@@ -87,6 +91,18 @@ fn worker(root: &Path) -> impl Stream<Item = Event> + use<> {
     })
 }
 
+fn changes_project(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Any
+            | EventKind::Create(_)
+            | EventKind::Modify(
+                ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Other
+            )
+            | EventKind::Remove(_)
+    )
+}
+
 fn is_relevant(root: &Path, path: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
 
@@ -106,6 +122,23 @@ fn is_relevant(root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::event::{AccessKind, CreateKind, DataChange, MetadataKind, RemoveKind};
+
+    #[test]
+    fn only_project_mutations_trigger_refreshes() {
+        assert!(changes_project(&EventKind::Any));
+        assert!(changes_project(&EventKind::Create(CreateKind::File)));
+        assert!(changes_project(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Content
+        ))));
+        assert!(changes_project(&EventKind::Remove(RemoveKind::File)));
+
+        assert!(!changes_project(&EventKind::Access(AccessKind::Read)));
+        assert!(!changes_project(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime
+        ))));
+        assert!(!changes_project(&EventKind::Other));
+    }
 
     #[test]
     fn build_and_hidden_directories_do_not_trigger_refreshes() {

@@ -29,8 +29,8 @@ pub struct TypstationWorld {
     time: Time,
     root: PathBuf,
     main: FileId,
-    source: Source,
-    bytes: Bytes,
+    source: Option<Source>,
+    bytes: Option<Bytes>,
     overlays: HashMap<FileId, MemoryFile>,
 }
 
@@ -69,16 +69,33 @@ impl TypstationWorld {
             time: Time::system(),
             root,
             main,
-            source: Source::new(main, String::new()),
-            bytes: Bytes::from_string(String::new()),
+            source: Some(Source::new(main, String::new())),
+            bytes: Some(Bytes::from_string(String::new())),
             overlays: HashMap::new(),
         }
     }
 
     /// Replaces only the in-memory main source, preserving external-file caches.
     pub fn set_source(&mut self, text: &str) {
-        self.source.replace(text);
-        self.bytes = Bytes::from_string(text.to_owned());
+        self.set_main_source(Some(text));
+    }
+
+    /// Selects an in-memory main source or falls back to the project file.
+    pub fn set_main_source(&mut self, text: Option<&str>) {
+        let source_was_in_memory = self.source.is_some();
+        match (self.source.as_mut(), text) {
+            (Some(source), Some(text)) => {
+                source.replace(text);
+            }
+            (None, Some(text)) => self.source = Some(Source::new(self.main, text.to_owned())),
+            (_, None) => {
+                self.source = None;
+            }
+        }
+        if text.is_none() && source_was_in_memory {
+            self.files.reset();
+        }
+        self.bytes = text.map(|text| Bytes::from_string(text.to_owned()));
         self.time.reset();
     }
 
@@ -164,7 +181,9 @@ impl World for TypstationWorld {
 
     fn source(&self, id: FileId) -> FileResult<Source> {
         if id == self.main {
-            Ok(self.source.clone())
+            self.source
+                .clone()
+                .map_or_else(|| self.files.source(id), Ok)
         } else if let Some(file) = self.overlays.get(&id) {
             Ok(file.source.clone())
         } else {
@@ -174,7 +193,7 @@ impl World for TypstationWorld {
 
     fn file(&self, id: FileId) -> FileResult<Bytes> {
         if id == self.main {
-            Ok(self.bytes.clone())
+            self.bytes.clone().map_or_else(|| self.files.file(id), Ok)
         } else if let Some(file) = self.overlays.get(&id) {
             Ok(file.bytes.clone())
         } else {

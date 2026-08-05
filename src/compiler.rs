@@ -8,10 +8,17 @@ use iced::{
     },
     stream,
 };
-use typst::diag::SourceDiagnostic;
+use typst::{
+    diag::SourceDiagnostic,
+    foundations::{NativeElement, StyleChain},
+    introspection::Introspector,
+    model::{HeadingElem, OutlineNode as TypstOutlineNode},
+};
 use typst_iced_editor::Diagnostic;
 use typst_layout::PagedDocument;
 use typstation::world::{SourceOverlay, TypstationWorld};
+
+use crate::source_map::{self, SourceRegion, SourceTarget};
 
 pub type Sender = UnboundedSender<Request>;
 
@@ -19,7 +26,7 @@ pub type Sender = UnboundedSender<Request>;
 pub struct Request {
     pub id: u64,
     pub revision: u64,
-    pub source: String,
+    pub source: Option<String>,
     pub overlays: Vec<SourceOverlay>,
     pub reset_files: bool,
     pub purpose: Purpose,
@@ -45,10 +52,26 @@ pub struct Output {
     pub pages: Vec<RenderedPage>,
     pub pdf: Option<Vec<u8>>,
     pub diagnostics: Vec<ReportedDiagnostic>,
+    pub outline: Vec<DocumentOutlineItem>,
     pub page_count: usize,
     pub warning_count: usize,
     pub error_count: usize,
     pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentOutlineItem {
+    pub title: String,
+    pub target: SourceTarget,
+    pub range: Range<usize>,
+    pub children: Vec<DocumentOutlineItem>,
+}
+
+#[derive(Debug)]
+struct NavigableHeading {
+    title: String,
+    target: SourceTarget,
+    range: Range<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,13 +79,10 @@ pub struct RenderedPage {
     pub svg: Vec<u8>,
     pub width: f32,
     pub height: f32,
+    pub regions: Vec<SourceRegion>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DiagnosticTarget {
-    Main,
-    ProjectFile(PathBuf),
-}
+pub type DiagnosticTarget = SourceTarget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
@@ -152,7 +172,7 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
         world.reset_files();
     }
 
-    world.set_source(&request.source);
+    world.set_main_source(request.source.as_deref());
     world.set_overlays(request.overlays);
 
     let result = typst::compile::<PagedDocument>(world);
@@ -172,6 +192,11 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
     match result.output {
         Ok(document) if !document.pages().is_empty() => {
             let page_count = document.pages().len();
+            let outline = if request.purpose == Purpose::Preview {
+                document_outline(world, &document)
+            } else {
+                Vec::new()
+            };
             let mut output = Output {
                 id: request.id,
                 revision: request.revision,
@@ -179,6 +204,7 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
                 pages: Vec::new(),
                 pdf: None,
                 diagnostics,
+                outline,
                 page_count,
                 warning_count,
                 error_count: 0,
@@ -195,6 +221,7 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
                             svg: typst_svg::svg(page, &options).into_bytes(),
                             width: page.frame.width().to_pt() as f32,
                             height: page.frame.height().to_pt() as f32,
+                            regions: source_map::page_regions(world, page),
                         })
                         .collect();
                 }
@@ -227,6 +254,7 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
             pages: Vec::new(),
             pdf: None,
             diagnostics,
+            outline: Vec::new(),
             page_count: 0,
             warning_count,
             error_count: 1,
@@ -251,12 +279,61 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
                 pages: Vec::new(),
                 pdf: None,
                 diagnostics,
+                outline: Vec::new(),
                 page_count: 0,
                 warning_count,
                 error_count: errors.len(),
                 summary,
             }
         }
+    }
+}
+
+fn document_outline(world: &TypstationWorld, document: &PagedDocument) -> Vec<DocumentOutlineItem> {
+    let elements = document.introspector().query(&HeadingElem::ELEM.select());
+    let headings = elements.iter().filter_map(|element| {
+        let heading = element.to_packed::<HeadingElem>()?;
+        let level = heading.resolve_level(StyleChain::default());
+        let include = heading.outlined.get(StyleChain::default());
+        let (target, range) = source_map::span_source_range(world, heading.span())?;
+        let body = heading.body.plain_text();
+        let title = match &heading.numbers {
+            Some(numbers) => format!("{numbers} {body}"),
+            None => body.to_string(),
+        };
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        Some((
+            NavigableHeading {
+                title: if title.is_empty() {
+                    "Tópico sem título".to_owned()
+                } else {
+                    title
+                },
+                target,
+                range,
+            },
+            level,
+            include,
+        ))
+    });
+
+    TypstOutlineNode::build_tree(headings)
+        .into_iter()
+        .map(convert_outline_node)
+        .collect()
+}
+
+fn convert_outline_node(node: TypstOutlineNode<NavigableHeading>) -> DocumentOutlineItem {
+    DocumentOutlineItem {
+        title: node.entry.title,
+        target: node.entry.target,
+        range: node.entry.range,
+        children: node
+            .children
+            .into_iter()
+            .map(convert_outline_node)
+            .collect(),
     }
 }
 
@@ -298,7 +375,7 @@ mod tests {
             Request {
                 id: 1,
                 revision: 4,
-                source: "First page\n#pagebreak()\nSecond page".to_owned(),
+                source: Some("First page\n#pagebreak()\nSecond page".to_owned()),
                 overlays: Vec::new(),
                 reset_files: true,
                 purpose: Purpose::Preview,
@@ -311,13 +388,25 @@ mod tests {
         assert_eq!(preview.error_count, 0);
         assert_eq!(preview.pages.len(), 2);
         assert!(preview.pdf.is_none());
+        assert!(preview.outline.is_empty());
+        assert!(preview.pages.iter().all(|page| !page.regions.is_empty()));
+        assert!(
+            preview.pages[0]
+                .regions
+                .iter()
+                .any(|region| region.target == DiagnosticTarget::Main && region.range.start < 10)
+        );
+        let second_page_start = "First page\n#pagebreak()\n".len();
+        assert!(preview.pages[1].regions.iter().any(|region| {
+            region.target == DiagnosticTarget::Main && region.range.start >= second_page_start
+        }));
 
         let pdf = compile(
             &mut world,
             Request {
                 id: 2,
                 revision: 4,
-                source: "Exported page".to_owned(),
+                source: Some("Exported page".to_owned()),
                 overlays: Vec::new(),
                 reset_files: false,
                 purpose: Purpose::ExportPdf,
@@ -337,7 +426,7 @@ mod tests {
             Request {
                 id: 3,
                 revision: 5,
-                source: "#let value =".to_owned(),
+                source: Some("#let value =".to_owned()),
                 overlays: Vec::new(),
                 reset_files: false,
                 purpose: Purpose::Preview,
@@ -347,6 +436,63 @@ mod tests {
         assert!(failure.error_count > 0);
         assert!(failure.pages.is_empty());
         assert!(!failure.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn compiler_builds_a_semantic_document_outline() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut world = TypstationWorld::new(root);
+        let source =
+            "= Introdução\n== Fundamentos\n#heading(outlined: false)[Oculto]\n= Próximos passos";
+
+        let output = compile(
+            &mut world,
+            Request {
+                id: 1,
+                revision: 1,
+                source: Some(source.to_owned()),
+                overlays: Vec::new(),
+                reset_files: true,
+                purpose: Purpose::Preview,
+            },
+        );
+
+        assert_eq!(output.error_count, 0);
+        assert_eq!(output.outline.len(), 2);
+        assert_eq!(output.outline[0].title, "Introdução");
+        assert_eq!(output.outline[0].children.len(), 1);
+        assert_eq!(output.outline[0].children[0].title, "Fundamentos");
+        assert_eq!(output.outline[1].title, "Próximos passos");
+        assert_eq!(output.outline[0].target, SourceTarget::Main);
+        assert_eq!(&source[output.outline[0].range.clone()], "= Introdução");
+    }
+
+    #[test]
+    fn imported_headings_keep_their_project_source() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let imported = directory.path().join("chapter.typ");
+        fs::write(&imported, "= Capítulo importado").expect("the imported source can be written");
+        let mut world = TypstationWorld::with_main(directory.path().to_path_buf(), "main.typ");
+
+        let output = compile(
+            &mut world,
+            Request {
+                id: 1,
+                revision: 1,
+                source: Some("#include \"chapter.typ\"".to_owned()),
+                overlays: Vec::new(),
+                reset_files: true,
+                purpose: Purpose::Preview,
+            },
+        );
+
+        assert_eq!(output.error_count, 0);
+        assert_eq!(output.outline.len(), 1);
+        assert_eq!(output.outline[0].title, "Capítulo importado");
+        assert_eq!(
+            output.outline[0].target,
+            SourceTarget::ProjectFile(imported)
+        );
     }
 
     #[test]
@@ -362,7 +508,7 @@ mod tests {
             Request {
                 id: 1,
                 revision: 1,
-                source: main.clone(),
+                source: Some(main.clone()),
                 overlays: vec![SourceOverlay {
                     path: imported.clone(),
                     text: "#let title =".to_owned(),
@@ -382,7 +528,7 @@ mod tests {
             Request {
                 id: 2,
                 revision: 1,
-                source: main,
+                source: Some(main),
                 overlays: Vec::new(),
                 reset_files: false,
                 purpose: Purpose::Preview,
@@ -391,5 +537,40 @@ mod tests {
 
         assert_eq!(disk_success.error_count, 0);
         assert_eq!(disk_success.pages.len(), 1);
+        assert!(
+            disk_success.pages[0]
+                .regions
+                .iter()
+                .any(|region| { region.target == DiagnosticTarget::ProjectFile(imported.clone()) })
+        );
+    }
+
+    #[test]
+    fn closed_main_document_is_loaded_from_disk() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        fs::write(directory.path().join("main.typ"), "Loaded from disk")
+            .expect("the main source can be written");
+        let mut world = TypstationWorld::with_main(directory.path().to_path_buf(), "main.typ");
+
+        let output = compile(
+            &mut world,
+            Request {
+                id: 1,
+                revision: 1,
+                source: None,
+                overlays: Vec::new(),
+                reset_files: true,
+                purpose: Purpose::Preview,
+            },
+        );
+
+        assert_eq!(output.error_count, 0);
+        assert_eq!(output.page_count, 1);
+        assert!(
+            output.pages[0]
+                .regions
+                .iter()
+                .any(|region| region.target == DiagnosticTarget::Main)
+        );
     }
 }

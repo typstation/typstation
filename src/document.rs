@@ -9,6 +9,14 @@ use typst_iced_editor::{Action, Content, Diagnostic};
 const UNTITLED_NAME: &str = "Sem título.typ";
 const UNTITLED_MAIN: &str = "untitled.typ";
 
+pub fn compiler_location_for_path(workspace_root: &Path, path: &Path) -> Option<(PathBuf, String)> {
+    let vpath = VirtualPath::virtualize(workspace_root, path).ok()?;
+    Some((
+        workspace_root.to_path_buf(),
+        vpath.get_without_slash().to_owned(),
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DocumentId(u64);
 
@@ -130,12 +138,9 @@ impl Document {
     /// keep using their own directory as the root.
     pub fn compiler_location(&self, workspace_root: &Path) -> (PathBuf, String) {
         if let Some(path) = self.path()
-            && let Ok(vpath) = VirtualPath::virtualize(workspace_root, path)
+            && let Some(location) = compiler_location_for_path(workspace_root, path)
         {
-            return (
-                workspace_root.to_path_buf(),
-                vpath.get_without_slash().to_owned(),
-            );
+            return location;
         }
 
         (self.directory(workspace_root), self.main_name())
@@ -213,8 +218,9 @@ impl Document {
         self.content.selection_text()
     }
 
-    pub fn revision(&self) -> u64 {
-        self.content.buffer().revision()
+    pub fn cursor_offset(&self) -> usize {
+        let position = self.content.cursor();
+        self.content.buffer().byte_of(position)
     }
 
     pub fn snapshot(&self) -> (u64, String) {

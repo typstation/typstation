@@ -15,6 +15,8 @@ const MAX_DOCUMENTS: usize = 512;
 pub struct Session {
     version: u32,
     pub workspace_root: PathBuf,
+    #[serde(default)]
+    pub project_main: Option<PathBuf>,
     pub active_document: usize,
     pub documents: Vec<Document>,
     pub pane_layout: PaneLayout,
@@ -25,6 +27,7 @@ pub struct Session {
 impl Session {
     pub fn new(
         workspace_root: PathBuf,
+        project_main: Option<PathBuf>,
         active_document: usize,
         documents: Vec<Document>,
         pane_layout: PaneLayout,
@@ -33,6 +36,7 @@ impl Session {
         Self {
             version: SESSION_VERSION,
             workspace_root,
+            project_main,
             active_document,
             documents,
             pane_layout,
@@ -57,12 +61,12 @@ impl Session {
         }
 
         self.active_document = self.active_document.min(self.documents.len() - 1);
-        self.pane_layout.ratio = if self.pane_layout.ratio.is_finite() {
-            self.pane_layout.ratio.clamp(0.1, 0.9)
-        } else {
-            PaneLayout::default().ratio
-        };
+        self.pane_layout = self.pane_layout.validated();
         self.settings = self.settings.validate();
+        self.project_main = self.project_main.filter(|path| {
+            path.starts_with(&self.workspace_root)
+                && path.extension().is_some_and(|extension| extension == "typ")
+        });
 
         Ok(self)
     }
@@ -85,19 +89,131 @@ impl Document {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct PaneLayout {
-    pub axis: Axis,
-    pub ratio: f32,
-    pub first: Pane,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PaneLayout {
+    Tree { tree: PaneNode },
+    Legacy { axis: Axis, ratio: f32, first: Pane },
+}
+
+impl PaneLayout {
+    pub fn from_tree(tree: PaneNode) -> Self {
+        Self::Tree { tree }
+    }
+
+    pub fn into_tree(self) -> PaneNode {
+        let mut tree = match self {
+            Self::Tree { tree } => tree,
+            Self::Legacy { axis, ratio, first } => PaneNode::from_legacy(axis, ratio, first),
+        };
+
+        if tree.normalize_and_validate() {
+            tree
+        } else {
+            PaneNode::default_layout()
+        }
+    }
+
+    fn validated(self) -> Self {
+        Self::from_tree(self.into_tree())
+    }
 }
 
 impl Default for PaneLayout {
     fn default() -> Self {
-        Self {
-            axis: Axis::Vertical,
-            ratio: 0.5,
-            first: Pane::Editor,
+        Self::from_tree(PaneNode::default_layout())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PaneNode {
+    Pane {
+        pane: Pane,
+    },
+    Split {
+        axis: Axis,
+        ratio: f32,
+        a: Box<PaneNode>,
+        b: Box<PaneNode>,
+    },
+}
+
+impl PaneNode {
+    pub fn pane(pane: Pane) -> Self {
+        Self::Pane { pane }
+    }
+
+    pub fn split(axis: Axis, ratio: f32, a: Self, b: Self) -> Self {
+        Self::Split {
+            axis,
+            ratio,
+            a: Box::new(a),
+            b: Box::new(b),
+        }
+    }
+
+    fn default_layout() -> Self {
+        Self::split(
+            Axis::Vertical,
+            0.23,
+            Self::pane(Pane::Project),
+            Self::split(
+                Axis::Vertical,
+                0.5,
+                Self::pane(Pane::Editor),
+                Self::pane(Pane::Preview),
+            ),
+        )
+    }
+
+    fn from_legacy(axis: Axis, ratio: f32, first: Pane) -> Self {
+        let (first, second) = match first {
+            Pane::Editor => (Pane::Editor, Pane::Preview),
+            Pane::Preview => (Pane::Preview, Pane::Editor),
+            Pane::Project => (Pane::Editor, Pane::Preview),
+        };
+
+        Self::split(
+            Axis::Vertical,
+            0.23,
+            Self::pane(Pane::Project),
+            Self::split(axis, ratio, Self::pane(first), Self::pane(second)),
+        )
+    }
+
+    fn normalize_and_validate(&mut self) -> bool {
+        let mut counts = [0_u8; 3];
+        self.normalize_and_count(0, &mut counts)
+            && counts[0] <= 1
+            && counts[1] == 1
+            && counts[2] == 1
+    }
+
+    fn normalize_and_count(&mut self, depth: usize, counts: &mut [u8; 3]) -> bool {
+        if depth > 8 {
+            return false;
+        }
+
+        match self {
+            Self::Pane { pane } => {
+                let index = match pane {
+                    Pane::Project => 0,
+                    Pane::Editor => 1,
+                    Pane::Preview => 2,
+                };
+                counts[index] = counts[index].saturating_add(1);
+                true
+            }
+            Self::Split { ratio, a, b, .. } => {
+                *ratio = if ratio.is_finite() {
+                    ratio.clamp(0.1, 0.9)
+                } else {
+                    0.5
+                };
+
+                a.normalize_and_count(depth + 1, counts) && b.normalize_and_count(depth + 1, counts)
+            }
         }
     }
 }
@@ -112,6 +228,7 @@ pub enum Axis {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Pane {
+    Project,
     Editor,
     Preview,
 }
@@ -196,6 +313,7 @@ mod tests {
     fn sample_session() -> Session {
         Session::new(
             PathBuf::from("/project"),
+            Some(PathBuf::from("/project/main.typ")),
             1,
             vec![
                 Document {
@@ -209,11 +327,17 @@ mod tests {
                     saved_text: None,
                 },
             ],
-            PaneLayout {
-                axis: Axis::Horizontal,
-                ratio: 0.7,
-                first: Pane::Preview,
-            },
+            PaneLayout::from_tree(PaneNode::split(
+                Axis::Horizontal,
+                0.7,
+                PaneNode::pane(Pane::Preview),
+                PaneNode::split(
+                    Axis::Vertical,
+                    0.35,
+                    PaneNode::pane(Pane::Project),
+                    PaneNode::pane(Pane::Editor),
+                ),
+            )),
             Settings {
                 wrap_lines: true,
                 preview_zoom: 125,
@@ -234,6 +358,10 @@ mod tests {
             .expect("the session exists");
 
         assert_eq!(loaded, expected);
+        assert_eq!(
+            loaded.project_main,
+            Some(PathBuf::from("/project/main.typ"))
+        );
         assert!(loaded.settings.wrap_lines);
         assert_eq!(loaded.settings.preview_zoom, 125);
     }
@@ -243,7 +371,13 @@ mod tests {
         let directory = tempfile::tempdir().expect("a temporary directory can be created");
         let path = directory.path().join("session.json");
         let mut stored = sample_session();
-        stored.pane_layout.ratio = 4.0;
+        let PaneLayout::Tree {
+            tree: PaneNode::Split { ratio, .. },
+        } = &mut stored.pane_layout
+        else {
+            panic!("the sample uses a tree layout");
+        };
+        *ratio = 4.0;
         let bytes = serde_json::to_vec(&stored).expect("the session can be serialized");
         fs::write(&path, bytes).expect("the invalid session can be written");
 
@@ -251,7 +385,60 @@ mod tests {
             .expect("the session can be loaded")
             .expect("the session exists");
 
-        assert_eq!(loaded.pane_layout.ratio, 0.9);
+        let PaneLayout::Tree {
+            tree: PaneNode::Split { ratio, .. },
+        } = loaded.pane_layout
+        else {
+            panic!("loaded layouts are normalized to trees");
+        };
+        assert_eq!(ratio, 0.9);
+    }
+
+    #[test]
+    fn legacy_two_pane_layout_gains_the_project_pane() {
+        let directory = tempfile::tempdir().expect("a temporary directory can be created");
+        let path = directory.path().join("session.json");
+        let mut stored =
+            serde_json::to_value(sample_session()).expect("the session can be represented as JSON");
+        stored["pane_layout"] = serde_json::json!({
+            "axis": "horizontal",
+            "ratio": 0.7,
+            "first": "preview"
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&stored).expect("the legacy session can be serialized"),
+        )
+        .expect("the legacy session can be written");
+
+        let loaded = load(&path)
+            .expect("the legacy session can be loaded")
+            .expect("the legacy session exists");
+
+        assert_eq!(
+            loaded.pane_layout,
+            PaneLayout::from_tree(PaneNode::from_legacy(Axis::Horizontal, 0.7, Pane::Preview,))
+        );
+    }
+
+    #[test]
+    fn layout_without_project_pane_is_preserved() {
+        let directory = tempfile::tempdir().expect("a temporary directory can be created");
+        let path = directory.path().join("session.json");
+        let mut stored = sample_session();
+        stored.pane_layout = PaneLayout::from_tree(PaneNode::split(
+            Axis::Vertical,
+            0.5,
+            PaneNode::pane(Pane::Editor),
+            PaneNode::pane(Pane::Preview),
+        ));
+
+        save_sync(&path, &stored).expect("the session can be saved");
+        let loaded = load(&path)
+            .expect("the session can be loaded")
+            .expect("the session exists");
+
+        assert_eq!(loaded.pane_layout, stored.pane_layout);
     }
 
     #[test]
@@ -275,6 +462,48 @@ mod tests {
             .expect("the old session exists");
 
         assert_eq!(loaded.settings, Settings::default());
+    }
+
+    #[test]
+    fn sessions_written_before_project_main_remain_compatible() {
+        let directory = tempfile::tempdir().expect("a temporary directory can be created");
+        let path = directory.path().join("session.json");
+        let mut stored = serde_json::to_value(sample_session())
+            .expect("the old session can be represented as JSON");
+        stored
+            .as_object_mut()
+            .expect("the session is a JSON object")
+            .remove("project_main");
+        fs::write(
+            &path,
+            serde_json::to_vec(&stored).expect("the old session can be serialized"),
+        )
+        .expect("the old session can be written");
+
+        let loaded = load(&path)
+            .expect("the old session can be loaded")
+            .expect("the old session exists");
+
+        assert_eq!(loaded.project_main, None);
+    }
+
+    #[test]
+    fn project_main_outside_the_workspace_is_discarded() {
+        let directory = tempfile::tempdir().expect("a temporary directory can be created");
+        let path = directory.path().join("session.json");
+        let mut stored = sample_session();
+        stored.project_main = Some(PathBuf::from("/other/main.typ"));
+        fs::write(
+            &path,
+            serde_json::to_vec(&stored).expect("the session can be serialized"),
+        )
+        .expect("the session can be written");
+
+        let loaded = load(&path)
+            .expect("the session can be loaded")
+            .expect("the session exists");
+
+        assert_eq!(loaded.project_main, None);
     }
 
     #[cfg(unix)]
