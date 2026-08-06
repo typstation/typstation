@@ -4,7 +4,7 @@ use std::{
 };
 
 use typst::syntax::VirtualPath;
-use typst_iced_editor::{Action, Content, Diagnostic};
+use typst_iced_editor::{Action, Anchor, Bias, Completion, Content, Diagnostic, Hover};
 
 const UNTITLED_NAME: &str = "Sem título.typ";
 const UNTITLED_MAIN: &str = "untitled.typ";
@@ -17,8 +17,14 @@ pub fn compiler_location_for_path(workspace_root: &Path, path: &Path) -> Option<
     ))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DocumentId(u64);
+
+impl DocumentId {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalChangeKind {
@@ -216,6 +222,35 @@ impl Document {
 
     pub fn selection_text(&self) -> Option<String> {
         self.content.selection_text()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.content.buffer().revision()
+    }
+
+    pub fn set_completions(&mut self, id: u64, completions: Vec<Completion>) {
+        self.content.set_completions(id, completions);
+    }
+
+    pub fn set_hover(&mut self, id: u64, hover: Option<Hover>) {
+        self.content.set_hover(id, hover);
+    }
+
+    pub fn create_anchored_range(&mut self, range: Range<usize>) -> (Anchor, Anchor) {
+        let start = self.content.create_anchor(range.start, Bias::Before);
+        let end = self.content.create_anchor(range.end, Bias::After);
+        (start, end)
+    }
+
+    pub fn resolve_anchored_range(&self, anchors: (Anchor, Anchor)) -> Option<Range<usize>> {
+        let start = self.content.anchor_position(anchors.0)?;
+        let end = self.content.anchor_position(anchors.1)?;
+        Some(start.min(end)..start.max(end))
+    }
+
+    pub fn remove_anchored_range(&mut self, anchors: (Anchor, Anchor)) {
+        self.content.remove_anchor(anchors.0);
+        self.content.remove_anchor(anchors.1);
     }
 
     pub fn cursor_offset(&self) -> usize {

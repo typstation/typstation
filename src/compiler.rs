@@ -503,7 +503,15 @@ fn document_outline(world: &TypstationWorld, document: &PagedDocument) -> Vec<Do
             Some(numbers) => format!("{numbers} {body}"),
             None => body.to_string(),
         };
-        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some(label) = heading.label() {
+            let label = label.resolve();
+            if title.is_empty() {
+                title = format!("<{label}>");
+            } else {
+                title.push_str(&format!(" <{label}>"));
+            }
+        }
 
         Some((
             NavigableHeading {
@@ -785,6 +793,26 @@ mod tests {
         assert_eq!(output.outline[1].title, "Próximos passos");
         assert_eq!(output.outline[0].target, SourceTarget::Main);
         assert_eq!(&source[output.outline[0].range.clone()], "= Introdução");
+    }
+
+    #[test]
+    fn semantic_outline_displays_heading_labels() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut world = TypstationWorld::new(root);
+        let output = compile(
+            &mut world,
+            Request {
+                id: 1,
+                revision: 1,
+                source: Some("= Introdução <intro>".to_owned()),
+                overlays: Vec::new(),
+                reset_files: true,
+                purpose: Purpose::Preview,
+                export_options: ExportOptions::default(),
+            },
+        );
+
+        assert_eq!(output.outline[0].title, "Introdução <intro>");
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod compiler;
 mod display;
 mod document;
 mod formatting;
+mod language;
 mod project;
 mod project_search;
 mod search;
@@ -36,7 +37,7 @@ use iced::{
     window,
 };
 use rfd::AsyncFileDialog;
-use typst_iced_editor::{Action, code_editor};
+use typst_iced_editor::{Action, Anchor, Binding, KeyPress, code_editor};
 use typstation::world::SourceOverlay;
 
 const DEBOUNCE: Duration = Duration::from_millis(250);
@@ -61,6 +62,7 @@ const EDIT_MENU_TRIGGER_WIDTH: f32 = 64.0;
 const VIEW_MENU_TRIGGER_WIDTH: f32 = 64.0;
 const HELP_MENU_TRIGGER_WIDTH: f32 = 64.0;
 const PROJECT_CONTEXT_MENU_WIDTH: f32 = 280.0;
+const EDITOR_CONTEXT_MENU_WIDTH: f32 = 304.0;
 const EXPORT_MENU_WIDTH: f32 = 280.0;
 const CONTEXT_MENU_VIEWPORT_MARGIN: f32 = 4.0;
 const SETTINGS_WINDOW_WIDTH: f32 = 640.0;
@@ -111,6 +113,13 @@ struct App {
     workspace_root: PathBuf,
     project_main: Option<PathBuf>,
     compiler: Option<compiler::Sender>,
+    language: Option<language::Sender>,
+    language_revision: u64,
+    language_synced_revision: Option<u64>,
+    completion_snippets: Vec<language::SnippetCompletion>,
+    snippet_session: Option<SnippetSession>,
+    semantic_results: Option<SemanticResults>,
+    rename_symbol: Option<RenameSymbolDialog>,
     pending_compile: Option<PendingCompile>,
     compilation_revision: u64,
     next_request_id: u64,
@@ -127,6 +136,7 @@ struct App {
     pending_export: Option<PendingExport>,
     search: SearchState,
     search_input_id: Id,
+    rename_input_id: Id,
     project_navigation: ProjectNavigation,
     project_search: ProjectSearchState,
     project_tree: Vec<project::ProjectEntry>,
@@ -160,6 +170,7 @@ struct App {
     menu_focus: usize,
     menu_bar_drag_active: bool,
     project_context_menu: Option<ProjectContextMenu>,
+    editor_context_menu: Option<EditorContextMenu>,
     cursor_position: Point,
     about_visible: bool,
     file_status: Option<String>,
@@ -190,6 +201,38 @@ struct PendingSourceReveal {
     status: String,
 }
 
+#[derive(Debug)]
+struct SnippetSession {
+    document: DocumentId,
+    placeholders: Vec<(Anchor, Anchor)>,
+    current: usize,
+}
+
+#[derive(Debug)]
+struct SemanticResults {
+    title: String,
+    locations: Vec<language::Location>,
+}
+
+#[derive(Debug)]
+struct RenameSymbolDialog {
+    document: DocumentId,
+    document_revision: u64,
+    workspace_revision: u64,
+    kind: language::RenameKind,
+    original: String,
+    value: String,
+    locations: Vec<language::Location>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LanguageCommand {
+    Definition,
+    References,
+    Rename,
+    Format,
+}
+
 #[derive(Debug, Clone)]
 struct ProjectContextMenu {
     path: PathBuf,
@@ -197,9 +240,25 @@ struct ProjectContextMenu {
     position: Point,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EditorContextMenu {
+    position: Point,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     Editor(Action),
+    Language(language::Event),
+    GoToDefinition,
+    FindReferences,
+    RenameSymbol,
+    FormatDocument,
+    SemanticLocationPressed(language::Location),
+    CloseSemanticResults,
+    RenameSymbolChanged(String),
+    ConfirmRenameSymbol,
+    CloseRenameSymbol,
+    WorkspaceRenameFinished(WorkspaceRenameOutcome),
     PaneDragged(pane_grid::DragEvent),
     PaneResized(pane_grid::ResizeEvent),
     DebounceTick(Instant),
@@ -310,6 +369,11 @@ enum Message {
     MenuFocused(usize),
     MenuNavigate(MenuNavigation),
     MenuCommand(MenuCommand),
+    EditorContextRequested {
+        position: Point,
+        offset: usize,
+    },
+    PasteFromClipboard(Option<String>),
     CursorMoved(Point),
     EscapePressed,
     ExitApplication,
@@ -382,6 +446,16 @@ enum MenuCommand {
     CloseDocument(DocumentId),
     Exit,
     Editor(Action),
+    GoToDefinition,
+    FindReferences,
+    RenameSymbol,
+    FormatDocument,
+    CopySelection,
+    CutSelection,
+    PasteClipboard,
+    Bold,
+    Italic,
+    Underline,
     OpenSearch,
     OpenProjectSearch,
     OpenReplace,
@@ -679,6 +753,12 @@ enum ExportWriteOutcome {
     },
 }
 
+#[derive(Debug, Clone)]
+struct WorkspaceRenameOutcome {
+    changed_files: usize,
+    errors: Vec<String>,
+}
+
 impl App {
     fn boot() -> (Self, Task<Message>) {
         let preview_logical_ppi = display::logical_pixels_per_inch();
@@ -777,6 +857,13 @@ impl App {
             workspace_root,
             project_main,
             compiler: None,
+            language: None,
+            language_revision: 1,
+            language_synced_revision: None,
+            completion_snippets: Vec::new(),
+            snippet_session: None,
+            semantic_results: None,
+            rename_symbol: None,
             pending_compile: Some(PendingCompile {
                 deadline: Instant::now(),
                 reset_files: true,
@@ -796,6 +883,7 @@ impl App {
             pending_export: None,
             search: SearchState::default(),
             search_input_id: Id::unique(),
+            rename_input_id: Id::unique(),
             project_navigation: ProjectNavigation::Files,
             project_search: ProjectSearchState::default(),
             project_tree: Vec::new(),
@@ -829,6 +917,7 @@ impl App {
             menu_focus: 0,
             menu_bar_drag_active: false,
             project_context_menu: None,
+            editor_context_menu: None,
             cursor_position: Point::ORIGIN,
             about_visible: false,
             file_status: Some(file_status),
@@ -882,6 +971,7 @@ impl App {
             Message::ToggleExportMenu => {
                 self.open_menu = None;
                 self.project_context_menu = None;
+                self.editor_context_menu = None;
                 self.menu_bar_drag_active = false;
                 self.export_menu_visible = !self.export_menu_visible;
                 if self.export_menu_visible {
@@ -908,6 +998,7 @@ impl App {
             Message::DismissMenu => {
                 self.open_menu = None;
                 self.project_context_menu = None;
+                self.editor_context_menu = None;
                 self.export_menu_visible = false;
                 self.menu_bar_drag_active = false;
                 Task::none()
@@ -915,6 +1006,7 @@ impl App {
             Message::MenuFocused(index) => {
                 if self.open_menu.is_some()
                     || self.project_context_menu.is_some()
+                    || self.editor_context_menu.is_some()
                     || self.export_menu_visible
                 {
                     self.menu_focus = index;
@@ -923,16 +1015,41 @@ impl App {
             }
             Message::MenuNavigate(navigation) => self.navigate_menu(navigation),
             Message::MenuCommand(command) => self.run_menu_command(command),
+            Message::EditorContextRequested { position, offset } => {
+                self.show_editor_context_menu(position, offset);
+                Task::none()
+            }
+            Message::PasteFromClipboard(Some(text)) => {
+                if self.file_busy {
+                    Task::none()
+                } else {
+                    self.update(Message::Editor(Action::Paste(text)))
+                }
+            }
+            Message::PasteFromClipboard(None) => {
+                self.file_status = Some("A área de transferência não contém texto".to_owned());
+                Task::none()
+            }
             Message::CursorMoved(position) => {
                 self.cursor_position = position;
                 Task::none()
             }
             Message::EscapePressed => {
                 self.menu_bar_drag_active = false;
+                if self.rename_symbol.take().is_some() {
+                    return Task::none();
+                }
+                if self.snippet_session.is_some() {
+                    self.cancel_snippet_session();
+                    return Task::none();
+                }
                 if self.pending_alert_dialog.is_some() {
                     return self.dismiss_alert_dialog();
                 }
                 if self.project_context_menu.take().is_some() {
+                    return Task::none();
+                }
+                if self.editor_context_menu.take().is_some() {
                     return Task::none();
                 }
                 if self.open_menu.take().is_some() {
@@ -959,21 +1076,86 @@ impl App {
                 self.about_visible = false;
                 Task::none()
             }
+            Message::Language(event) => self.handle_language_event(event),
+            Message::GoToDefinition => {
+                self.request_language_at_cursor(LanguageCommand::Definition);
+                Task::none()
+            }
+            Message::FindReferences => {
+                self.request_language_at_cursor(LanguageCommand::References);
+                Task::none()
+            }
+            Message::RenameSymbol => {
+                self.request_language_at_cursor(LanguageCommand::Rename);
+                Task::none()
+            }
+            Message::FormatDocument => {
+                self.request_language_at_cursor(LanguageCommand::Format);
+                Task::none()
+            }
+            Message::SemanticLocationPressed(location) => {
+                self.reveal_language_location(location, "Referência revelada no editor")
+            }
+            Message::CloseSemanticResults => {
+                self.semantic_results = None;
+                Task::none()
+            }
+            Message::RenameSymbolChanged(value) => {
+                if let Some(rename) = self.rename_symbol.as_mut() {
+                    rename.value = value;
+                }
+                Task::none()
+            }
+            Message::ConfirmRenameSymbol => self.confirm_symbol_rename(),
+            Message::CloseRenameSymbol => {
+                self.rename_symbol = None;
+                Task::none()
+            }
+            Message::WorkspaceRenameFinished(outcome) => {
+                self.handle_workspace_rename_finished(outcome)
+            }
             Message::Editor(action) => {
                 self.project_tree_focused = false;
+                match action {
+                    Action::RequestCompletions {
+                        id,
+                        offset,
+                        explicit,
+                    } => {
+                        self.request_editor_intelligence(id, offset, true, explicit);
+                        return Task::none();
+                    }
+                    Action::RequestHover { id, offset } => {
+                        self.request_editor_intelligence(id, offset, false, false);
+                        return Task::none();
+                    }
+                    Action::Indent if self.move_snippet_placeholder(false) => {
+                        return Task::none();
+                    }
+                    Action::Unindent if self.move_snippet_placeholder(true) => {
+                        return Task::none();
+                    }
+                    _ => {}
+                }
                 if action.is_edit() && self.file_busy {
                     return Task::none();
                 }
                 let reveal_in_preview =
                     self.modifiers.command() && matches!(action, Action::MoveTo(_));
+                let snippet = self.accepted_snippet(&action);
                 let changed = self.document.perform(action);
 
                 if changed {
+                    self.invalidate_language();
                     self.clear_compile_diagnostics();
                     self.file_status = None;
                     self.mark_session_changed();
                     self.schedule_compile(DEBOUNCE, false);
                     self.refresh_search_matches(None, false);
+                }
+
+                if let Some(snippet) = snippet {
+                    self.start_snippet_session(snippet);
                 }
 
                 if reveal_in_preview {
@@ -1262,6 +1444,9 @@ impl App {
             Message::OpenDocument => self.start_open_document(),
             Message::OpenProject => self.start_open_project(),
             Message::ProjectNavigationSelected(navigation) => {
+                if navigation == ProjectNavigation::Search {
+                    self.semantic_results = None;
+                }
                 self.project_navigation = navigation;
                 self.project_context_menu = None;
                 Task::none()
@@ -1275,6 +1460,7 @@ impl App {
                 Task::none()
             }
             Message::OpenProjectSearch => {
+                self.semantic_results = None;
                 self.project_navigation = ProjectNavigation::Search;
                 self.project_context_menu = None;
                 if !self.project_pane_visible() {
@@ -1283,6 +1469,7 @@ impl App {
                 self.start_project_search()
             }
             Message::ProjectSearchQueryChanged(query) => {
+                self.semantic_results = None;
                 self.project_search.query = query;
                 self.start_project_search()
             }
@@ -1500,11 +1687,15 @@ impl App {
 
     fn subscription(&self) -> Subscription<Message> {
         let compiler = compiler::subscription(self.compiler_config()).map(Message::Compiler);
+        let language = language::subscription(self.language_config()).map(Message::Language);
         let close_requests = window::close_requests().map(Message::CloseRequested);
-        let shortcuts = if self.pending_alert_dialog.is_some() {
+        let shortcuts = if self.rename_symbol.is_some() {
+            rename_dialog_keyboard_subscription()
+        } else if self.pending_alert_dialog.is_some() {
             alert_dialog_keyboard_subscription()
         } else if self.open_menu.is_some()
             || self.project_context_menu.is_some()
+            || self.editor_context_menu.is_some()
             || self.export_menu_visible
         {
             menu_keyboard_subscription()
@@ -1516,6 +1707,7 @@ impl App {
         let file_drop = file_drop_subscription();
         let mut subscriptions = vec![
             compiler,
+            language,
             close_requests,
             shortcuts,
             watcher,
@@ -1546,6 +1738,7 @@ impl App {
     fn open_settings_window(&mut self) -> Task<Message> {
         self.open_menu = None;
         self.project_context_menu = None;
+        self.editor_context_menu = None;
         self.export_menu_visible = false;
 
         if let Some(window) = self.settings_window {
@@ -1576,6 +1769,7 @@ impl App {
 
     fn show_menu(&mut self, menu: AppMenu) {
         self.project_context_menu = None;
+        self.editor_context_menu = None;
         self.export_menu_visible = false;
         self.open_menu = Some(menu);
         self.menu_focus = first_enabled_menu_item(&self.menu_entries(menu)).unwrap_or(0);
@@ -1584,6 +1778,7 @@ impl App {
     fn navigate_menu(&mut self, navigation: MenuNavigation) -> Task<Message> {
         if self.open_menu.is_none()
             && self.project_context_menu.is_none()
+            && self.editor_context_menu.is_none()
             && !self.export_menu_visible
         {
             return Task::none();
@@ -1640,6 +1835,7 @@ impl App {
     fn run_menu_command(&mut self, command: MenuCommand) -> Task<Message> {
         self.open_menu = None;
         self.project_context_menu = None;
+        self.editor_context_menu = None;
         self.export_menu_visible = false;
         self.menu_bar_drag_active = false;
 
@@ -1654,6 +1850,25 @@ impl App {
             MenuCommand::CloseDocument(id) => self.update(Message::CloseDocument(id)),
             MenuCommand::Exit => self.update(Message::ExitApplication),
             MenuCommand::Editor(action) => self.update(Message::Editor(action)),
+            MenuCommand::GoToDefinition => self.update(Message::GoToDefinition),
+            MenuCommand::FindReferences => self.update(Message::FindReferences),
+            MenuCommand::RenameSymbol => self.update(Message::RenameSymbol),
+            MenuCommand::FormatDocument => self.update(Message::FormatDocument),
+            MenuCommand::CopySelection => self
+                .document
+                .selection_text()
+                .map_or_else(Task::none, iced::clipboard::write),
+            MenuCommand::CutSelection => {
+                let Some(text) = self.document.selection_text() else {
+                    return Task::none();
+                };
+                let edit = self.update(Message::Editor(Action::Delete));
+                Task::batch([iced::clipboard::write(text), edit])
+            }
+            MenuCommand::PasteClipboard => iced::clipboard::read().map(Message::PasteFromClipboard),
+            MenuCommand::Bold => self.update(Message::Bold),
+            MenuCommand::Italic => self.update(Message::Italic),
+            MenuCommand::Underline => self.update(Message::Underline),
             MenuCommand::OpenSearch => self.update(Message::OpenSearch),
             MenuCommand::OpenProjectSearch => self.update(Message::OpenProjectSearch),
             MenuCommand::OpenReplace => self.update(Message::OpenReplace),
@@ -1730,6 +1945,8 @@ impl App {
             self.menu_entries(menu)
         } else if let Some(context) = self.project_context_menu.as_ref() {
             self.project_context_entries(context)
+        } else if self.editor_context_menu.is_some() {
+            self.editor_context_entries()
         } else if self.export_menu_visible {
             self.export_menu_entries()
         } else {
@@ -1946,6 +2163,35 @@ impl App {
                 ),
                 AppMenuEntry::Divider,
                 AppMenuEntry::item(
+                    "Ir para definição",
+                    Some("F12".to_owned()),
+                    false,
+                    can_edit,
+                    MenuCommand::GoToDefinition,
+                ),
+                AppMenuEntry::item(
+                    "Localizar referências",
+                    Some("Shift+F12".to_owned()),
+                    false,
+                    can_edit,
+                    MenuCommand::FindReferences,
+                ),
+                AppMenuEntry::item(
+                    "Renomear símbolo…",
+                    Some("F2".to_owned()),
+                    false,
+                    can_edit,
+                    MenuCommand::RenameSymbol,
+                ),
+                AppMenuEntry::item(
+                    "Formatar documento",
+                    Some("Shift+Alt+F".to_owned()),
+                    false,
+                    can_edit,
+                    MenuCommand::FormatDocument,
+                ),
+                AppMenuEntry::Divider,
+                AppMenuEntry::item(
                     "Alternar comentário de linha",
                     None,
                     false,
@@ -2053,6 +2299,7 @@ impl App {
         }
 
         self.open_menu = None;
+        self.editor_context_menu = None;
         self.export_menu_visible = false;
         self.menu_bar_drag_active = false;
         self.selected_project_entry = Some(path.clone());
@@ -2068,6 +2315,123 @@ impl App {
             .as_ref()
             .and_then(|context| first_enabled_menu_item(&self.project_context_entries(context)))
             .unwrap_or(0);
+    }
+
+    fn show_editor_context_menu(&mut self, position: Point, offset: usize) {
+        let selection = self.document.content().selection();
+        if selection.is_empty() || offset < selection.start || offset > selection.end {
+            self.document.perform(Action::MoveTo(offset));
+        }
+
+        self.open_menu = None;
+        self.project_context_menu = None;
+        self.export_menu_visible = false;
+        self.menu_bar_drag_active = false;
+        self.project_tree_focused = false;
+        self.editor_context_menu = Some(EditorContextMenu { position });
+        self.menu_focus = first_enabled_menu_item(&self.editor_context_entries()).unwrap_or(0);
+    }
+
+    fn editor_context_entries(&self) -> Vec<AppMenuEntry> {
+        let can_edit = !self.file_busy;
+        let has_selection = self.document.selection_text().is_some();
+
+        vec![
+            AppMenuEntry::item(
+                "Desfazer",
+                Some(command_shortcut("Z")),
+                false,
+                can_edit,
+                MenuCommand::Editor(Action::Undo),
+            ),
+            AppMenuEntry::item(
+                "Refazer",
+                Some(command_shift_shortcut("Z")),
+                false,
+                can_edit,
+                MenuCommand::Editor(Action::Redo),
+            ),
+            AppMenuEntry::Divider,
+            AppMenuEntry::item(
+                "Recortar",
+                Some(command_shortcut("X")),
+                false,
+                can_edit && has_selection,
+                MenuCommand::CutSelection,
+            ),
+            AppMenuEntry::item(
+                "Copiar",
+                Some(command_shortcut("C")),
+                false,
+                has_selection,
+                MenuCommand::CopySelection,
+            ),
+            AppMenuEntry::item(
+                "Colar",
+                Some(command_shortcut("V")),
+                false,
+                can_edit,
+                MenuCommand::PasteClipboard,
+            ),
+            AppMenuEntry::Divider,
+            AppMenuEntry::item(
+                "Negrito",
+                Some(command_shortcut("B")),
+                false,
+                can_edit,
+                MenuCommand::Bold,
+            ),
+            AppMenuEntry::item(
+                "Itálico",
+                Some(command_shortcut("I")),
+                false,
+                can_edit,
+                MenuCommand::Italic,
+            ),
+            AppMenuEntry::item(
+                "Sublinhado",
+                Some(command_shortcut("U")),
+                false,
+                can_edit,
+                MenuCommand::Underline,
+            ),
+            AppMenuEntry::item(
+                "Alternar comentário de linha",
+                Some(command_shortcut("/")),
+                false,
+                can_edit,
+                MenuCommand::Editor(Action::ToggleLineComment),
+            ),
+            AppMenuEntry::Divider,
+            AppMenuEntry::item(
+                "Ir para definição",
+                Some("F12".to_owned()),
+                false,
+                can_edit,
+                MenuCommand::GoToDefinition,
+            ),
+            AppMenuEntry::item(
+                "Localizar referências",
+                Some("Shift+F12".to_owned()),
+                false,
+                can_edit,
+                MenuCommand::FindReferences,
+            ),
+            AppMenuEntry::item(
+                "Renomear símbolo…",
+                Some("F2".to_owned()),
+                false,
+                can_edit,
+                MenuCommand::RenameSymbol,
+            ),
+            AppMenuEntry::item(
+                "Formatar documento",
+                Some("Shift+Alt+F".to_owned()),
+                false,
+                can_edit,
+                MenuCommand::FormatDocument,
+            ),
+        ]
     }
 
     fn project_context_entries(&self, context: &ProjectContextMenu) -> Vec<AppMenuEntry> {
@@ -2362,6 +2726,14 @@ impl App {
                 .push(self.project_context_menu_overlay(context));
         }
 
+        if let Some(context) = self.editor_context_menu {
+            let dismiss =
+                mouse_area(Space::new().width(Fill).height(Fill)).on_press(Message::DismissMenu);
+            layers = layers
+                .push(dismiss)
+                .push(self.editor_context_menu_overlay(context));
+        }
+
         if self.about_visible {
             let backdrop = mouse_area(
                 container(Space::new())
@@ -2375,6 +2747,9 @@ impl App {
 
         if let Some(pending) = self.pending_alert_dialog.as_ref() {
             layers = layers.push(self.alert_dialog_view(pending));
+        }
+        if let Some(rename) = self.rename_symbol.as_ref() {
+            layers = layers.push(self.rename_symbol_dialog_view(rename));
         }
 
         layers.into()
@@ -2541,6 +2916,33 @@ impl App {
         .into()
     }
 
+    fn editor_context_menu_overlay(&self, context: EditorContextMenu) -> Element<'_, Message> {
+        let definitions = self.editor_context_entries();
+        let popup_height = menu_popup_height(&definitions);
+        let position = context.position;
+        let menu_focus = self.menu_focus;
+
+        responsive(move |viewport| {
+            let maximum_x =
+                (viewport.width - EDITOR_CONTEXT_MENU_WIDTH - CONTEXT_MENU_VIEWPORT_MARGIN)
+                    .max(CONTEXT_MENU_VIEWPORT_MARGIN);
+            let maximum_y = (viewport.height - popup_height - CONTEXT_MENU_VIEWPORT_MARGIN)
+                .max(CONTEXT_MENU_VIEWPORT_MARGIN);
+            let x = position.x.clamp(CONTEXT_MENU_VIEWPORT_MARGIN, maximum_x);
+            let y = position.y.clamp(CONTEXT_MENU_VIEWPORT_MARGIN, maximum_y);
+            let popup = menu_popup(definitions.clone(), menu_focus, EDITOR_CONTEXT_MENU_WIDTH);
+
+            column![
+                Space::new().height(iced::Length::Fixed(y)),
+                row![Space::new().width(iced::Length::Fixed(x)), popup],
+            ]
+            .width(Fill)
+            .height(Fill)
+            .into()
+        })
+        .into()
+    }
+
     fn about_overlay(&self) -> Element<'_, Message> {
         let close = ui::spectrum_button(
             "Fechar",
@@ -2646,6 +3048,68 @@ impl App {
                 .into()
             }
         }
+    }
+
+    fn rename_symbol_dialog_view(&self, rename: &RenameSymbolDialog) -> Element<'_, Message> {
+        let valid = valid_symbol_name(rename.kind, &rename.value)
+            && rename.value != rename.original
+            && !rename.locations.is_empty();
+        let field = ui::spectrum_text_field(
+            "Novo nome",
+            &rename.value,
+            Message::RenameSymbolChanged,
+            valid.then_some(Message::ConfirmRenameSymbol),
+            Fill,
+        )
+        .id(self.rename_input_id.clone());
+        let actions = row![
+            Space::new().width(Fill),
+            ui::spectrum_button(
+                "Cancelar",
+                Some(Message::CloseRenameSymbol),
+                ui::ButtonOptions::SECONDARY,
+            ),
+            ui::spectrum_button(
+                "Renomear",
+                valid.then_some(Message::ConfirmRenameSymbol),
+                ui::ButtonOptions::ACCENT,
+            ),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(ui::tokens::spacing::ALERT_DIALOG_BUTTON_GAP);
+        let dialog = container(
+            column![
+                text(format!("Renomear {}", rename.original))
+                    .size(ui::tokens::typography::ALERT_DIALOG_TITLE)
+                    .font(iced::Font {
+                        weight: iced::font::Weight::Bold,
+                        ..iced::Font::DEFAULT
+                    }),
+                text(format!(
+                    "{} ocorrência(s) semântica(s) serão alteradas.",
+                    rename.locations.len()
+                ))
+                .size(ui::tokens::typography::ALERT_DIALOG_DESCRIPTION),
+                field,
+                actions,
+            ]
+            .spacing(16),
+        )
+        .width(Fill)
+        .max_width(ui::tokens::dimension::ALERT_DIALOG_MAXIMUM_WIDTH)
+        .padding(ui::tokens::spacing::ALERT_DIALOG_PADDING)
+        .style(modal_dialog_style);
+        let overlay = container(dialog)
+            .width(Fill)
+            .height(Fill)
+            .padding(ui::tokens::spacing::BASE_PADDING_HORIZONTAL_EXTRA_LARGE)
+            .center_x(Fill)
+            .center_y(Fill)
+            .style(modal_backdrop_style);
+
+        mouse_area(overlay)
+            .on_press(Message::CloseRenameSymbol)
+            .into()
     }
 
     fn preview_view(&self) -> Element<'_, Message> {
@@ -3063,6 +3527,15 @@ impl App {
 
         let editor: Element<'_, Message> = code_editor(self.document.content())
             .on_action(Message::Editor)
+            .on_context_menu(|position, offset| Message::EditorContextRequested {
+                position,
+                offset,
+            })
+            .key_binding(editor_key_binding)
+            .completions()
+            .completion_triggers(['#', '@', '<', '.', '(', ':'])
+            .hover()
+            .hover_delay(Duration::from_millis(350))
             .wrap(self.settings.wrap_lines)
             .gutter(self.settings.show_gutter)
             .size(f32::from(self.settings.editor_font_size))
@@ -3143,7 +3616,14 @@ impl App {
     }
 
     fn project_pane_title_bar(&self) -> Element<'_, Message> {
-        let title = text(self.project_navigation.title())
+        let pane_title = if self.project_navigation == ProjectNavigation::Search
+            && self.semantic_results.is_some()
+        {
+            "Referências"
+        } else {
+            self.project_navigation.title()
+        };
+        let title = text(pane_title)
             .size(ui::tokens::typography::FONT_SIZE_100)
             .font(iced::Font {
                 weight: iced::font::Weight::Bold,
@@ -3183,6 +3663,9 @@ impl App {
     }
 
     fn project_search_view(&self) -> Element<'_, Message> {
+        if let Some(results) = self.semantic_results.as_ref() {
+            return self.semantic_results_view(results);
+        }
         let query = ui::spectrum_text_field(
             "Buscar em todos os arquivos",
             &self.project_search.query,
@@ -3295,6 +3778,74 @@ impl App {
         }
 
         column![header, scrollable(results).width(Fill).height(Fill)]
+            .width(Fill)
+            .height(Fill)
+            .into()
+    }
+
+    fn semantic_results_view(&self, results: &SemanticResults) -> Element<'_, Message> {
+        let close = ui::workflow_icon_action_button(
+            ui::WorkflowIcon::Close,
+            "Fechar referências",
+            Some(Message::CloseSemanticResults),
+            ui::ActionButtonOptions::QUIET,
+        );
+        let header = container(
+            row![
+                text(results.title.clone())
+                    .size(ui::tokens::typography::FONT_SIZE_100)
+                    .font(iced::Font {
+                        weight: iced::font::Weight::Bold,
+                        ..iced::Font::DEFAULT
+                    }),
+                Space::new().width(Fill),
+                close,
+            ]
+            .align_y(Alignment::Center),
+        )
+        .width(Fill)
+        .padding(ui::tokens::spacing::SEARCH_PANEL_EDGE_TO_CONTENT)
+        .style(search_panel_style);
+        let mut locations = column![
+            container(
+                text(format!("{} ocorrência(s)", results.locations.len()))
+                    .size(ui::tokens::typography::FONT_SIZE_75)
+                    .style(search_metadata_text_style),
+            )
+            .width(Fill)
+            .padding([8, 10])
+        ];
+        for location in &results.locations {
+            let path = location
+                .path
+                .as_deref()
+                .and_then(|path| path.strip_prefix(&self.workspace_root).ok().or(Some(path)))
+                .map(|path| path.to_string_lossy().into_owned())
+                .or_else(|| {
+                    location
+                        .document
+                        .and_then(|id| self.document.get(id).map(Document::display_name))
+                })
+                .unwrap_or_else(|| "Documento".to_owned());
+            let content = column![
+                text(format!("{path}:{}:{}", location.line, location.column))
+                    .size(ui::tokens::typography::FONT_SIZE_75)
+                    .wrapping(text::Wrapping::None),
+                text(location.excerpt.clone())
+                    .size(ui::tokens::typography::FONT_SIZE_75)
+                    .wrapping(text::Wrapping::None),
+            ]
+            .spacing(2);
+            locations = locations.push(
+                iced::widget::button(content)
+                    .on_press(Message::SemanticLocationPressed(location.clone()))
+                    .width(Fill)
+                    .padding([7, 10])
+                    .style(project_search_result_style),
+            );
+        }
+
+        column![header, scrollable(locations).width(Fill).height(Fill)]
             .width(Fill)
             .height(Fill)
             .into()
@@ -5319,6 +5870,8 @@ impl App {
     }
 
     fn active_document_replaced(&mut self) {
+        self.cancel_snippet_session();
+        self.invalidate_language();
         self.search.visible = false;
         self.apply_editor_settings();
         self.replace_editor_pane_identity();
@@ -5329,7 +5882,9 @@ impl App {
     fn restart_compilation(&mut self, previous_config: compiler::Config, clear_preview: bool) {
         if previous_config != self.compiler_config() {
             self.compiler = None;
+            self.language = None;
         }
+        self.invalidate_language();
         self.latest_request_id = None;
         self.clear_compile_diagnostics();
 
@@ -5377,6 +5932,309 @@ impl App {
 
         let (root, main_name) = self.document.compiler_location(&self.workspace_root);
         compiler::Config::new(root, main_name)
+    }
+
+    fn language_config(&self) -> language::Config {
+        if let Some(path) = self.project_main.as_deref()
+            && let Some((root, main_name)) = compiler_location_for_path(&self.workspace_root, path)
+        {
+            return language::Config::new(root, main_name);
+        }
+
+        let (root, main_name) = self.document.compiler_location(&self.workspace_root);
+        language::Config::new(root, main_name)
+    }
+
+    fn invalidate_language(&mut self) {
+        self.language_revision = self.language_revision.wrapping_add(1);
+        self.language_synced_revision = None;
+        self.completion_snippets.clear();
+    }
+
+    fn sync_language(&mut self) -> bool {
+        if self.language_synced_revision == Some(self.language_revision) {
+            return self.language.is_some();
+        }
+        let Some(sender) = self.language.clone() else {
+            return false;
+        };
+        let config = self.language_config();
+        let documents = self
+            .document
+            .iter()
+            .map(|(id, document)| {
+                let (revision, text) = document.snapshot();
+                language::DocumentSnapshot {
+                    id,
+                    revision,
+                    path: document.path().map(Path::to_path_buf),
+                    text,
+                }
+            })
+            .collect();
+        let known_files = collect_project_files(&self.project_tree)
+            .into_iter()
+            .filter(|path| path.extension().is_some_and(|extension| extension == "typ"))
+            .filter(|path| path.starts_with(config.root()))
+            .collect();
+        let snapshot = language::Snapshot {
+            revision: self.language_revision,
+            main_document: self.compilation_main_document_id(),
+            active_document: self.document.active_id(),
+            documents,
+            known_files,
+        };
+
+        if sender
+            .unbounded_send(language::Request::Sync(snapshot))
+            .is_err()
+        {
+            self.language = None;
+            return false;
+        }
+        self.language_synced_revision = Some(self.language_revision);
+        true
+    }
+
+    fn request_editor_intelligence(
+        &mut self,
+        request_id: u64,
+        offset: usize,
+        complete: bool,
+        explicit: bool,
+    ) {
+        if !self.sync_language() {
+            return;
+        }
+        let Some(sender) = self.language.clone() else {
+            return;
+        };
+        let document = self.document.active_id();
+        let revision = self.document.revision();
+        let request = if complete {
+            language::Request::Complete {
+                request_id,
+                document,
+                revision,
+                offset,
+                explicit,
+            }
+        } else {
+            language::Request::Hover {
+                request_id,
+                document,
+                revision,
+                offset,
+            }
+        };
+        if sender.unbounded_send(request).is_err() {
+            self.language = None;
+        }
+    }
+
+    fn request_language_at_cursor(&mut self, command: LanguageCommand) {
+        if self.file_busy || !self.sync_language() {
+            self.file_status = Some("O serviço de linguagem ainda não está disponível".to_owned());
+            return;
+        }
+        let Some(sender) = self.language.clone() else {
+            return;
+        };
+        let document = self.document.active_id();
+        let revision = self.document.revision();
+        let offset = self.document.cursor_offset();
+        let request = match command {
+            LanguageCommand::Definition => language::Request::Definition {
+                document,
+                revision,
+                offset,
+            },
+            LanguageCommand::References => language::Request::References {
+                document,
+                revision,
+                offset,
+            },
+            LanguageCommand::Rename => language::Request::PrepareRename {
+                document,
+                revision,
+                offset,
+            },
+            LanguageCommand::Format => language::Request::Format {
+                document,
+                revision,
+                tab_width: self.settings.tab_width,
+            },
+        };
+        if sender.unbounded_send(request).is_err() {
+            self.language = None;
+        }
+    }
+
+    fn handle_language_event(&mut self, event: language::Event) -> Task<Message> {
+        match event {
+            language::Event::Ready { config, sender } => {
+                if config != self.language_config() {
+                    return Task::none();
+                }
+                self.language = Some(sender);
+                self.language_synced_revision = None;
+                self.sync_language();
+            }
+            language::Event::Completions {
+                config,
+                request_id,
+                document,
+                revision,
+                items,
+                snippets,
+            } => {
+                if config == self.language_config()
+                    && self.document.active_id() == document
+                    && self.document.revision() == revision
+                {
+                    self.document.set_completions(request_id, items);
+                    self.completion_snippets = snippets;
+                }
+            }
+            language::Event::Hover {
+                config,
+                request_id,
+                document,
+                revision,
+                hover,
+            } => {
+                if config == self.language_config()
+                    && self.document.active_id() == document
+                    && self.document.revision() == revision
+                {
+                    self.document.set_hover(request_id, hover);
+                }
+            }
+            language::Event::Definition {
+                config,
+                document,
+                revision,
+                location,
+            } => {
+                if config != self.language_config()
+                    || self.document.active_id() != document
+                    || self.document.revision() != revision
+                {
+                    return Task::none();
+                }
+                if let Some(location) = location {
+                    return self.reveal_language_location(location, "Definição revelada no editor");
+                }
+                self.file_status = Some("Nenhuma definição navegável foi encontrada".to_owned());
+            }
+            language::Event::References {
+                config,
+                document,
+                revision,
+                symbol,
+                locations,
+            } => {
+                if config != self.language_config()
+                    || self.document.active_id() != document
+                    || self.document.revision() != revision
+                {
+                    return Task::none();
+                }
+                let title = symbol
+                    .map(|symbol| format!("Referências de {symbol}"))
+                    .unwrap_or_else(|| "Referências".to_owned());
+                self.file_status = Some(format!("{} ocorrência(s) encontrada(s)", locations.len()));
+                self.semantic_results = Some(SemanticResults { title, locations });
+                self.project_navigation = ProjectNavigation::Search;
+            }
+            language::Event::RenamePrepared {
+                config,
+                document,
+                revision,
+                workspace_revision,
+                symbol,
+                kind,
+                locations,
+            } => {
+                if config != self.language_config()
+                    || self.document.active_id() != document
+                    || self.document.revision() != revision
+                    || self.language_revision != workspace_revision
+                {
+                    return Task::none();
+                }
+                let (Some(symbol), Some(kind)) = (symbol, kind) else {
+                    self.file_status = Some("O símbolo atual não pode ser renomeado".to_owned());
+                    return Task::none();
+                };
+                self.rename_symbol = Some(RenameSymbolDialog {
+                    document,
+                    document_revision: revision,
+                    workspace_revision,
+                    kind,
+                    original: symbol.clone(),
+                    value: symbol,
+                    locations,
+                });
+                return operation::focus(self.rename_input_id.clone());
+            }
+            language::Event::Formatted {
+                config,
+                document,
+                revision,
+                result,
+            } => {
+                if config != self.language_config()
+                    || self.document.active_id() != document
+                    || self.document.revision() != revision
+                {
+                    return Task::none();
+                }
+                match result {
+                    Ok(formatted) if formatted != self.document.snapshot().1 => {
+                        let len = self.document.content().buffer().len();
+                        self.document.perform(Action::Replace {
+                            range: 0..len,
+                            text: formatted,
+                        });
+                        self.after_formatting();
+                        self.file_status = Some("Documento formatado com Typstyle".to_owned());
+                    }
+                    Ok(_) => self.file_status = Some("O documento já está formatado".to_owned()),
+                    Err(error) => {
+                        self.file_status = Some(format!("Não foi possível formatar: {error}"));
+                    }
+                }
+            }
+        }
+        Task::none()
+    }
+
+    fn reveal_language_location(
+        &mut self,
+        location: language::Location,
+        status: &str,
+    ) -> Task<Message> {
+        if let Some(document) = location.document
+            && self.document.get(document).is_some()
+        {
+            self.activate_document(document);
+            if let Some(document) = self.document.get_mut(document) {
+                document.reveal_range(location.range);
+            }
+            self.file_status = Some(status.to_owned());
+            return Task::none();
+        }
+        let Some(path) = location.path else {
+            self.file_status =
+                Some("A origem do símbolo não possui um arquivo navegável".to_owned());
+            return Task::none();
+        };
+        self.reveal_source_target(
+            source_map::SourceTarget::ProjectFile(path),
+            location.range,
+            status,
+        )
     }
 
     fn compilation_main_document_id(&self) -> Option<DocumentId> {
@@ -5596,12 +6454,202 @@ impl App {
     }
 
     fn after_formatting(&mut self) {
+        self.cancel_snippet_session();
+        self.invalidate_language();
         self.clear_compile_diagnostics();
         self.file_status = None;
         self.mark_session_changed();
         self.schedule_compile(Duration::ZERO, false);
         self.dispatch_compile(Instant::now());
         self.refresh_search_matches(None, false);
+    }
+
+    fn accepted_snippet(&self, action: &Action) -> Option<language::SnippetCompletion> {
+        let Action::Replace { range, text } = action else {
+            return None;
+        };
+        self.completion_snippets
+            .iter()
+            .find(|snippet| snippet.replace.start == range.start && snippet.insert == *text)
+            .cloned()
+            .map(|mut snippet| {
+                snippet.replace = range.clone();
+                snippet
+            })
+    }
+
+    fn start_snippet_session(&mut self, snippet: language::SnippetCompletion) {
+        self.cancel_snippet_session();
+        let base = snippet.replace.start;
+        let placeholders = snippet
+            .placeholders
+            .into_iter()
+            .map(|range| {
+                self.document
+                    .create_anchored_range(base + range.start..base + range.end)
+            })
+            .collect::<Vec<_>>();
+        let Some(first) = placeholders.first().copied() else {
+            return;
+        };
+        if let Some(range) = self.document.resolve_anchored_range(first) {
+            self.document.reveal_range(range);
+        }
+        self.snippet_session = Some(SnippetSession {
+            document: self.document.active_id(),
+            placeholders,
+            current: 0,
+        });
+    }
+
+    fn move_snippet_placeholder(&mut self, reverse: bool) -> bool {
+        let Some(mut session) = self.snippet_session.take() else {
+            return false;
+        };
+        if session.document != self.document.active_id() {
+            for anchors in session.placeholders {
+                if let Some(document) = self.document.get_mut(session.document) {
+                    document.remove_anchored_range(anchors);
+                }
+            }
+            return false;
+        }
+        let next = if reverse {
+            session.current.saturating_sub(1)
+        } else {
+            session.current + 1
+        };
+        if next >= session.placeholders.len() {
+            for anchors in session.placeholders {
+                self.document.remove_anchored_range(anchors);
+            }
+            return true;
+        }
+        session.current = next;
+        if let Some(range) = self
+            .document
+            .resolve_anchored_range(session.placeholders[next])
+        {
+            self.document.reveal_range(range);
+        }
+        self.snippet_session = Some(session);
+        true
+    }
+
+    fn cancel_snippet_session(&mut self) {
+        let Some(session) = self.snippet_session.take() else {
+            return;
+        };
+        if let Some(document) = self.document.get_mut(session.document) {
+            for anchors in session.placeholders {
+                document.remove_anchored_range(anchors);
+            }
+        }
+    }
+
+    fn confirm_symbol_rename(&mut self) -> Task<Message> {
+        let Some(rename) = self.rename_symbol.take() else {
+            return Task::none();
+        };
+        if self.language_revision != rename.workspace_revision
+            || self
+                .document
+                .get(rename.document)
+                .is_none_or(|document| document.revision() != rename.document_revision)
+        {
+            self.file_status = Some(
+                "O documento mudou durante a renomeação; execute o comando novamente".to_owned(),
+            );
+            return Task::none();
+        }
+        if !valid_symbol_name(rename.kind, &rename.value) || rename.value == rename.original {
+            return Task::none();
+        }
+
+        let mut open_edits: std::collections::HashMap<DocumentId, Vec<(Range<usize>, String)>> =
+            std::collections::HashMap::new();
+        let mut closed_edits: std::collections::HashMap<PathBuf, Vec<Range<usize>>> =
+            std::collections::HashMap::new();
+        for location in rename.locations {
+            let open_document = location
+                .document
+                .filter(|id| self.document.get(*id).is_some())
+                .or_else(|| {
+                    location
+                        .path
+                        .as_deref()
+                        .and_then(|path| self.document.find_path(path))
+                });
+            if let Some(document) = open_document {
+                open_edits
+                    .entry(document)
+                    .or_default()
+                    .push((location.range, rename.value.clone()));
+            } else if let Some(path) = location.path {
+                closed_edits.entry(path).or_default().push(location.range);
+            }
+        }
+
+        let mut changed_files = 0;
+        for (document, edits) in open_edits {
+            if let Some(document) = self.document.get_mut(document)
+                && document.perform(Action::ApplyEdits(edits))
+            {
+                changed_files += 1;
+            }
+        }
+        if changed_files > 0 {
+            self.invalidate_language();
+            self.clear_compile_diagnostics();
+            self.mark_session_changed();
+            self.schedule_compile(Duration::ZERO, false);
+            self.dispatch_compile(Instant::now());
+            self.refresh_search_matches(None, false);
+        }
+
+        self.file_busy = !closed_edits.is_empty();
+        self.file_status = Some(format!(
+            "Renomeando {} para {}...",
+            rename.original, rename.value
+        ));
+        if closed_edits.is_empty() {
+            return Task::done(Message::WorkspaceRenameFinished(WorkspaceRenameOutcome {
+                changed_files,
+                errors: Vec::new(),
+            }));
+        }
+        Task::perform(
+            apply_closed_workspace_edits(
+                closed_edits,
+                rename.original,
+                rename.value,
+                changed_files,
+            ),
+            Message::WorkspaceRenameFinished,
+        )
+    }
+
+    fn handle_workspace_rename_finished(
+        &mut self,
+        outcome: WorkspaceRenameOutcome,
+    ) -> Task<Message> {
+        self.file_busy = false;
+        if outcome.errors.is_empty() {
+            self.file_status = Some(format!(
+                "Símbolo renomeado em {} arquivo(s)",
+                outcome.changed_files
+            ));
+        } else {
+            self.file_status = Some(format!(
+                "Renomeação parcial: {} arquivo(s); {}",
+                outcome.changed_files,
+                truncate(&outcome.errors.join("; "), 120)
+            ));
+        }
+        self.invalidate_language();
+        self.schedule_compile(Duration::ZERO, true);
+        self.dispatch_compile(Instant::now());
+        self.refresh_project_tree()
     }
 
     fn clear_compile_diagnostics(&mut self) {
@@ -6760,6 +7808,62 @@ async fn write_export(
     }
 }
 
+async fn apply_closed_workspace_edits(
+    edits: std::collections::HashMap<PathBuf, Vec<Range<usize>>>,
+    original: String,
+    replacement: String,
+    open_changed_files: usize,
+) -> WorkspaceRenameOutcome {
+    match tokio::task::spawn_blocking(move || {
+        let mut changed_files = open_changed_files;
+        let mut errors = Vec::new();
+        for (path, mut ranges) in edits {
+            let result = (|| -> io::Result<()> {
+                let mut source = fs::read_to_string(&path)?;
+                ranges.sort_by_key(|range| std::cmp::Reverse(range.start));
+                for range in ranges {
+                    if source.get(range.clone()) != Some(original.as_str()) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "o arquivo mudou desde a análise semântica",
+                        ));
+                    }
+                    source.replace_range(range, &replacement);
+                }
+                atomic_write_file(&path, source.as_bytes())
+            })();
+            match result {
+                Ok(()) => changed_files += 1,
+                Err(error) => errors.push(format!("{}: {error}", path.display())),
+            }
+        }
+        WorkspaceRenameOutcome {
+            changed_files,
+            errors,
+        }
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => WorkspaceRenameOutcome {
+            changed_files: open_changed_files,
+            errors: vec![format!("tarefa de renomeação interrompida: {error}")],
+        },
+    }
+}
+
+fn valid_symbol_name(kind: language::RenameKind, value: &str) -> bool {
+    match kind {
+        language::RenameKind::Identifier => typst::syntax::is_ident(value),
+        language::RenameKind::Label => {
+            !value.is_empty()
+                && !value.chars().any(|character| {
+                    character.is_whitespace() || matches!(character, '<' | '>' | '@')
+                })
+        }
+    }
+}
+
 fn atomic_write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     atomic_write_file_with_mode(path, contents, None)
 }
@@ -6934,6 +8038,16 @@ fn shortcut_subscription() -> Subscription<Message> {
                     Message::SearchNext
                 });
             }
+            keyboard::Key::Named(keyboard::key::Named::F2) if modifiers.is_empty() => {
+                return Some(Message::RenameSymbol);
+            }
+            keyboard::Key::Named(keyboard::key::Named::F12) => {
+                return Some(if modifiers.shift() {
+                    Message::FindReferences
+                } else {
+                    Message::GoToDefinition
+                });
+            }
             keyboard::Key::Named(keyboard::key::Named::Escape) => {
                 return Some(Message::EscapePressed);
             }
@@ -6942,6 +8056,23 @@ fn shortcut_subscription() -> Subscription<Message> {
 
         shortcut_message(key.to_latin(physical_key)?, modifiers)
     })
+}
+
+fn editor_key_binding(press: KeyPress) -> Option<Binding<Message>> {
+    if is_format_shortcut(&press.key, press.modifiers) {
+        Some(Binding::Custom(Message::FormatDocument))
+    } else {
+        Binding::from_key_press(press)
+    }
+}
+
+fn is_format_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool {
+    modifiers.alt()
+        && modifiers.shift()
+        && matches!(
+            key.as_ref(),
+            keyboard::Key::Character(character) if character.eq_ignore_ascii_case("f")
+        )
 }
 
 fn menu_keyboard_subscription() -> Subscription<Message> {
@@ -6991,6 +8122,21 @@ fn alert_dialog_keyboard_subscription() -> Subscription<Message> {
         };
 
         Some(Message::DismissAlertDialog)
+    })
+}
+
+fn rename_dialog_keyboard_subscription() -> Subscription<Message> {
+    event::listen_with(|event, _status, _window| {
+        let iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            repeat: false,
+            ..
+        }) = event
+        else {
+            return None;
+        };
+
+        Some(Message::CloseRenameSymbol)
     })
 }
 
@@ -7590,6 +8736,27 @@ mod tests {
         ));
         assert!(shortcut_message('s', keyboard::Modifiers::NONE).is_none());
         assert!(shortcut_message('n', command | keyboard::Modifiers::SHIFT).is_none());
+    }
+
+    #[test]
+    fn format_shortcut_is_captured_only_with_shift_and_alt() {
+        let key = keyboard::Key::Character("f".into());
+        let modifiers = keyboard::Modifiers::SHIFT | keyboard::Modifiers::ALT;
+
+        assert!(is_format_shortcut(&key, modifiers));
+        assert!(!is_format_shortcut(&key, keyboard::Modifiers::SHIFT));
+        assert!(!is_format_shortcut(&key, keyboard::Modifiers::ALT));
+        assert!(matches!(
+            editor_key_binding(KeyPress {
+                key,
+                modified_key: keyboard::Key::Character("F".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyF),
+                modifiers,
+                text: Some("F".into()),
+                status: typst_iced_editor::Status::Focused { is_hovered: true },
+            }),
+            Some(Binding::Custom(Message::FormatDocument))
+        ));
     }
 
     #[test]
@@ -8202,6 +9369,31 @@ mod tests {
             .expect("the context menu should be open");
         assert_eq!(context.path, path);
         assert_eq!(context.position, Point::new(120.0, 240.0));
+    }
+
+    #[test]
+    fn editor_context_menu_targets_the_click_and_preserves_an_existing_selection() {
+        let mut app = App::new();
+        *app.document.active_mut() =
+            Document::opened(PathBuf::from("document.typ"), "alpha beta".to_owned());
+        app.document.perform(Action::MoveTo(0));
+        app.document.perform(Action::SelectTo(5));
+
+        app.show_editor_context_menu(Point::new(240.0, 180.0), 2);
+
+        assert_eq!(app.document.content().selection(), 0..5);
+        assert_eq!(
+            app.editor_context_menu.map(|context| context.position),
+            Some(Point::new(240.0, 180.0))
+        );
+        let entries = app.editor_context_entries();
+        let labels = menu_labels(&entries);
+        assert!(labels.contains(&"Recortar"));
+        assert!(labels.contains(&"Ir para definição"));
+        assert!(labels.contains(&"Formatar documento"));
+
+        app.show_editor_context_menu(Point::new(300.0, 220.0), 8);
+        assert_eq!(app.document.content().selection(), 8..8);
     }
 
     #[test]
@@ -8917,6 +10109,68 @@ mod tests {
         assert_eq!(stored.recent_projects[0], first.path());
         assert_eq!(stored.recent_projects[1], second.path());
         assert_eq!(stored.recent_projects.len(), 2);
+    }
+
+    #[test]
+    fn stale_language_completion_does_not_modify_the_active_editor() {
+        let mut app = App::new();
+        let config = app.language_config();
+        let document = app.document.active_id();
+        let revision = app.document.revision();
+        let _ = app.update(Message::Editor(Action::Insert("x".to_owned())));
+
+        let _ = app.update(Message::Language(language::Event::Completions {
+            config,
+            request_id: 9,
+            document,
+            revision,
+            items: vec![typst_iced_editor::Completion::new(0..0, "text")],
+            snippets: Vec::new(),
+        }));
+
+        assert!(app.document.content().completions().is_none());
+    }
+
+    #[test]
+    fn filtered_snippet_replaces_the_prefix_and_selects_each_placeholder() {
+        let mut app = App::new();
+        app.document = Documents::new(Document::opened(
+            PathBuf::from("document.typ"),
+            "#let".to_owned(),
+        ));
+        app.completion_snippets = vec![language::SnippetCompletion {
+            replace: 1..1,
+            insert: "let name = value".to_owned(),
+            placeholders: vec![4..8, 11..16],
+        }];
+
+        let _ = app.update(Message::Editor(Action::Replace {
+            range: 1..4,
+            text: "let name = value".to_owned(),
+        }));
+        assert_eq!(app.document.snapshot().1, "#let name = value");
+        assert_eq!(app.document.selection_text().as_deref(), Some("name"));
+
+        let _ = app.update(Message::Editor(Action::Insert("total".to_owned())));
+        let _ = app.update(Message::Editor(Action::Indent));
+        assert_eq!(app.document.selection_text().as_deref(), Some("value"));
+    }
+
+    #[test]
+    fn typst_symbol_validation_distinguishes_identifiers_and_labels() {
+        assert!(valid_symbol_name(
+            language::RenameKind::Identifier,
+            "total_2"
+        ));
+        assert!(!valid_symbol_name(
+            language::RenameKind::Identifier,
+            "capitulo:2"
+        ));
+        assert!(valid_symbol_name(language::RenameKind::Label, "capitulo-2"));
+        assert!(!valid_symbol_name(
+            language::RenameKind::Label,
+            "capitulo 2"
+        ));
     }
 
     #[cfg(unix)]

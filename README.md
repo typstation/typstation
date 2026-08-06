@@ -20,6 +20,11 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
   command, to reveal the editor cursor in the rendered page.
 - Typst errors and warnings attached to their source ranges, including errors
   in imported project files and navigation from the Problems panel.
+- Typst-aware completion and snippets, semantic hover documentation, go to
+  definition, scoped references, project-wide symbol rename, and Typstyle
+  document formatting in a dedicated language worker.
+- Snippet placeholders tracked by edit-resistant anchors and navigated with
+  Tab or Shift+Tab.
 - Selection formatting for strong emphasis, emphasis, underline, bullet lists,
   and numbered lists.
 - New, Open, Save, Save As, Save All, and optional autosave operations using
@@ -79,6 +84,7 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
 - [x] Search and replace across the project
 - [x] Save all, autosave, recent projects, and complete tab shortcuts
 - [x] Navigate and manipulate the project tree with the keyboard
+- [x] Add Typst-aware editing intelligence and syntax formatting
 
 ## Building
 

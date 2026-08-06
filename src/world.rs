@@ -32,6 +32,7 @@ pub struct TypstationWorld {
     source: Option<Source>,
     bytes: Option<Bytes>,
     overlays: HashMap<FileId, MemoryFile>,
+    known_files: Vec<FileId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +77,7 @@ impl TypstationWorld {
             source: Some(Source::new(main, String::new())),
             bytes: Some(Bytes::from_string(String::new())),
             overlays: HashMap::new(),
+            known_files: vec![main],
         }
     }
 
@@ -145,6 +147,28 @@ impl TypstationWorld {
         self.files.reset();
     }
 
+    /// Replaces the project file list exposed to IDE path completion.
+    pub fn set_known_files(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        let mut files = paths
+            .into_iter()
+            .filter_map(|path| self.project_file_id(&path))
+            .collect::<Vec<_>>();
+        files.push(self.main);
+        let mut seen = std::collections::HashSet::new();
+        files.retain(|id| seen.insert(*id));
+        self.known_files = files;
+    }
+
+    /// Returns the Typst file ID for an absolute path inside the project root.
+    pub fn project_file_id(&self, path: &std::path::Path) -> Option<FileId> {
+        let vpath = VirtualPath::virtualize(&self.root, path).ok()?;
+        Some(RootedPath::new(VirtualRoot::Project, vpath).intern())
+    }
+
+    pub fn main_id(&self) -> FileId {
+        self.main
+    }
+
     /// Resolves a Typst diagnostic span to its source file and byte range.
     pub fn span_range(&self, span: DiagSpan) -> Option<(FileId, Range<usize>)> {
         match span.get() {
@@ -167,6 +191,16 @@ impl TypstationWorld {
         matches!(id.root(), VirtualRoot::Project)
             .then(|| id.vpath().realize(self.root.as_path()).ok())
             .flatten()
+    }
+}
+
+impl typst_ide::IdeWorld for TypstationWorld {
+    fn upcast(&self) -> &dyn World {
+        self
+    }
+
+    fn files(&self) -> Vec<FileId> {
+        self.known_files.clone()
     }
 }
 
