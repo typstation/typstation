@@ -12,7 +12,8 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
 - A reusable `World` implementation for the Typst compiler, built on
   [`typst-kit`](https://crates.io/crates/typst-kit).
 - An [Iced](https://iced.rs) interface with movable project, editor, and preview panes.
-- Debounced live compilation in a persistent background worker.
+- Debounced live compilation in a persistent background worker that coalesces
+  stale preview requests without dropping exports.
 - A scrollable SVG preview with separate pages and persistent zoom controls.
 - Bidirectional source navigation: click the preview to reveal its Typst source,
   or use the platform command modifier with click/J, or the preview's Locate
@@ -21,16 +22,19 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
   in imported project files and navigation from the Problems panel.
 - Selection formatting for strong emphasis, emphasis, underline, bullet lists,
   and numbered lists.
-- New, Open, Save, and Save As operations using native file dialogs.
+- New, Open, Save, Save As, Save All, and optional autosave operations using
+  native file dialogs and atomic writes.
 - Keyboard shortcuts for file operations and inline formatting.
 - Atomic document replacement that preserves existing file permissions and
   symbolic links.
-- PDF export from the current editor snapshot using the persistent compiler
-  worker.
+- PDF, SVG, and experimental HTML export from the current editor snapshot.
 - Unicode-aware search and replace with match navigation, whole-word and case
   options, and single-step undo for Replace All.
+- Project-wide search and replace with navigation to file, line, and column.
 - A recursive Typst project tree, multiple document tabs, and create, rename,
   and delete operations for project files.
+- Keyboard tree navigation plus move, duplicate, and copy-path operations.
+- Tab cycling, reordering, reopening, recent projects, and drag-and-drop opening.
 - A persistent project main document: edit imported files while the preview and
   PDF export continue compiling the selected entry point.
 - Unsaved open imports compiled as in-memory overlays, without writing them to
@@ -71,6 +75,10 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
 - [x] Navigate bidirectionally between source text and preview regions
 - [x] Keep a persistent project main document while editing imports
 - [x] Keep the project tree inside the movable, persistent pane grid
+- [x] Coalesce obsolete preview compilation requests
+- [x] Search and replace across the project
+- [x] Save all, autosave, recent projects, and complete tab shortcuts
+- [x] Navigate and manipulate the project tree with the keyboard
 
 ## Building
 

@@ -3,6 +3,7 @@ mod display;
 mod document;
 mod formatting;
 mod project;
+mod project_search;
 mod search;
 mod session;
 mod settings;
@@ -42,6 +43,8 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 const DEBOUNCE_TICK: Duration = Duration::from_millis(50);
 const SESSION_DEBOUNCE: Duration = Duration::from_millis(750);
 const SESSION_TICK: Duration = Duration::from_millis(200);
+const AUTO_SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+const AUTO_SAVE_TICK: Duration = Duration::from_millis(250);
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(150);
 const WATCHER_TICK: Duration = Duration::from_millis(50);
 const PREVIEW_PADDING: f32 = 12.0;
@@ -125,10 +128,12 @@ struct App {
     search: SearchState,
     search_input_id: Id,
     project_navigation: ProjectNavigation,
+    project_search: ProjectSearchState,
     project_tree: Vec<project::ProjectEntry>,
     expanded_project_directories: HashSet<PathBuf>,
     selected_project_entry: Option<PathBuf>,
     selected_project_file: Option<PathBuf>,
+    project_tree_focused: bool,
     document_outline: Vec<compiler::DocumentOutlineItem>,
     collapsed_outline_entries: HashSet<OutlineKey>,
     diagnostics: Vec<compiler::ReportedDiagnostic>,
@@ -138,6 +143,11 @@ struct App {
     external_check_busy: bool,
     watcher_deadline: Option<Instant>,
     discarded_on_close: HashSet<DocumentId>,
+    discarded_tabs: HashSet<DocumentId>,
+    closed_documents: Vec<session::Document>,
+    recent_projects: Vec<PathBuf>,
+    auto_save_deadline: Option<Instant>,
+    auto_save_busy: bool,
     session: SessionTracker,
     settings: settings::Settings,
     settings_page: SettingsPage,
@@ -205,6 +215,7 @@ enum Message {
     TabWidthChanged(u16),
     AutoPairsChanged(bool),
     AutoIndentChanged(bool),
+    AutoSaveChanged(bool),
     WrapLinesChanged(bool),
     ShowGutterChanged(bool),
     EditorFontSizeChanged(u16),
@@ -228,6 +239,7 @@ enum Message {
     PreviewClicked(usize),
     ModifiersChanged(keyboard::Modifiers),
     OpenSearch,
+    OpenProjectSearch,
     OpenReplace,
     CloseSearch,
     ToggleReplace,
@@ -240,12 +252,25 @@ enum Message {
     ReplaceCurrent,
     ReplaceAll,
     ActivateDocument(DocumentId),
+    ActivateRelativeDocument(bool),
+    MoveActiveDocument(bool),
+    ReopenClosedDocument,
+    CloseActiveDocument,
     CloseDocument(DocumentId),
     NewDocument,
     OpenDocument,
     OpenProject,
     ProjectNavigationSelected(ProjectNavigation),
     OpenProblems,
+    ProjectSearchQueryChanged(String),
+    ProjectSearchReplacementChanged(String),
+    ProjectSearchCaseChanged(bool),
+    ProjectSearchWholeWordChanged(bool),
+    ProjectSearchToggleReplace,
+    ProjectSearchFinished(project_search::SearchOutcome),
+    ProjectSearchResultPressed(PathBuf, Range<usize>),
+    ProjectReplaceAll,
+    ProjectReplaceFinished(project_search::ReplaceOutcome),
     DocumentOutlinePressed {
         target: source_map::SourceTarget,
         range: Range<usize>,
@@ -253,6 +278,8 @@ enum Message {
     },
     ProjectEntryPressed(PathBuf, project::EntryKind),
     ProjectEntryContextRequested(PathBuf, project::EntryKind),
+    ProjectTreeNavigate(TreeNavigation),
+    FileDropped(window::Id, PathBuf),
     CreateProjectFile,
     CreateProjectDirectory,
     RefreshProjectTree,
@@ -269,6 +296,10 @@ enum Message {
     SessionWriteFinished(SessionWriteOutcome),
     SaveDocument,
     SaveDocumentAs,
+    SaveAllDocuments,
+    SaveAllFinished(Vec<SaveOutcome>),
+    AutoSaveTick(Instant),
+    AutoSaveFinished(Vec<SaveOutcome>),
     Export(compiler::ExportFormat),
     ToggleExportMenu,
     ToggleMenu(AppMenu),
@@ -346,12 +377,18 @@ enum MenuCommand {
     OpenProject,
     SaveDocument,
     SaveDocumentAs,
+    SaveAllDocuments,
     Export(compiler::ExportFormat),
     CloseDocument(DocumentId),
     Exit,
     Editor(Action),
     OpenSearch,
+    OpenProjectSearch,
     OpenReplace,
+    ActivateRelativeDocument(bool),
+    MoveActiveDocument(bool),
+    ReopenClosedDocument,
+    OpenRecentProject(PathBuf),
     ToggleSettings,
     OpenExportSettings,
     ShowGutter(bool),
@@ -366,6 +403,9 @@ enum MenuCommand {
     CreateProjectFileAt(PathBuf),
     CreateProjectDirectoryAt(PathBuf),
     RenameProjectEntry(PathBuf, project::EntryKind),
+    MoveProjectEntry(PathBuf, project::EntryKind),
+    DuplicateProjectEntry(PathBuf, project::EntryKind),
+    CopyProjectPath(PathBuf),
     DeleteProjectEntry(PathBuf, project::EntryKind),
     SetProjectMain(PathBuf),
     ClearProjectMain,
@@ -375,7 +415,7 @@ enum MenuCommand {
 #[derive(Debug, Clone)]
 enum AppMenuEntry {
     Item {
-        label: &'static str,
+        label: String,
         value: Option<String>,
         selected: bool,
         enabled: bool,
@@ -386,14 +426,14 @@ enum AppMenuEntry {
 
 impl AppMenuEntry {
     fn item(
-        label: &'static str,
+        label: impl Into<String>,
         value: Option<String>,
         selected: bool,
         enabled: bool,
         command: MenuCommand,
     ) -> Self {
         Self::Item {
-            label,
+            label: label.into(),
             value,
             selected,
             enabled,
@@ -433,14 +473,27 @@ impl SettingsPage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectNavigation {
     Files,
+    Search,
     Topics,
     Problems,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeNavigation {
+    Previous,
+    Next,
+    ParentOrCollapse,
+    ChildOrExpand,
+    First,
+    Last,
+    Activate,
 }
 
 impl ProjectNavigation {
     const fn title(self) -> &'static str {
         match self {
             Self::Files => "Arquivos",
+            Self::Search => "Busca",
             Self::Topics => "Sumário",
             Self::Problems => "Problemas",
         }
@@ -504,6 +557,22 @@ struct SearchState {
     whole_word: bool,
 }
 
+#[derive(Debug, Default)]
+struct ProjectSearchState {
+    query: String,
+    replacement: String,
+    case_sensitive: bool,
+    whole_word: bool,
+    replace_visible: bool,
+    revision: u64,
+    busy: bool,
+    results: Vec<project_search::Match>,
+    skipped_files: usize,
+    error: Option<String>,
+    pending_replaced: usize,
+    pending_changed_files: usize,
+}
+
 enum PreviewStatus {
     Waiting,
     Compiling,
@@ -557,6 +626,15 @@ enum SaveOutcome {
         document_id: DocumentId,
         error: String,
     },
+}
+
+#[derive(Debug, Clone)]
+struct SaveRequest {
+    document_id: DocumentId,
+    path: Option<PathBuf>,
+    directory: PathBuf,
+    file_name: String,
+    source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -660,6 +738,7 @@ impl App {
         session_path: Option<PathBuf>,
         preview_logical_ppi: f32,
     ) -> Self {
+        let recent_projects = stored.recent_projects.clone();
         let documents = stored
             .documents
             .into_iter()
@@ -677,6 +756,7 @@ impl App {
             stored.settings,
             "Sessão anterior restaurada".to_owned(),
         );
+        app.recent_projects = recent_projects;
         app.preview_logical_ppi = preview_logical_ppi;
         app
     }
@@ -717,10 +797,12 @@ impl App {
             search: SearchState::default(),
             search_input_id: Id::unique(),
             project_navigation: ProjectNavigation::Files,
+            project_search: ProjectSearchState::default(),
             project_tree: Vec::new(),
             expanded_project_directories,
             selected_project_entry: None,
             selected_project_file: None,
+            project_tree_focused: false,
             document_outline: Vec::new(),
             collapsed_outline_entries: HashSet::new(),
             diagnostics: Vec::new(),
@@ -730,6 +812,11 @@ impl App {
             external_check_busy: false,
             watcher_deadline: None,
             discarded_on_close: HashSet::new(),
+            discarded_tabs: HashSet::new(),
+            closed_documents: Vec::new(),
+            recent_projects: Vec::new(),
+            auto_save_deadline: None,
+            auto_save_busy: false,
             session: SessionTracker::new(session_path),
             settings: settings.validate(),
             settings_page: SettingsPage::Editor,
@@ -873,6 +960,7 @@ impl App {
                 Task::none()
             }
             Message::Editor(action) => {
+                self.project_tree_focused = false;
                 if action.is_edit() && self.file_busy {
                     return Task::none();
                 }
@@ -969,6 +1057,14 @@ impl App {
             Message::AutoIndentChanged(auto_indent) => {
                 self.settings.auto_indent = auto_indent;
                 self.settings_changed(true);
+                Task::none()
+            }
+            Message::AutoSaveChanged(auto_save) => {
+                self.settings.auto_save = auto_save;
+                self.auto_save_deadline = auto_save
+                    .then(|| Instant::now() + AUTO_SAVE_DEBOUNCE)
+                    .filter(|_| self.has_auto_save_documents());
+                self.settings_changed(false);
                 Task::none()
             }
             Message::WrapLinesChanged(wrap_lines) => {
@@ -1132,6 +1228,28 @@ impl App {
                 }
                 Task::none()
             }
+            Message::ActivateRelativeDocument(reverse) => {
+                if !self.file_busy {
+                    self.activate_relative_document(reverse);
+                }
+                Task::none()
+            }
+            Message::MoveActiveDocument(reverse) => {
+                if !self.file_busy && self.document.move_active(reverse) {
+                    self.mark_session_changed();
+                    self.file_status = Some("Aba reordenada".to_owned());
+                }
+                Task::none()
+            }
+            Message::ReopenClosedDocument => {
+                if !self.file_busy {
+                    self.reopen_closed_document();
+                }
+                Task::none()
+            }
+            Message::CloseActiveDocument => self.request_destructive_action(
+                DestructiveFileAction::CloseDocument(self.document.active_id()),
+            ),
             Message::CloseDocument(id) => {
                 self.request_destructive_action(DestructiveFileAction::CloseDocument(id))
             }
@@ -1156,6 +1274,47 @@ impl App {
                 }
                 Task::none()
             }
+            Message::OpenProjectSearch => {
+                self.project_navigation = ProjectNavigation::Search;
+                self.project_context_menu = None;
+                if !self.project_pane_visible() {
+                    self.toggle_project_pane();
+                }
+                self.start_project_search()
+            }
+            Message::ProjectSearchQueryChanged(query) => {
+                self.project_search.query = query;
+                self.start_project_search()
+            }
+            Message::ProjectSearchReplacementChanged(replacement) => {
+                self.project_search.replacement = replacement;
+                Task::none()
+            }
+            Message::ProjectSearchCaseChanged(case_sensitive) => {
+                self.project_search.case_sensitive = case_sensitive;
+                self.start_project_search()
+            }
+            Message::ProjectSearchWholeWordChanged(whole_word) => {
+                self.project_search.whole_word = whole_word;
+                self.start_project_search()
+            }
+            Message::ProjectSearchToggleReplace => {
+                self.project_search.replace_visible = !self.project_search.replace_visible;
+                Task::none()
+            }
+            Message::ProjectSearchFinished(outcome) => {
+                self.handle_project_search_finished(outcome);
+                Task::none()
+            }
+            Message::ProjectSearchResultPressed(path, range) => self.reveal_source_target(
+                source_map::SourceTarget::ProjectFile(path),
+                range,
+                "Resultado da busca revelado no editor",
+            ),
+            Message::ProjectReplaceAll => self.replace_all_project_matches(),
+            Message::ProjectReplaceFinished(outcome) => {
+                self.handle_project_replace_finished(outcome)
+            }
             Message::DocumentOutlinePressed {
                 target,
                 range,
@@ -1163,8 +1322,17 @@ impl App {
             } => self.document_outline_pressed(target, range, has_children),
             Message::ProjectEntryPressed(path, kind) => self.project_entry_pressed(path, kind),
             Message::ProjectEntryContextRequested(path, kind) => {
+                self.project_tree_focused = true;
                 self.show_project_context_menu(path, kind);
                 Task::none()
+            }
+            Message::ProjectTreeNavigate(navigation) => self.navigate_project_tree(navigation),
+            Message::FileDropped(window, path) => {
+                if window == self.main_window {
+                    self.handle_file_dropped(path)
+                } else {
+                    Task::none()
+                }
             }
             Message::CreateProjectFile => self.start_create_project_file(),
             Message::CreateProjectDirectory => self.start_create_project_directory(),
@@ -1277,6 +1445,10 @@ impl App {
                 self.pending_after_save = None;
                 self.start_save(true)
             }
+            Message::SaveAllDocuments => self.start_save_all(),
+            Message::SaveAllFinished(outcomes) => self.handle_save_all_finished(outcomes, false),
+            Message::AutoSaveTick(now) => self.dispatch_auto_save(now),
+            Message::AutoSaveFinished(outcomes) => self.handle_save_all_finished(outcomes, true),
             Message::Export(format) => {
                 self.export_menu_visible = false;
                 self.start_export(format)
@@ -1307,6 +1479,9 @@ impl App {
                     }
                     UnsavedDecision::Discard => {
                         self.pending_after_save = None;
+                        if let DestructiveFileAction::CloseDocument(id) = action {
+                            self.discarded_tabs.insert(id);
+                        }
                         self.discard_destructive_action(action)
                     }
                     UnsavedDecision::Cancel => {
@@ -1338,19 +1513,28 @@ impl App {
         };
         let watcher = watcher::subscription(self.workspace_root.clone()).map(Message::Watcher);
         let menu_bar_pointer = menu_bar_pointer_subscription();
+        let file_drop = file_drop_subscription();
         let mut subscriptions = vec![
             compiler,
             close_requests,
             shortcuts,
             watcher,
             menu_bar_pointer,
+            file_drop,
         ];
+
+        if self.project_tree_focused && self.project_navigation == ProjectNavigation::Files {
+            subscriptions.push(project_tree_keyboard_subscription());
+        }
 
         if self.pending_compile.is_some() {
             subscriptions.push(time::every(DEBOUNCE_TICK).map(Message::DebounceTick));
         }
         if self.session.deadline.is_some() {
             subscriptions.push(time::every(SESSION_TICK).map(Message::SessionTick));
+        }
+        if self.auto_save_deadline.is_some() {
+            subscriptions.push(time::every(AUTO_SAVE_TICK).map(Message::AutoSaveTick));
         }
         if self.watcher_deadline.is_some() {
             subscriptions.push(time::every(WATCHER_TICK).map(Message::WatcherTick));
@@ -1465,12 +1649,24 @@ impl App {
             MenuCommand::OpenProject => self.update(Message::OpenProject),
             MenuCommand::SaveDocument => self.update(Message::SaveDocument),
             MenuCommand::SaveDocumentAs => self.update(Message::SaveDocumentAs),
+            MenuCommand::SaveAllDocuments => self.update(Message::SaveAllDocuments),
             MenuCommand::Export(format) => self.update(Message::Export(format)),
             MenuCommand::CloseDocument(id) => self.update(Message::CloseDocument(id)),
             MenuCommand::Exit => self.update(Message::ExitApplication),
             MenuCommand::Editor(action) => self.update(Message::Editor(action)),
             MenuCommand::OpenSearch => self.update(Message::OpenSearch),
+            MenuCommand::OpenProjectSearch => self.update(Message::OpenProjectSearch),
             MenuCommand::OpenReplace => self.update(Message::OpenReplace),
+            MenuCommand::ActivateRelativeDocument(reverse) => {
+                self.update(Message::ActivateRelativeDocument(reverse))
+            }
+            MenuCommand::MoveActiveDocument(reverse) => {
+                self.update(Message::MoveActiveDocument(reverse))
+            }
+            MenuCommand::ReopenClosedDocument => self.update(Message::ReopenClosedDocument),
+            MenuCommand::OpenRecentProject(path) => {
+                self.update(Message::ProjectFolderSelected(Some(path)))
+            }
             MenuCommand::ToggleSettings => self.update(Message::OpenSettings),
             MenuCommand::OpenExportSettings => self.update(Message::OpenExportSettings),
             MenuCommand::ShowGutter(show) => self.update(Message::ShowGutterChanged(show)),
@@ -1505,6 +1701,14 @@ impl App {
             }
             MenuCommand::RenameProjectEntry(path, kind) => {
                 self.start_rename_project_entry(path, kind)
+            }
+            MenuCommand::MoveProjectEntry(path, kind) => self.start_move_project_entry(path, kind),
+            MenuCommand::DuplicateProjectEntry(path, kind) => {
+                self.start_duplicate_project_entry(path, kind)
+            }
+            MenuCommand::CopyProjectPath(path) => {
+                self.file_status = Some(format!("Caminho copiado: {}", path.display()));
+                iced::clipboard::write(path.to_string_lossy().into_owned())
             }
             MenuCommand::DeleteProjectEntry(path, kind) => {
                 self.start_delete_project_entry(path, kind)
@@ -1566,80 +1770,143 @@ impl App {
         let can_edit = !self.file_busy;
 
         match menu {
-            AppMenu::File => vec![
-                AppMenuEntry::item(
-                    "Novo documento",
-                    Some(command_shortcut("N")),
-                    false,
-                    !self.file_busy,
-                    MenuCommand::NewDocument,
-                ),
-                AppMenuEntry::item(
-                    "Abrir arquivo…",
-                    Some(command_shortcut("O")),
-                    false,
-                    !self.file_busy,
-                    MenuCommand::OpenDocument,
-                ),
-                AppMenuEntry::item(
-                    "Abrir projeto…",
-                    Some(command_shift_shortcut("O")),
-                    false,
-                    !self.file_busy,
-                    MenuCommand::OpenProject,
-                ),
-                AppMenuEntry::Divider,
-                AppMenuEntry::item(
-                    "Salvar",
-                    Some(command_shortcut("S")),
-                    false,
-                    !self.file_busy && self.document.is_dirty(),
-                    MenuCommand::SaveDocument,
-                ),
-                AppMenuEntry::item(
-                    "Salvar como…",
-                    Some(command_shift_shortcut("S")),
-                    false,
-                    !self.file_busy,
-                    MenuCommand::SaveDocumentAs,
-                ),
-                AppMenuEntry::item(
-                    "Exportar PDF…",
-                    None,
-                    false,
-                    !self.file_busy && self.compiler.is_some(),
-                    MenuCommand::Export(compiler::ExportFormat::Pdf),
-                ),
-                AppMenuEntry::item(
-                    "Exportar SVG…",
-                    None,
-                    false,
-                    !self.file_busy && self.compiler.is_some(),
-                    MenuCommand::Export(compiler::ExportFormat::Svg),
-                ),
-                AppMenuEntry::item(
-                    "Exportar HTML…",
-                    None,
-                    false,
-                    !self.file_busy && self.compiler.is_some(),
-                    MenuCommand::Export(compiler::ExportFormat::Html),
-                ),
-                AppMenuEntry::Divider,
-                AppMenuEntry::item(
-                    "Fechar documento",
-                    None,
-                    false,
-                    !self.file_busy,
-                    MenuCommand::CloseDocument(self.document.active_id()),
-                ),
-                AppMenuEntry::item(
-                    "Sair",
-                    Some(command_shortcut("Q")),
-                    false,
-                    true,
-                    MenuCommand::Exit,
-                ),
-            ],
+            AppMenu::File => {
+                let mut entries = vec![
+                    AppMenuEntry::item(
+                        "Novo documento",
+                        Some(command_shortcut("N")),
+                        false,
+                        !self.file_busy,
+                        MenuCommand::NewDocument,
+                    ),
+                    AppMenuEntry::item(
+                        "Abrir arquivo…",
+                        Some(command_shortcut("O")),
+                        false,
+                        !self.file_busy,
+                        MenuCommand::OpenDocument,
+                    ),
+                    AppMenuEntry::item(
+                        "Abrir projeto…",
+                        Some(command_shift_shortcut("O")),
+                        false,
+                        !self.file_busy,
+                        MenuCommand::OpenProject,
+                    ),
+                    AppMenuEntry::Divider,
+                    AppMenuEntry::item(
+                        "Salvar",
+                        Some(command_shortcut("S")),
+                        false,
+                        !self.file_busy && self.document.is_dirty(),
+                        MenuCommand::SaveDocument,
+                    ),
+                    AppMenuEntry::item(
+                        "Salvar como…",
+                        Some(command_shift_shortcut("S")),
+                        false,
+                        !self.file_busy,
+                        MenuCommand::SaveDocumentAs,
+                    ),
+                    AppMenuEntry::item(
+                        "Salvar tudo",
+                        Some(command_alt_shortcut("S")),
+                        false,
+                        !self.file_busy
+                            && self
+                                .document
+                                .iter()
+                                .any(|(_, document)| document.is_dirty()),
+                        MenuCommand::SaveAllDocuments,
+                    ),
+                    AppMenuEntry::item(
+                        "Exportar PDF…",
+                        None,
+                        false,
+                        !self.file_busy && self.compiler.is_some(),
+                        MenuCommand::Export(compiler::ExportFormat::Pdf),
+                    ),
+                    AppMenuEntry::item(
+                        "Exportar SVG…",
+                        None,
+                        false,
+                        !self.file_busy && self.compiler.is_some(),
+                        MenuCommand::Export(compiler::ExportFormat::Svg),
+                    ),
+                    AppMenuEntry::item(
+                        "Exportar HTML…",
+                        None,
+                        false,
+                        !self.file_busy && self.compiler.is_some(),
+                        MenuCommand::Export(compiler::ExportFormat::Html),
+                    ),
+                    AppMenuEntry::Divider,
+                    AppMenuEntry::item(
+                        "Fechar documento",
+                        Some(command_shortcut("W")),
+                        false,
+                        !self.file_busy,
+                        MenuCommand::CloseDocument(self.document.active_id()),
+                    ),
+                    AppMenuEntry::item(
+                        "Reabrir aba fechada",
+                        Some(command_shift_shortcut("T")),
+                        false,
+                        !self.file_busy && !self.closed_documents.is_empty(),
+                        MenuCommand::ReopenClosedDocument,
+                    ),
+                    AppMenuEntry::item(
+                        "Próxima aba",
+                        Some("Ctrl+Tab".to_owned()),
+                        false,
+                        !self.file_busy && self.document.len() > 1,
+                        MenuCommand::ActivateRelativeDocument(false),
+                    ),
+                    AppMenuEntry::item(
+                        "Aba anterior",
+                        Some("Ctrl+Shift+Tab".to_owned()),
+                        false,
+                        !self.file_busy && self.document.len() > 1,
+                        MenuCommand::ActivateRelativeDocument(true),
+                    ),
+                    AppMenuEntry::item(
+                        "Mover aba para a esquerda",
+                        Some("Ctrl+Shift+PageUp".to_owned()),
+                        false,
+                        !self.file_busy && self.document.active_index() > 0,
+                        MenuCommand::MoveActiveDocument(true),
+                    ),
+                    AppMenuEntry::item(
+                        "Mover aba para a direita",
+                        Some("Ctrl+Shift+PageDown".to_owned()),
+                        false,
+                        !self.file_busy && self.document.active_index() + 1 < self.document.len(),
+                        MenuCommand::MoveActiveDocument(false),
+                    ),
+                    AppMenuEntry::item(
+                        "Sair",
+                        Some(command_shortcut("Q")),
+                        false,
+                        true,
+                        MenuCommand::Exit,
+                    ),
+                ];
+                if !self.recent_projects.is_empty() {
+                    let mut recent = vec![AppMenuEntry::Divider];
+                    recent.extend(self.recent_projects.iter().take(5).cloned().map(|path| {
+                        let label = format!("Projeto recente: {}", path.display());
+                        AppMenuEntry::item(
+                            label,
+                            None,
+                            false,
+                            !self.file_busy && path.is_dir(),
+                            MenuCommand::OpenRecentProject(path),
+                        )
+                    }));
+                    entries.splice(3..3, recent);
+                }
+                entries
+            }
             AppMenu::Edit => vec![
                 AppMenuEntry::item(
                     "Desfazer",
@@ -1662,6 +1929,13 @@ impl App {
                     false,
                     true,
                     MenuCommand::OpenSearch,
+                ),
+                AppMenuEntry::item(
+                    "Buscar no projeto…",
+                    Some(command_shift_shortcut("F")),
+                    false,
+                    true,
+                    MenuCommand::OpenProjectSearch,
                 ),
                 AppMenuEntry::item(
                     "Substituir…",
@@ -1912,6 +2186,31 @@ impl App {
                     MenuCommand::DeleteProjectEntry(context.path.clone(), context.kind),
                 ));
             }
+        }
+
+        entries.push(AppMenuEntry::Divider);
+        entries.push(AppMenuEntry::item(
+            "Copiar caminho",
+            None,
+            false,
+            enabled,
+            MenuCommand::CopyProjectPath(context.path.clone()),
+        ));
+        if !is_root {
+            entries.push(AppMenuEntry::item(
+                "Duplicar",
+                None,
+                false,
+                enabled,
+                MenuCommand::DuplicateProjectEntry(context.path.clone(), context.kind),
+            ));
+            entries.push(AppMenuEntry::item(
+                "Mover para…",
+                None,
+                false,
+                enabled,
+                MenuCommand::MoveProjectEntry(context.path.clone(), context.kind),
+            ));
         }
 
         entries.push(AppMenuEntry::Divider);
@@ -2572,6 +2871,11 @@ impl App {
                     self.settings.show_gutter,
                     Message::ShowGutterChanged,
                 ),
+                ui::spectrum_checkbox(
+                    "Salvar automaticamente arquivos já nomeados",
+                    self.settings.auto_save,
+                    Message::AutoSaveChanged,
+                ),
             ]
             .spacing(16)
             .into(),
@@ -2795,6 +3099,14 @@ impl App {
             )
             .selected(self.project_navigation == ProjectNavigation::Files),
             ui::SideNavigationItem::new(
+                "Buscar no projeto",
+                ui::WorkflowIcon::Search,
+                Some(Message::ProjectNavigationSelected(
+                    ProjectNavigation::Search,
+                )),
+            )
+            .selected(self.project_navigation == ProjectNavigation::Search),
+            ui::SideNavigationItem::new(
                 "Sumário",
                 ui::WorkflowIcon::TextBulleted,
                 Some(Message::ProjectNavigationSelected(
@@ -2819,6 +3131,7 @@ impl App {
             .style(project_navigation_divider_style);
         let panel = match self.project_navigation {
             ProjectNavigation::Files => self.project_files_view(),
+            ProjectNavigation::Search => self.project_search_view(),
             ProjectNavigation::Topics => self.document_outline_view(),
             ProjectNavigation::Problems => self.problems_view(),
         };
@@ -2867,6 +3180,124 @@ impl App {
             ui::TreeView::new(vec![self.project_tree_root_item()]).into();
 
         container(scrollable(tree)).width(Fill).height(Fill).into()
+    }
+
+    fn project_search_view(&self) -> Element<'_, Message> {
+        let query = ui::spectrum_text_field(
+            "Buscar em todos os arquivos",
+            &self.project_search.query,
+            Message::ProjectSearchQueryChanged,
+            None,
+            Fill,
+        );
+        let case_sensitive = ui::icon_action_button(
+            "Aa",
+            "Diferenciar maiúsculas de minúsculas",
+            Some(Message::ProjectSearchCaseChanged(
+                !self.project_search.case_sensitive,
+            )),
+            ui::ActionButtonOptions::QUIET.selected(self.project_search.case_sensitive),
+        );
+        let whole_word = ui::icon_action_button(
+            "ab",
+            "Corresponder palavra inteira",
+            Some(Message::ProjectSearchWholeWordChanged(
+                !self.project_search.whole_word,
+            )),
+            ui::ActionButtonOptions::QUIET.selected(self.project_search.whole_word),
+        );
+        let replace_toggle = ui::workflow_icon_action_button(
+            ui::WorkflowIcon::FindAndReplace,
+            "Mostrar substituição no projeto",
+            Some(Message::ProjectSearchToggleReplace),
+            ui::ActionButtonOptions::QUIET.selected(self.project_search.replace_visible),
+        );
+        let summary = if self.project_search.busy {
+            "Buscando...".to_owned()
+        } else if let Some(error) = self.project_search.error.as_deref() {
+            format!("Erro: {}", truncate(error, 100))
+        } else {
+            let count = self.project_search.results.len();
+            let skipped = self.project_search.skipped_files;
+            if skipped == 0 {
+                format!("{count} resultado(s)")
+            } else {
+                format!("{count} resultado(s), {skipped} arquivo(s) ignorado(s)")
+            }
+        };
+        let mut header = column![
+            query,
+            row![case_sensitive, whole_word, replace_toggle]
+                .align_y(Alignment::Center)
+                .spacing(ui::tokens::spacing::SEARCH_PANEL_CONTROL_GAP),
+        ]
+        .spacing(ui::tokens::spacing::SEARCH_PANEL_ROW_GAP);
+
+        if self.project_search.replace_visible {
+            let replacement = ui::spectrum_text_field(
+                "Substituir por",
+                &self.project_search.replacement,
+                Message::ProjectSearchReplacementChanged,
+                None,
+                Fill,
+            );
+            let replace = ui::spectrum_button(
+                "Substituir todos",
+                (!self.file_busy && !self.project_search.results.is_empty())
+                    .then_some(Message::ProjectReplaceAll),
+                ui::ButtonOptions::PRIMARY,
+            );
+            header = header
+                .push(replacement)
+                .push(row![Space::new().width(Fill), replace]);
+        }
+
+        let header = container(header)
+            .width(Fill)
+            .padding(ui::tokens::spacing::SEARCH_PANEL_EDGE_TO_CONTENT)
+            .style(search_panel_style);
+        let mut results = column![
+            container(
+                text(summary)
+                    .size(ui::tokens::typography::FONT_SIZE_75)
+                    .style(search_metadata_text_style),
+            )
+            .width(Fill)
+            .padding([8, 10])
+        ];
+
+        for found in &self.project_search.results {
+            let path = found
+                .path
+                .strip_prefix(&self.workspace_root)
+                .unwrap_or(&found.path)
+                .to_string_lossy();
+            let location = format!("{path}:{}:{}", found.line, found.column);
+            let content = column![
+                text(location)
+                    .size(ui::tokens::typography::FONT_SIZE_75)
+                    .wrapping(text::Wrapping::None),
+                text(found.excerpt.clone())
+                    .size(ui::tokens::typography::FONT_SIZE_75)
+                    .wrapping(text::Wrapping::None),
+            ]
+            .spacing(2);
+            results = results.push(
+                iced::widget::button(content)
+                    .on_press(Message::ProjectSearchResultPressed(
+                        found.path.clone(),
+                        found.range.clone(),
+                    ))
+                    .width(Fill)
+                    .padding([7, 10])
+                    .style(project_search_result_style),
+            );
+        }
+
+        column![header, scrollable(results).width(Fill).height(Fill)]
+            .width(Fill)
+            .height(Fill)
+            .into()
     }
 
     fn problems_view(&self) -> Element<'_, Message> {
@@ -3417,6 +3848,55 @@ impl App {
         true
     }
 
+    fn activate_relative_document(&mut self, reverse: bool) -> bool {
+        let previous_config = self.compiler_config();
+        self.document.clear_search_matches();
+        if !self.document.activate_relative(reverse) {
+            return false;
+        }
+
+        if let Some(path) = self
+            .document
+            .path()
+            .filter(|path| path.starts_with(&self.workspace_root))
+            .map(Path::to_path_buf)
+        {
+            self.reveal_project_entry(&path);
+            self.selected_project_file = Some(path);
+        }
+        if self.project_main.is_some() {
+            self.active_document_replaced();
+        } else {
+            self.document_replaced(previous_config);
+        }
+        true
+    }
+
+    fn reopen_closed_document(&mut self) {
+        let Some(stored) = self.closed_documents.pop() else {
+            self.file_status = Some("Não há abas fechadas para reabrir".to_owned());
+            return;
+        };
+        let previous_config = self.compiler_config();
+        let reopened = Document::restored(stored.path, stored.text, stored.saved_text);
+        let replace_blank = self.document.len() == 1
+            && self.document.path().is_none()
+            && !self.document.is_dirty()
+            && self.document.snapshot().1.is_empty();
+        if replace_blank {
+            *self.document.active_mut() = reopened;
+        } else {
+            self.document.add(reopened);
+        }
+        self.apply_editor_settings();
+        self.file_status = Some(format!("Aba reaberta: {}", self.document.display_name()));
+        if self.project_main.is_some() {
+            self.active_document_replaced();
+        } else {
+            self.document_replaced(previous_config);
+        }
+    }
+
     fn new_document(&mut self) {
         let previous_config = self.compiler_config();
         self.document.clear_search_matches();
@@ -3447,7 +3927,31 @@ impl App {
         };
         let previous_config = affects_compilation.then(|| self.compiler_config());
 
+        let discarded = self.discarded_tabs.remove(&id);
+        let closed = if discarded {
+            match (document.path(), document.saved_text()) {
+                (Some(path), Some(saved_text)) => Some(session::Document {
+                    path: Some(path.to_path_buf()),
+                    text: saved_text.to_owned(),
+                    saved_text: Some(saved_text.to_owned()),
+                }),
+                _ => None,
+            }
+        } else {
+            Some(session::Document {
+                path: document.path().map(Path::to_path_buf),
+                text: document.snapshot().1,
+                saved_text: document.saved_text().map(str::to_owned),
+            })
+        };
+
         self.document.remove(id);
+        if let Some(closed) = closed {
+            self.closed_documents.push(closed);
+            if self.closed_documents.len() > 20 {
+                self.closed_documents.remove(0);
+            }
+        }
         self.discarded_on_close.remove(&id);
         self.file_status = Some(format!("Aba fechada: {name}"));
 
@@ -3503,6 +4007,10 @@ impl App {
         let previous_config = self.compiler_config();
         let project_changed = self.workspace_root != path;
         self.workspace_root = path;
+        self.recent_projects
+            .retain(|recent| recent != &self.workspace_root);
+        self.recent_projects.insert(0, self.workspace_root.clone());
+        self.recent_projects.truncate(10);
         if project_changed {
             self.project_main = None;
         }
@@ -3527,6 +4035,7 @@ impl App {
             return Task::none();
         }
 
+        self.project_tree_focused = true;
         self.selected_project_entry = Some(path.clone());
         match kind {
             project::EntryKind::Directory => {
@@ -3565,6 +4074,119 @@ impl App {
                 Task::none()
             }
         }
+    }
+
+    fn navigate_project_tree(&mut self, navigation: TreeNavigation) -> Task<Message> {
+        if self.file_busy || self.project_navigation != ProjectNavigation::Files {
+            return Task::none();
+        }
+        let entries = self.visible_project_entries();
+        if entries.is_empty() {
+            return Task::none();
+        }
+        let current = self
+            .selected_project_entry
+            .as_ref()
+            .and_then(|selected| entries.iter().position(|(path, _)| path == selected))
+            .unwrap_or(0);
+
+        match navigation {
+            TreeNavigation::Activate => {
+                let (path, kind) = entries[current].clone();
+                return self.project_entry_pressed(path, kind);
+            }
+            TreeNavigation::ParentOrCollapse => {
+                let (path, kind) = &entries[current];
+                if *kind == project::EntryKind::Directory
+                    && self.expanded_project_directories.remove(path)
+                {
+                    return Task::none();
+                }
+                let parent = path
+                    .parent()
+                    .filter(|parent| parent.starts_with(&self.workspace_root))
+                    .unwrap_or(&self.workspace_root);
+                if let Some(index) = entries.iter().position(|(path, _)| path == parent) {
+                    self.select_project_tree_entry(&entries[index]);
+                }
+                return Task::none();
+            }
+            TreeNavigation::ChildOrExpand => {
+                let (path, kind) = &entries[current];
+                if *kind != project::EntryKind::Directory {
+                    return Task::none();
+                }
+                if self.expanded_project_directories.insert(path.clone()) {
+                    return Task::none();
+                }
+                if let Some(child) = entries
+                    .get(current + 1)
+                    .filter(|(child, _)| child.parent().is_some_and(|parent| parent == path))
+                {
+                    self.select_project_tree_entry(child);
+                }
+                return Task::none();
+            }
+            TreeNavigation::Previous
+            | TreeNavigation::Next
+            | TreeNavigation::First
+            | TreeNavigation::Last => {}
+        }
+
+        let target = match navigation {
+            TreeNavigation::Previous => current.saturating_sub(1),
+            TreeNavigation::Next => (current + 1).min(entries.len() - 1),
+            TreeNavigation::First => 0,
+            TreeNavigation::Last => entries.len() - 1,
+            TreeNavigation::ParentOrCollapse
+            | TreeNavigation::ChildOrExpand
+            | TreeNavigation::Activate => unreachable!(),
+        };
+        self.select_project_tree_entry(&entries[target]);
+        Task::none()
+    }
+
+    fn visible_project_entries(&self) -> Vec<(PathBuf, project::EntryKind)> {
+        let mut entries = vec![(self.workspace_root.clone(), project::EntryKind::Directory)];
+        if self
+            .expanded_project_directories
+            .contains(&self.workspace_root)
+        {
+            append_visible_project_entries(
+                &self.project_tree,
+                &self.expanded_project_directories,
+                &mut entries,
+            );
+        }
+        entries
+    }
+
+    fn select_project_tree_entry(&mut self, entry: &(PathBuf, project::EntryKind)) {
+        self.project_tree_focused = true;
+        self.selected_project_entry = Some(entry.0.clone());
+        self.selected_project_file =
+            (entry.1 == project::EntryKind::TypstFile).then(|| entry.0.clone());
+    }
+
+    fn handle_file_dropped(&mut self, path: PathBuf) -> Task<Message> {
+        if self.file_busy {
+            return Task::none();
+        }
+        if path.is_dir() {
+            return self.update(Message::ProjectFolderSelected(Some(path)));
+        }
+        if path.extension().is_some_and(|extension| extension == "typ") {
+            if path.starts_with(&self.workspace_root) {
+                self.reveal_project_entry(&path);
+                return self.open_project_file(path);
+            }
+            self.file_busy = true;
+            self.file_status = Some(format!("Abrindo arquivo solto: {}", path.display()));
+            return Task::perform(read_document(path), Message::OpenFinished);
+        }
+
+        self.file_status = Some("Solte uma pasta ou um arquivo .typ para abri-lo".to_owned());
+        Task::none()
     }
 
     fn open_project_file(&mut self, path: PathBuf) -> Task<Message> {
@@ -3708,6 +4330,38 @@ impl App {
         )
     }
 
+    fn start_move_project_entry(
+        &mut self,
+        path: PathBuf,
+        kind: project::EntryKind,
+    ) -> Task<Message> {
+        if self.file_busy || path == self.workspace_root {
+            return Task::none();
+        }
+        self.file_busy = true;
+        self.file_status = Some(format!("Escolha o destino de {}...", path.display()));
+        Task::perform(
+            project::move_entry(self.workspace_root.clone(), path, kind),
+            Message::ProjectOperationFinished,
+        )
+    }
+
+    fn start_duplicate_project_entry(
+        &mut self,
+        path: PathBuf,
+        kind: project::EntryKind,
+    ) -> Task<Message> {
+        if self.file_busy || path == self.workspace_root {
+            return Task::none();
+        }
+        self.file_busy = true;
+        self.file_status = Some(format!("Duplicando {}...", path.display()));
+        Task::perform(
+            project::duplicate_entry(self.workspace_root.clone(), path, kind),
+            Message::ProjectOperationFinished,
+        )
+    }
+
     fn start_delete_project_entry(
         &mut self,
         path: PathBuf,
@@ -3761,17 +4415,15 @@ impl App {
                         self.file_status = Some(format!("Pasta criada: {}", path.display()));
                     }
                     project::EntryKind::TypstFile => {
-                        let previous_config = self.compiler_config();
                         self.selected_project_file = Some(path.clone());
-                        self.document.clear_search_matches();
-                        self.document
-                            .add(Document::opened(path.clone(), String::new()));
                         self.file_status = Some(format!("Arquivo criado: {}", path.display()));
-                        if self.project_main.is_some() {
-                            self.active_document_replaced();
+                        let open = if let Some(id) = self.document.find_path(&path) {
+                            self.activate_document(id);
+                            Task::none()
                         } else {
-                            self.document_replaced(previous_config);
-                        }
+                            self.open_project_file(path)
+                        };
+                        return Task::batch([open, self.refresh_project_tree()]);
                     }
                     project::EntryKind::File => {
                         self.selected_project_file = None;
@@ -4150,6 +4802,9 @@ impl App {
     }
 
     fn mark_session_changed(&mut self) {
+        if self.settings.auto_save && self.has_auto_save_documents() {
+            self.auto_save_deadline = Some(Instant::now() + AUTO_SAVE_DEBOUNCE);
+        }
         if self.session.path.is_none() {
             return;
         }
@@ -4266,14 +4921,16 @@ impl App {
             documents.push(session::Document::blank());
         }
 
-        session::Session::new(
+        let mut stored = session::Session::new(
             self.workspace_root.clone(),
             self.project_main.clone(),
             active_document.unwrap_or(0),
             documents,
             self.pane_layout(),
             self.settings,
-        )
+        );
+        stored.recent_projects = self.recent_projects.clone();
+        stored
     }
 
     fn pane_layout(&self) -> session::PaneLayout {
@@ -4308,6 +4965,127 @@ impl App {
             save_document_as(document_id, directory, file_name, source),
             Message::SaveFinished,
         )
+    }
+
+    fn has_auto_save_documents(&self) -> bool {
+        self.document
+            .iter()
+            .any(|(_, document)| document.is_dirty() && document.path().is_some())
+    }
+
+    fn save_requests(&self, include_drafts: bool) -> Vec<SaveRequest> {
+        self.document
+            .iter()
+            .filter(|(_, document)| {
+                document.is_dirty() && (include_drafts || document.path().is_some())
+            })
+            .map(|(document_id, document)| SaveRequest {
+                document_id,
+                path: document.path().map(Path::to_path_buf),
+                directory: document.directory(&self.workspace_root),
+                file_name: document.display_name(),
+                source: document.snapshot().1,
+            })
+            .collect()
+    }
+
+    fn start_save_all(&mut self) -> Task<Message> {
+        if self.file_busy {
+            return Task::none();
+        }
+        let requests = self.save_requests(true);
+        if requests.is_empty() {
+            self.file_status = Some("Todos os documentos já estão salvos".to_owned());
+            return Task::none();
+        }
+
+        self.file_busy = true;
+        self.auto_save_deadline = None;
+        self.file_status = Some("Salvando todos os documentos...".to_owned());
+        Task::perform(save_documents(requests, true), Message::SaveAllFinished)
+    }
+
+    fn dispatch_auto_save(&mut self, now: Instant) -> Task<Message> {
+        let Some(deadline) = self.auto_save_deadline else {
+            return Task::none();
+        };
+        if now < deadline {
+            return Task::none();
+        }
+        if self.file_busy || self.auto_save_busy {
+            self.auto_save_deadline = Some(now + AUTO_SAVE_DEBOUNCE);
+            return Task::none();
+        }
+
+        let requests = self.save_requests(false);
+        self.auto_save_deadline = None;
+        if requests.is_empty() {
+            return Task::none();
+        }
+        self.auto_save_busy = true;
+        Task::perform(save_documents(requests, false), Message::AutoSaveFinished)
+    }
+
+    fn handle_save_all_finished(
+        &mut self,
+        outcomes: Vec<SaveOutcome>,
+        automatic: bool,
+    ) -> Task<Message> {
+        let previous_config = self.compiler_config();
+        let mut saved = 0;
+        let mut cancelled = 0;
+        let mut errors = Vec::new();
+
+        for outcome in outcomes {
+            match outcome {
+                SaveOutcome::Saved {
+                    document_id,
+                    path,
+                    source,
+                } => {
+                    if let Some(document) = self.document.get_mut(document_id) {
+                        document.mark_saved(path, source);
+                        saved += 1;
+                    }
+                }
+                SaveOutcome::Cancelled { .. } => cancelled += 1,
+                SaveOutcome::Failed { error, .. } => errors.push(error),
+            }
+        }
+
+        if automatic {
+            self.auto_save_busy = false;
+            if !errors.is_empty() {
+                self.file_status = Some(format!(
+                    "Falha no salvamento automático: {}",
+                    truncate(&errors.join("; "), 140)
+                ));
+            }
+        } else {
+            self.file_busy = false;
+            self.file_status = Some(if errors.is_empty() && cancelled == 0 {
+                format!("{saved} documento(s) salvo(s)")
+            } else if !errors.is_empty() {
+                format!(
+                    "Salvamento parcial: {saved} salvo(s); {}",
+                    truncate(&errors.join("; "), 140)
+                )
+            } else {
+                format!("{saved} documento(s) salvo(s); operação cancelada")
+            });
+        }
+
+        if saved == 0 {
+            return Task::none();
+        }
+        self.mark_session_changed();
+        if previous_config != self.compiler_config() {
+            self.restart_compilation(previous_config, true);
+        } else {
+            self.schedule_compile(Duration::ZERO, true);
+            self.dispatch_compile(Instant::now());
+        }
+        self.refresh_project_tree()
     }
 
     fn start_export(&mut self, format: compiler::ExportFormat) -> Task<Message> {
@@ -4875,6 +5653,169 @@ impl App {
         operation::focus(self.search_input_id.clone())
     }
 
+    fn start_project_search(&mut self) -> Task<Message> {
+        self.project_search.revision = self.project_search.revision.wrapping_add(1);
+        let revision = self.project_search.revision;
+        self.project_search.error = None;
+
+        if self.project_search.query.is_empty() {
+            self.project_search.busy = false;
+            self.project_search.results.clear();
+            self.project_search.skipped_files = 0;
+            return Task::none();
+        }
+
+        self.project_search.busy = true;
+        let files = collect_project_files(&self.project_tree);
+        let overlays = self
+            .document
+            .iter()
+            .filter_map(|(_, document)| {
+                let path = document.path()?.to_path_buf();
+                path.starts_with(&self.workspace_root)
+                    .then(|| (path, document.snapshot().1))
+            })
+            .collect();
+
+        Task::perform(
+            project_search::search(
+                revision,
+                self.workspace_root.clone(),
+                files,
+                overlays,
+                self.project_search.query.clone(),
+                search::Options {
+                    case_sensitive: self.project_search.case_sensitive,
+                    whole_word: self.project_search.whole_word,
+                },
+            ),
+            Message::ProjectSearchFinished,
+        )
+    }
+
+    fn handle_project_search_finished(&mut self, outcome: project_search::SearchOutcome) {
+        if outcome.revision != self.project_search.revision || outcome.root != self.workspace_root {
+            return;
+        }
+
+        self.project_search.busy = false;
+        match outcome.result {
+            Ok(report) => {
+                self.project_search.results = report.matches;
+                self.project_search.skipped_files = report.skipped_files;
+                self.project_search.error = None;
+            }
+            Err(error) => {
+                self.project_search.results.clear();
+                self.project_search.skipped_files = 0;
+                self.project_search.error = Some(error);
+            }
+        }
+    }
+
+    fn replace_all_project_matches(&mut self) -> Task<Message> {
+        if self.file_busy || self.project_search.results.is_empty() {
+            return Task::none();
+        }
+
+        let options = search::Options {
+            case_sensitive: self.project_search.case_sensitive,
+            whole_word: self.project_search.whole_word,
+        };
+        let query = self.project_search.query.clone();
+        let replacement = self.project_search.replacement.clone();
+        let result_paths = self
+            .project_search
+            .results
+            .iter()
+            .map(|found| found.path.clone())
+            .collect::<HashSet<_>>();
+        let open_paths = self
+            .document
+            .iter()
+            .filter_map(|(_, document)| document.path().map(Path::to_path_buf))
+            .collect::<HashSet<_>>();
+        let closed_files = result_paths
+            .difference(&open_paths)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut replaced = 0;
+        let mut changed_files = 0;
+
+        for (_, document) in self.document.iter_mut() {
+            if !document
+                .path()
+                .is_some_and(|path| result_paths.contains(path))
+            {
+                continue;
+            }
+            let matches = search::find_matches(&document.snapshot().1, &query, options);
+            if matches.is_empty() {
+                continue;
+            }
+            replaced += matches.len();
+            changed_files += 1;
+            let edits = matches
+                .into_iter()
+                .map(|range| (range, replacement.clone()))
+                .collect();
+            document.perform(Action::ApplyEdits(edits));
+        }
+
+        if replaced > 0 {
+            self.clear_compile_diagnostics();
+            self.mark_session_changed();
+            self.schedule_compile(Duration::ZERO, false);
+            self.dispatch_compile(Instant::now());
+        }
+
+        self.file_busy = true;
+        self.project_search.pending_replaced = replaced;
+        self.project_search.pending_changed_files = changed_files;
+        self.file_status = Some("Substituindo ocorrências no projeto...".to_owned());
+        Task::perform(
+            project_search::replace_closed_files(
+                self.project_search.revision,
+                closed_files,
+                query,
+                replacement,
+                options,
+            ),
+            Message::ProjectReplaceFinished,
+        )
+    }
+
+    fn handle_project_replace_finished(
+        &mut self,
+        outcome: project_search::ReplaceOutcome,
+    ) -> Task<Message> {
+        self.file_busy = false;
+        let replaced = self.project_search.pending_replaced + outcome.replaced;
+        let changed_files = self.project_search.pending_changed_files + outcome.changed_files;
+        self.project_search.pending_replaced = 0;
+        self.project_search.pending_changed_files = 0;
+
+        if outcome.errors.is_empty() {
+            self.file_status = Some(format!(
+                "{replaced} ocorrência(s) substituída(s) em {changed_files} arquivo(s)"
+            ));
+        } else {
+            let error = outcome.errors.join("; ");
+            self.file_status = Some(format!(
+                "Substituição parcial: {replaced} ocorrência(s); {}",
+                truncate(&error, 140)
+            ));
+            self.project_search.error = Some(error);
+        }
+
+        if outcome.revision != self.project_search.revision {
+            return Task::none();
+        }
+        self.schedule_compile(Duration::ZERO, true);
+        self.dispatch_compile(Instant::now());
+        self.start_project_search()
+    }
+
     fn refresh_search_matches(&mut self, preferred: Option<usize>, reveal: bool) {
         if !self.search.visible {
             return;
@@ -5429,6 +6370,15 @@ fn command_shift_shortcut(key: &str) -> String {
     format!("{modifier}{key}")
 }
 
+fn command_alt_shortcut(key: &str) -> String {
+    #[cfg(target_os = "macos")]
+    let modifier = "⌥⌘";
+    #[cfg(not(target_os = "macos"))]
+    let modifier = "Ctrl+Alt+";
+
+    format!("{modifier}{key}")
+}
+
 fn settings_slider_row<'a>(
     label: &'a str,
     value: String,
@@ -5501,6 +6451,29 @@ fn search_panel_style(theme: &Theme) -> iced::widget::container::Style {
 fn search_metadata_text_style(theme: &Theme) -> text::Style {
     text::Style {
         color: Some(ui::tokens::SpectrumColors::from_theme(theme).gray.gray_600),
+    }
+}
+
+fn project_search_result_style(
+    theme: &Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    let colors = ui::tokens::SpectrumColors::from_theme(theme);
+    let background = match status {
+        iced::widget::button::Status::Hovered => {
+            Some(iced::Background::Color(colors.gray.gray_100))
+        }
+        iced::widget::button::Status::Pressed => {
+            Some(iced::Background::Color(colors.gray.gray_200))
+        }
+        iced::widget::button::Status::Active | iced::widget::button::Status::Disabled => None,
+    };
+
+    iced::widget::button::Style {
+        background,
+        text_color: colors.gray.gray_800,
+        border: Border::default(),
+        ..iced::widget::button::Style::default()
     }
 }
 
@@ -5686,6 +6659,33 @@ async fn save_document_as(
     write_document(document_id, with_typst_extension(file.path()), source).await
 }
 
+async fn save_documents(requests: Vec<SaveRequest>, prompt_for_drafts: bool) -> Vec<SaveOutcome> {
+    let mut outcomes = Vec::with_capacity(requests.len());
+
+    for request in requests {
+        let outcome = if let Some(path) = request.path {
+            write_document(request.document_id, path, request.source).await
+        } else if prompt_for_drafts {
+            save_document_as(
+                request.document_id,
+                request.directory,
+                request.file_name,
+                request.source,
+            )
+            .await
+        } else {
+            continue;
+        };
+        let cancelled = matches!(outcome, SaveOutcome::Cancelled { .. });
+        outcomes.push(outcome);
+        if cancelled {
+            break;
+        }
+    }
+
+    outcomes
+}
+
 async fn choose_export_path(
     directory: PathBuf,
     file_name: String,
@@ -5854,6 +6854,40 @@ fn menu_bar_pointer_subscription() -> Subscription<Message> {
     })
 }
 
+fn file_drop_subscription() -> Subscription<Message> {
+    event::listen_with(|event, _status, window| match event {
+        iced::Event::Window(window::Event::FileDropped(path)) => {
+            Some(Message::FileDropped(window, path))
+        }
+        _ => None,
+    })
+}
+
+fn project_tree_keyboard_subscription() -> Subscription<Message> {
+    event::listen_with(|event, status, _window| {
+        if status == event::Status::Captured {
+            return None;
+        }
+        let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) = event else {
+            return None;
+        };
+        let keyboard::Key::Named(key) = key else {
+            return None;
+        };
+        let navigation = match key {
+            keyboard::key::Named::ArrowUp => TreeNavigation::Previous,
+            keyboard::key::Named::ArrowDown => TreeNavigation::Next,
+            keyboard::key::Named::ArrowLeft => TreeNavigation::ParentOrCollapse,
+            keyboard::key::Named::ArrowRight => TreeNavigation::ChildOrExpand,
+            keyboard::key::Named::Home => TreeNavigation::First,
+            keyboard::key::Named::End => TreeNavigation::Last,
+            keyboard::key::Named::Enter | keyboard::key::Named::Space => TreeNavigation::Activate,
+            _ => return None,
+        };
+        Some(Message::ProjectTreeNavigate(navigation))
+    })
+}
+
 fn shortcut_subscription() -> Subscription<Message> {
     event::listen_with(|event, _status, _window| {
         let iced::Event::Keyboard(event) = event else {
@@ -5880,6 +6914,19 @@ fn shortcut_subscription() -> Subscription<Message> {
         }
 
         match key.as_ref() {
+            keyboard::Key::Named(keyboard::key::Named::Tab) if modifiers.control() => {
+                return Some(Message::ActivateRelativeDocument(modifiers.shift()));
+            }
+            keyboard::Key::Named(keyboard::key::Named::PageUp)
+                if modifiers.command() && modifiers.shift() =>
+            {
+                return Some(Message::MoveActiveDocument(true));
+            }
+            keyboard::Key::Named(keyboard::key::Named::PageDown)
+                if modifiers.command() && modifiers.shift() =>
+            {
+                return Some(Message::MoveActiveDocument(false));
+            }
             keyboard::Key::Named(keyboard::key::Named::F3) => {
                 return Some(if modifiers.shift() {
                     Message::SearchPrevious
@@ -5948,6 +6995,9 @@ fn alert_dialog_keyboard_subscription() -> Subscription<Message> {
 }
 
 fn shortcut_message(key: char, modifiers: keyboard::Modifiers) -> Option<Message> {
+    if modifiers.command() && modifiers.alt() && key.eq_ignore_ascii_case(&'s') {
+        return Some(Message::SaveAllDocuments);
+    }
     if !modifiers.command() || modifiers.alt() {
         return None;
     }
@@ -5962,10 +7012,13 @@ fn shortcut_message(key: char, modifiers: keyboard::Modifiers) -> Option<Message
         ('s', false) => Some(Message::SaveDocument),
         ('s', true) => Some(Message::SaveDocumentAs),
         ('q', false) => Some(Message::ExitApplication),
+        ('w', false) => Some(Message::CloseActiveDocument),
+        ('t', true) => Some(Message::ReopenClosedDocument),
         ('b', false) => Some(Message::Bold),
         ('i', false) => Some(Message::Italic),
         ('u', false) => Some(Message::Underline),
         ('f', false) => Some(Message::OpenSearch),
+        ('f', true) => Some(Message::OpenProjectSearch),
         ('h', false) => Some(Message::OpenReplace),
         ('j', false) => Some(Message::RevealInPreview),
         _ => None,
@@ -6082,6 +7135,31 @@ fn project_entry_contains_path(entry: &Path, kind: project::EntryKind, candidate
     }
 }
 
+fn collect_project_files(entries: &[project::ProjectEntry]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in entries {
+        if entry.kind == project::EntryKind::Directory {
+            files.extend(collect_project_files(&entry.children));
+        } else {
+            files.push(entry.path.clone());
+        }
+    }
+    files
+}
+
+fn append_visible_project_entries(
+    source: &[project::ProjectEntry],
+    expanded: &HashSet<PathBuf>,
+    target: &mut Vec<(PathBuf, project::EntryKind)>,
+) {
+    for entry in source {
+        target.push((entry.path.clone(), entry.kind));
+        if entry.kind == project::EntryKind::Directory && expanded.contains(&entry.path) {
+            append_visible_project_entries(&entry.children, expanded, target);
+        }
+    }
+}
+
 fn remap_project_path(
     path: &Path,
     from: &Path,
@@ -6114,11 +7192,11 @@ fn truncate(text: &str, limit: usize) -> String {
 mod tests {
     use super::*;
 
-    fn menu_labels(entries: &[AppMenuEntry]) -> Vec<&'static str> {
+    fn menu_labels(entries: &[AppMenuEntry]) -> Vec<&str> {
         entries
             .iter()
             .filter_map(|entry| match entry {
-                AppMenuEntry::Item { label, .. } => Some(*label),
+                AppMenuEntry::Item { label, .. } => Some(label.as_str()),
                 AppMenuEntry::Divider => None,
             })
             .collect()
@@ -6494,6 +7572,22 @@ mod tests {
             shortcut_message('j', command),
             Some(Message::RevealInPreview)
         ));
+        assert!(matches!(
+            shortcut_message('f', command | keyboard::Modifiers::SHIFT),
+            Some(Message::OpenProjectSearch)
+        ));
+        assert!(matches!(
+            shortcut_message('w', command),
+            Some(Message::CloseActiveDocument)
+        ));
+        assert!(matches!(
+            shortcut_message('t', command | keyboard::Modifiers::SHIFT),
+            Some(Message::ReopenClosedDocument)
+        ));
+        assert!(matches!(
+            shortcut_message('s', command | keyboard::Modifiers::ALT),
+            Some(Message::SaveAllDocuments)
+        ));
         assert!(shortcut_message('s', keyboard::Modifiers::NONE).is_none());
         assert!(shortcut_message('n', command | keyboard::Modifiers::SHIFT).is_none());
     }
@@ -6525,7 +7619,8 @@ mod tests {
     #[test]
     fn export_overflow_contains_related_actions_and_can_be_dismissed() {
         let mut app = App::new();
-        let labels = menu_labels(&app.export_menu_entries());
+        let entries = app.export_menu_entries();
+        let labels = menu_labels(&entries);
 
         assert_eq!(
             labels,
@@ -7118,7 +8213,8 @@ mod tests {
             kind: project::EntryKind::Directory,
             position: Point::ORIGIN,
         };
-        let root_labels = menu_labels(&app.project_context_entries(&root_context));
+        let root_entries = app.project_context_entries(&root_context);
+        let root_labels = menu_labels(&root_entries);
 
         assert!(root_labels.contains(&"Novo arquivo Typst…"));
         assert!(root_labels.contains(&"Nova pasta…"));
@@ -7131,7 +8227,8 @@ mod tests {
             kind: project::EntryKind::Directory,
             position: Point::ORIGIN,
         };
-        let folder_labels = menu_labels(&app.project_context_entries(&folder_context));
+        let folder_entries = app.project_context_entries(&folder_context);
+        let folder_labels = menu_labels(&folder_entries);
 
         assert!(folder_labels.contains(&"Renomear…"));
         assert!(folder_labels.contains(&"Excluir…"));
@@ -7741,6 +8838,85 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn project_tree_keyboard_navigation_respects_expansion() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let folder = directory.path().join("chapters");
+        let file = folder.join("one.typ");
+        let mut app = App::new();
+        app.workspace_root = directory.path().to_path_buf();
+        app.expanded_project_directories = HashSet::from([directory.path().to_path_buf()]);
+        app.project_tree = vec![project::ProjectEntry {
+            path: folder.clone(),
+            kind: project::EntryKind::Directory,
+            children: vec![project::ProjectEntry {
+                path: file.clone(),
+                kind: project::EntryKind::TypstFile,
+                children: Vec::new(),
+            }],
+        }];
+        app.selected_project_entry = Some(folder.clone());
+
+        let _ = app.navigate_project_tree(TreeNavigation::ChildOrExpand);
+        assert!(app.expanded_project_directories.contains(&folder));
+        let _ = app.navigate_project_tree(TreeNavigation::ChildOrExpand);
+        assert_eq!(app.selected_project_entry, Some(file));
+        let _ = app.navigate_project_tree(TreeNavigation::ParentOrCollapse);
+        assert_eq!(app.selected_project_entry, Some(folder));
+    }
+
+    #[test]
+    fn closed_tabs_can_be_reopened_and_discarded_text_is_not_restored() {
+        let path = PathBuf::from("/project/main.typ");
+        let mut app = App::new();
+        app.document = Documents::new(Document::opened(path.clone(), "salvo".to_owned()));
+        let id = app.document.active_id();
+        app.document.perform(Action::MoveTo(5));
+        app.document.perform(Action::Insert(" local".to_owned()));
+        app.discarded_tabs.insert(id);
+
+        app.close_document(id);
+        app.reopen_closed_document();
+
+        assert_eq!(app.document.path(), Some(path.as_path()));
+        assert_eq!(app.document.snapshot().1, "salvo");
+        assert!(!app.document.is_dirty());
+    }
+
+    #[test]
+    fn autosave_is_scheduled_only_for_named_dirty_documents() {
+        let mut app = App::new();
+        app.settings.auto_save = true;
+        app.document = Documents::new(Document::opened(
+            PathBuf::from("/project/main.typ"),
+            "texto".to_owned(),
+        ));
+
+        let _ = app.update(Message::Editor(Action::Insert(" novo".to_owned())));
+        assert!(app.auto_save_deadline.is_some());
+
+        app.document = Documents::new(Document::new());
+        app.auto_save_deadline = None;
+        let _ = app.update(Message::Editor(Action::Insert("rascunho".to_owned())));
+        assert!(app.auto_save_deadline.is_none());
+    }
+
+    #[test]
+    fn recent_projects_are_persisted_in_most_recent_first_order() {
+        let first = tempfile::tempdir().expect("a first project can be created");
+        let second = tempfile::tempdir().expect("a second project can be created");
+        let mut app = App::new();
+
+        let _ = app.handle_project_folder_selected(Some(first.path().to_path_buf()));
+        let _ = app.handle_project_folder_selected(Some(second.path().to_path_buf()));
+        let _ = app.handle_project_folder_selected(Some(first.path().to_path_buf()));
+        let stored = app.session_snapshot(false);
+
+        assert_eq!(stored.recent_projects[0], first.path());
+        assert_eq!(stored.recent_projects[1], second.path());
+        assert_eq!(stored.recent_projects.len(), 2);
     }
 
     #[cfg(unix)]

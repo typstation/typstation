@@ -450,6 +450,45 @@ impl Documents {
 
         Some(removed)
     }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    pub fn activate_relative(&mut self, reverse: bool) -> bool {
+        if self.entries.len() < 2 {
+            return false;
+        }
+        self.active = if reverse {
+            (self.active + self.entries.len() - 1) % self.entries.len()
+        } else {
+            (self.active + 1) % self.entries.len()
+        };
+        true
+    }
+
+    pub fn move_active(&mut self, reverse: bool) -> bool {
+        if self.entries.len() < 2 {
+            return false;
+        }
+        let target = if reverse {
+            self.active.checked_sub(1)
+        } else if self.active + 1 < self.entries.len() {
+            Some(self.active + 1)
+        } else {
+            None
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        self.entries.swap(self.active, target);
+        self.active = target;
+        true
+    }
 }
 
 impl Deref for Documents {
@@ -572,6 +611,26 @@ mod tests {
         assert_eq!(documents.iter().count(), 1);
         assert_eq!(documents.active_id(), second);
         assert_eq!(documents.snapshot().1, "segundo");
+    }
+
+    #[test]
+    fn documents_cycle_and_reorder_without_changing_the_active_identity() {
+        let mut documents = Documents::new(Document::draft("primeiro"));
+        let first = documents.active_id();
+        let second = documents.add(Document::draft("segundo"));
+        let third = documents.add(Document::draft("terceiro"));
+
+        assert!(documents.activate_relative(false));
+        assert_eq!(documents.active_id(), first);
+        assert!(documents.activate_relative(true));
+        assert_eq!(documents.active_id(), third);
+        assert!(documents.move_active(true));
+        assert_eq!(documents.active_id(), third);
+        assert_eq!(documents.active_index(), 1);
+        assert!(documents.activate_relative(true));
+        assert_eq!(documents.active_id(), first);
+        assert!(documents.activate(second));
+        assert!(!documents.move_active(false));
     }
 
     #[test]

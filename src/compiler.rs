@@ -201,21 +201,50 @@ fn worker(config: &Config) -> impl Stream<Item = Event> + use<> {
 
         let mut world = TypstationWorld::with_main(config.root.clone(), &config.main_name);
 
-        while let Some(request) = requests.next().await {
-            let compiled = compile(&mut world, request);
+        while let Some(first) = requests.next().await {
+            let mut pending = vec![first];
+            while let Ok(request) = requests.try_recv() {
+                pending.push(request);
+            }
 
-            if output
-                .send(Event::Finished {
-                    config: config.clone(),
-                    output: compiled,
-                })
-                .await
-                .is_err()
-            {
-                break;
+            for request in coalesce_requests(pending) {
+                let compiled = compile(&mut world, request);
+
+                if output
+                    .send(Event::Finished {
+                        config: config.clone(),
+                        output: compiled,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
             }
         }
     })
+}
+
+fn coalesce_requests(mut requests: Vec<Request>) -> Vec<Request> {
+    let latest_preview = requests
+        .iter()
+        .rposition(|request| request.purpose == Purpose::Preview);
+    let preview_requires_reset = requests
+        .iter()
+        .any(|request| request.purpose == Purpose::Preview && request.reset_files);
+
+    requests
+        .drain(..)
+        .enumerate()
+        .filter_map(|(index, mut request)| {
+            if request.purpose == Purpose::Preview && Some(index) == latest_preview {
+                request.reset_files |= preview_requires_reset;
+                Some(request)
+            } else {
+                (request.purpose != Purpose::Preview).then_some(request)
+            }
+        })
+        .collect()
 }
 
 fn compile(world: &mut TypstationWorld, request: Request) -> Output {
@@ -537,6 +566,59 @@ fn editor_diagnostic(
 mod tests {
     use super::*;
     use std::fs;
+
+    fn request(id: u64, purpose: Purpose) -> Request {
+        Request {
+            id,
+            revision: id,
+            source: Some(format!("Revisão {id}")),
+            overlays: Vec::new(),
+            reset_files: false,
+            purpose,
+            export_options: ExportOptions::default(),
+        }
+    }
+
+    #[test]
+    fn coalescing_keeps_only_the_latest_preview_and_every_export() {
+        let requests = vec![
+            Request {
+                reset_files: true,
+                ..request(1, Purpose::Preview)
+            },
+            request(2, Purpose::Export(ExportFormat::Pdf)),
+            request(3, Purpose::Preview),
+            request(4, Purpose::Export(ExportFormat::Svg)),
+            request(5, Purpose::Preview),
+        ];
+
+        let coalesced = coalesce_requests(requests);
+        let ids = coalesced
+            .iter()
+            .map(|request| request.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![2, 4, 5]);
+        assert_eq!(coalesced[0].purpose, Purpose::Export(ExportFormat::Pdf));
+        assert_eq!(coalesced[1].purpose, Purpose::Export(ExportFormat::Svg));
+        assert_eq!(coalesced[2].purpose, Purpose::Preview);
+        assert!(coalesced[2].reset_files);
+    }
+
+    #[test]
+    fn coalescing_does_not_require_a_preview_request() {
+        let requests = vec![
+            request(1, Purpose::Export(ExportFormat::Pdf)),
+            request(2, Purpose::Export(ExportFormat::Html)),
+        ];
+
+        let ids = coalesce_requests(requests)
+            .into_iter()
+            .map(|request| request.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![1, 2]);
+    }
 
     #[test]
     fn compiler_generates_multiple_pages_and_editor_diagnostics() {

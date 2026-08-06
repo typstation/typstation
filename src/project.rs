@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -182,6 +182,75 @@ pub async fn rename_entry(root: PathBuf, from: PathBuf, kind: EntryKind) -> Oper
     }
 }
 
+pub async fn move_entry(root: PathBuf, from: PathBuf, kind: EntryKind) -> OperationOutcome {
+    if from == root || !from.starts_with(&root) {
+        return OperationOutcome::Failed("a raiz do projeto não pode ser movida".to_owned());
+    }
+    let Some(folder) = AsyncFileDialog::new()
+        .set_directory(&root)
+        .set_title("Mover item para a pasta")
+        .pick_folder()
+        .await
+    else {
+        return OperationOutcome::Cancelled;
+    };
+    let directory = folder.path();
+    if !directory.starts_with(&root) {
+        return OperationOutcome::Failed("a pasta de destino deve pertencer ao projeto".to_owned());
+    }
+    let Some(name) = from.file_name() else {
+        return OperationOutcome::Failed("o item não possui um nome válido".to_owned());
+    };
+    let to = directory.join(name);
+    if to == from {
+        return OperationOutcome::Cancelled;
+    }
+    if kind == EntryKind::Directory && to.starts_with(&from) {
+        return OperationOutcome::Failed(
+            "uma pasta não pode ser movida para dentro dela mesma".to_owned(),
+        );
+    }
+    if tokio::fs::try_exists(&to).await.unwrap_or(false) {
+        return OperationOutcome::Failed(format!("o destino já existe: {}", to.display()));
+    }
+
+    match tokio::fs::rename(&from, &to).await {
+        Ok(()) => OperationOutcome::Renamed { from, to, kind },
+        Err(error) => {
+            OperationOutcome::Failed(format!("{} -> {}: {error}", from.display(), to.display()))
+        }
+    }
+}
+
+pub async fn duplicate_entry(root: PathBuf, source: PathBuf, kind: EntryKind) -> OperationOutcome {
+    if source == root || !source.starts_with(&root) {
+        return OperationOutcome::Failed("a raiz do projeto não pode ser duplicada".to_owned());
+    }
+    let destination = unique_copy_path(&source);
+    let copy_source = source.clone();
+    let copy_destination = destination.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        if kind == EntryKind::Directory {
+            copy_directory(&copy_source, &copy_destination)
+        } else {
+            fs::copy(&copy_source, &copy_destination).map(|_| ())
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => OperationOutcome::Created {
+            path: destination,
+            kind,
+        },
+        Ok(Err(error)) => OperationOutcome::Failed(format!("{}: {error}", source.display())),
+        Err(error) => OperationOutcome::Failed(format!(
+            "{}: tarefa de duplicação interrompida: {error}",
+            source.display()
+        )),
+    }
+}
+
 pub async fn delete_entry(root: PathBuf, path: PathBuf, kind: EntryKind) -> OperationOutcome {
     if path == root || !path.starts_with(&root) {
         return OperationOutcome::Failed("a raiz do projeto não pode ser excluída".to_owned());
@@ -205,6 +274,45 @@ fn project_directory(root: &Path, directory: PathBuf) -> PathBuf {
     } else {
         root.to_path_buf()
     }
+}
+
+fn unique_copy_path(source: &Path) -> PathBuf {
+    let parent = source.parent().unwrap_or_else(|| Path::new("."));
+    let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+    let extension = source.extension().map(|value| value.to_string_lossy());
+
+    for number in 1.. {
+        let suffix = if number == 1 {
+            "copia".to_owned()
+        } else {
+            format!("copia-{number}")
+        };
+        let mut name = format!("{stem}-{suffix}");
+        if let Some(extension) = extension.as_deref() {
+            name.push('.');
+            name.push_str(extension);
+        }
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_directory(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 const fn entry_fallback_name(kind: EntryKind) -> &'static str {
@@ -418,6 +526,36 @@ mod tests {
         assert_eq!(
             project_directory(project.path(), project.path().join("missing")),
             project.path()
+        );
+    }
+
+    #[test]
+    fn copy_paths_do_not_overwrite_existing_entries() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let source = directory.path().join("main.typ");
+        fs::write(&source, "main").expect("the source can be written");
+
+        let first = unique_copy_path(&source);
+        fs::write(&first, "copy").expect("the first copy can be written");
+        let second = unique_copy_path(&source);
+
+        assert_eq!(first.file_name().unwrap(), "main-copia.typ");
+        assert_eq!(second.file_name().unwrap(), "main-copia-2.typ");
+    }
+
+    #[test]
+    fn directory_copy_preserves_nested_files() {
+        let directory = tempfile::tempdir().expect("a temporary project can be created");
+        let source = directory.path().join("chapters");
+        let destination = directory.path().join("chapters-copia");
+        fs::create_dir_all(source.join("nested")).expect("the source can be created");
+        fs::write(source.join("nested/one.typ"), "content").expect("the file can be written");
+
+        copy_directory(&source, &destination).expect("the directory can be copied");
+
+        assert_eq!(
+            fs::read_to_string(destination.join("nested/one.typ")).unwrap(),
+            "content"
         );
     }
 }

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env, fs, io,
     path::{Path, PathBuf},
 };
@@ -17,6 +18,8 @@ pub struct Session {
     pub workspace_root: PathBuf,
     #[serde(default)]
     pub project_main: Option<PathBuf>,
+    #[serde(default)]
+    pub recent_projects: Vec<PathBuf>,
     pub active_document: usize,
     pub documents: Vec<Document>,
     pub pane_layout: PaneLayout,
@@ -37,6 +40,7 @@ impl Session {
             version: SESSION_VERSION,
             workspace_root,
             project_main,
+            recent_projects: Vec::new(),
             active_document,
             documents,
             pane_layout,
@@ -67,6 +71,10 @@ impl Session {
             path.starts_with(&self.workspace_root)
                 && path.extension().is_some_and(|extension| extension == "typ")
         });
+        let mut seen_projects = HashSet::new();
+        self.recent_projects
+            .retain(|path| path.is_absolute() && seen_projects.insert(path.clone()));
+        self.recent_projects.truncate(10);
 
         Ok(self)
     }
