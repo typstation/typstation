@@ -1,7 +1,7 @@
 use std::{collections::HashMap, ops::Range, path::PathBuf};
 
 use typst::{
-    Library, LibraryExt, World,
+    Feature, Library, LibraryExt, World,
     diag::FileResult,
     foundations::{Bytes, Datetime, Duration},
     syntax::{DiagSpan, DiagSpanKind, FileId, RootedPath, Source, VirtualPath, VirtualRoot},
@@ -63,7 +63,11 @@ impl TypstationWorld {
         let main = RootedPath::new(VirtualRoot::Project, vpath).intern();
 
         Self {
-            library: LazyHash::new(Library::default()),
+            library: LazyHash::new(
+                Library::builder()
+                    .with_features([Feature::Html].into_iter().collect())
+                    .build(),
+            ),
             fonts,
             files,
             time: Time::system(),

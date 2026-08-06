@@ -12,8 +12,10 @@ use typst::{
     diag::SourceDiagnostic,
     foundations::{NativeElement, StyleChain},
     introspection::Introspector,
+    layout::Abs,
     model::{HeadingElem, OutlineNode as TypstOutlineNode},
 };
+use typst_html::HtmlDocument;
 use typst_iced_editor::Diagnostic;
 use typst_layout::PagedDocument;
 use typstation::world::{SourceOverlay, TypstationWorld};
@@ -30,12 +32,61 @@ pub struct Request {
     pub overlays: Vec<SourceOverlay>,
     pub reset_files: bool,
     pub purpose: Purpose,
+    pub export_options: ExportOptions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
     Preview,
-    ExportPdf,
+    Export(ExportFormat),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Pdf,
+    Svg,
+    Html,
+}
+
+impl ExportFormat {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pdf => "PDF",
+            Self::Svg => "SVG",
+            Self::Html => "HTML",
+        }
+    }
+
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Pdf => "pdf",
+            Self::Svg => "svg",
+            Self::Html => "html",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportOptions {
+    pub pdf_tagged: bool,
+    pub pdf_pretty: bool,
+    pub svg_render_bleed: bool,
+    pub svg_pretty: bool,
+    pub svg_page_gap: u16,
+    pub html_pretty: bool,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            pdf_tagged: true,
+            pdf_pretty: false,
+            svg_render_bleed: false,
+            svg_pretty: false,
+            svg_page_gap: 12,
+            html_pretty: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +101,7 @@ pub struct Output {
     pub revision: u64,
     pub purpose: Purpose,
     pub pages: Vec<RenderedPage>,
-    pub pdf: Option<Vec<u8>>,
+    pub artifact: Option<Vec<u8>>,
     pub diagnostics: Vec<ReportedDiagnostic>,
     pub outline: Vec<DocumentOutlineItem>,
     pub page_count: usize,
@@ -168,41 +219,60 @@ fn worker(config: &Config) -> impl Stream<Item = Event> + use<> {
 }
 
 fn compile(world: &mut TypstationWorld, request: Request) -> Output {
-    if request.reset_files {
+    let Request {
+        id,
+        revision,
+        source,
+        overlays,
+        reset_files,
+        purpose,
+        export_options,
+    } = request;
+
+    if reset_files {
         world.reset_files();
     }
 
-    world.set_main_source(request.source.as_deref());
-    world.set_overlays(request.overlays);
+    world.set_main_source(source.as_deref());
+    world.set_overlays(overlays);
 
-    let result = typst::compile::<PagedDocument>(world);
-    let mut diagnostics = Vec::new();
-    let mut summary = None;
-
-    for warning in &result.warnings {
-        summary.get_or_insert_with(|| warning.message.to_string());
-
-        if let Some(diagnostic) = editor_diagnostic(world, warning) {
-            diagnostics.push(diagnostic);
+    match purpose {
+        Purpose::Export(ExportFormat::Html) => {
+            compile_html(world, id, revision, purpose, export_options)
+        }
+        Purpose::Preview
+        | Purpose::Export(ExportFormat::Pdf)
+        | Purpose::Export(ExportFormat::Svg) => {
+            compile_paged(world, id, revision, purpose, export_options)
         }
     }
+}
 
+fn compile_paged(
+    world: &TypstationWorld,
+    id: u64,
+    revision: u64,
+    purpose: Purpose,
+    export_options: ExportOptions,
+) -> Output {
+    let result = typst::compile::<PagedDocument>(world);
+    let (mut diagnostics, mut summary) = reported_warnings(world, &result.warnings);
     let warning_count = result.warnings.len();
 
     match result.output {
         Ok(document) if !document.pages().is_empty() => {
             let page_count = document.pages().len();
-            let outline = if request.purpose == Purpose::Preview {
+            let outline = if purpose == Purpose::Preview {
                 document_outline(world, &document)
             } else {
                 Vec::new()
             };
             let mut output = Output {
-                id: request.id,
-                revision: request.revision,
-                purpose: request.purpose,
+                id,
+                revision,
+                purpose,
                 pages: Vec::new(),
-                pdf: None,
+                artifact: None,
                 diagnostics,
                 outline,
                 page_count,
@@ -211,7 +281,7 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
                 summary,
             };
 
-            match request.purpose {
+            match purpose {
                 Purpose::Preview => {
                     let options = typst_svg::SvgOptions::default();
                     output.pages = document
@@ -225,9 +295,14 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
                         })
                         .collect();
                 }
-                Purpose::ExportPdf => {
-                    match typst_pdf::pdf(&document, &typst_pdf::PdfOptions::default()) {
-                        Ok(pdf) => output.pdf = Some(pdf),
+                Purpose::Export(ExportFormat::Pdf) => {
+                    let options = typst_pdf::PdfOptions {
+                        tagged: export_options.pdf_tagged,
+                        pretty: export_options.pdf_pretty,
+                        ..typst_pdf::PdfOptions::default()
+                    };
+                    match typst_pdf::pdf(&document, &options) {
+                        Ok(pdf) => output.artifact = Some(pdf),
                         Err(errors) => {
                             output.error_count = errors.len();
                             output.summary = errors
@@ -243,16 +318,31 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
                         }
                     }
                 }
+                Purpose::Export(ExportFormat::Svg) => {
+                    let options = typst_svg::SvgOptions {
+                        render_bleed: export_options.svg_render_bleed,
+                        pretty: export_options.svg_pretty,
+                    };
+                    output.artifact = Some(
+                        typst_svg::svg_merged(
+                            &document,
+                            &options,
+                            Abs::pt(f64::from(export_options.svg_page_gap)),
+                        )
+                        .into_bytes(),
+                    );
+                }
+                Purpose::Export(ExportFormat::Html) => unreachable!(),
             }
 
             output
         }
         Ok(_) => Output {
-            id: request.id,
-            revision: request.revision,
-            purpose: request.purpose,
+            id,
+            revision,
+            purpose,
             pages: Vec::new(),
-            pdf: None,
+            artifact: None,
             diagnostics,
             outline: Vec::new(),
             page_count: 0,
@@ -273,11 +363,11 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
             }
 
             Output {
-                id: request.id,
-                revision: request.revision,
-                purpose: request.purpose,
+                id,
+                revision,
+                purpose,
                 pages: Vec::new(),
-                pdf: None,
+                artifact: None,
                 diagnostics,
                 outline: Vec::new(),
                 page_count: 0,
@@ -285,6 +375,89 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
                 error_count: errors.len(),
                 summary,
             }
+        }
+    }
+}
+
+fn compile_html(
+    world: &TypstationWorld,
+    id: u64,
+    revision: u64,
+    purpose: Purpose,
+    export_options: ExportOptions,
+) -> Output {
+    let result = typst::compile::<HtmlDocument>(world);
+    let (mut diagnostics, mut summary) = reported_warnings(world, &result.warnings);
+    let warning_count = result.warnings.len();
+    let mut output = Output {
+        id,
+        revision,
+        purpose,
+        pages: Vec::new(),
+        artifact: None,
+        diagnostics: Vec::new(),
+        outline: Vec::new(),
+        page_count: 0,
+        warning_count,
+        error_count: 0,
+        summary: None,
+    };
+
+    match result.output {
+        Ok(document) => {
+            let options = typst_html::HtmlOptions {
+                pretty: export_options.html_pretty,
+            };
+            match typst_html::html(&document, &options) {
+                Ok(html) => output.artifact = Some(html.into_bytes()),
+                Err(errors) => {
+                    output.error_count = errors.len();
+                    summary = errors
+                        .first()
+                        .map(|error| error.message.to_string())
+                        .or(summary);
+                    append_reported_errors(world, &errors, &mut diagnostics);
+                }
+            }
+        }
+        Err(errors) => {
+            output.error_count = errors.len();
+            summary = errors
+                .first()
+                .map(|error| error.message.to_string())
+                .or(summary);
+            append_reported_errors(world, &errors, &mut diagnostics);
+        }
+    }
+
+    output.diagnostics = diagnostics;
+    output.summary = summary;
+    output
+}
+
+fn reported_warnings(
+    world: &TypstationWorld,
+    warnings: &[SourceDiagnostic],
+) -> (Vec<ReportedDiagnostic>, Option<String>) {
+    let mut diagnostics = Vec::new();
+    let mut summary = None;
+    for warning in warnings {
+        summary.get_or_insert_with(|| warning.message.to_string());
+        if let Some(diagnostic) = editor_diagnostic(world, warning) {
+            diagnostics.push(diagnostic);
+        }
+    }
+    (diagnostics, summary)
+}
+
+fn append_reported_errors(
+    world: &TypstationWorld,
+    errors: &[SourceDiagnostic],
+    diagnostics: &mut Vec<ReportedDiagnostic>,
+) {
+    for error in errors {
+        if let Some(diagnostic) = editor_diagnostic(world, error) {
+            diagnostics.push(diagnostic);
         }
     }
 }
@@ -379,6 +552,7 @@ mod tests {
                 overlays: Vec::new(),
                 reset_files: true,
                 purpose: Purpose::Preview,
+                export_options: ExportOptions::default(),
             },
         );
 
@@ -387,7 +561,7 @@ mod tests {
         assert_eq!(preview.page_count, 2);
         assert_eq!(preview.error_count, 0);
         assert_eq!(preview.pages.len(), 2);
-        assert!(preview.pdf.is_none());
+        assert!(preview.artifact.is_none());
         assert!(preview.outline.is_empty());
         assert!(preview.pages.iter().all(|page| !page.regions.is_empty()));
         assert!(
@@ -409,14 +583,15 @@ mod tests {
                 source: Some("Exported page".to_owned()),
                 overlays: Vec::new(),
                 reset_files: false,
-                purpose: Purpose::ExportPdf,
+                purpose: Purpose::Export(ExportFormat::Pdf),
+                export_options: ExportOptions::default(),
             },
         );
 
         assert_eq!(pdf.error_count, 0);
         assert!(pdf.pages.is_empty());
         assert!(
-            pdf.pdf
+            pdf.artifact
                 .as_deref()
                 .is_some_and(|bytes| bytes.starts_with(b"%PDF-"))
         );
@@ -430,12 +605,74 @@ mod tests {
                 overlays: Vec::new(),
                 reset_files: false,
                 purpose: Purpose::Preview,
+                export_options: ExportOptions::default(),
             },
         );
 
         assert!(failure.error_count > 0);
         assert!(failure.pages.is_empty());
         assert!(!failure.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn compiler_exports_svg_with_the_selected_layout_options() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut world = TypstationWorld::new(root);
+        let options = ExportOptions {
+            svg_pretty: true,
+            svg_page_gap: 24,
+            ..ExportOptions::default()
+        };
+
+        let output = compile(
+            &mut world,
+            Request {
+                id: 1,
+                revision: 1,
+                source: Some("Primeira página\n#pagebreak()\nSegunda página".to_owned()),
+                overlays: Vec::new(),
+                reset_files: true,
+                purpose: Purpose::Export(ExportFormat::Svg),
+                export_options: options,
+            },
+        );
+
+        let svg = String::from_utf8(output.artifact.expect("SVG should be generated"))
+            .expect("SVG should be UTF-8");
+        assert_eq!(output.error_count, 0);
+        assert_eq!(output.page_count, 2);
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains('\n'));
+    }
+
+    #[test]
+    fn compiler_exports_experimental_html() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut world = TypstationWorld::new(root);
+
+        let output = compile(
+            &mut world,
+            Request {
+                id: 1,
+                revision: 1,
+                source: Some("= Título exportado\n\nConteúdo do documento.".to_owned()),
+                overlays: Vec::new(),
+                reset_files: true,
+                purpose: Purpose::Export(ExportFormat::Html),
+                export_options: ExportOptions {
+                    html_pretty: true,
+                    ..ExportOptions::default()
+                },
+            },
+        );
+
+        let html = String::from_utf8(output.artifact.expect("HTML should be generated"))
+            .expect("HTML should be UTF-8");
+        assert_eq!(output.error_count, 0);
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("Título exportado"));
+        assert!(html.contains("Conteúdo do documento."));
+        assert!(html.contains('\n'));
     }
 
     #[test]
@@ -454,6 +691,7 @@ mod tests {
                 overlays: Vec::new(),
                 reset_files: true,
                 purpose: Purpose::Preview,
+                export_options: ExportOptions::default(),
             },
         );
 
@@ -483,6 +721,7 @@ mod tests {
                 overlays: Vec::new(),
                 reset_files: true,
                 purpose: Purpose::Preview,
+                export_options: ExportOptions::default(),
             },
         );
 
@@ -515,6 +754,7 @@ mod tests {
                 }],
                 reset_files: true,
                 purpose: Purpose::Preview,
+                export_options: ExportOptions::default(),
             },
         );
 
@@ -532,6 +772,7 @@ mod tests {
                 overlays: Vec::new(),
                 reset_files: false,
                 purpose: Purpose::Preview,
+                export_options: ExportOptions::default(),
             },
         );
 
@@ -561,6 +802,7 @@ mod tests {
                 overlays: Vec::new(),
                 reset_files: true,
                 purpose: Purpose::Preview,
+                export_options: ExportOptions::default(),
             },
         );
 

@@ -5415,6 +5415,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "typst",
+ "typst-html",
  "typst-iced-editor",
  "typst-kit",
  "typst-layout",

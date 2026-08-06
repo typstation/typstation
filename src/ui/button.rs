@@ -65,6 +65,12 @@ impl ButtonOptions {
         size: ButtonSize::Medium,
     };
 
+    pub const NEGATIVE_OUTLINE: Self = Self {
+        variant: ButtonVariant::Negative,
+        style: ButtonStyle::Outline,
+        size: ButtonSize::Medium,
+    };
+
     pub const fn size(mut self, size: ButtonSize) -> Self {
         self.size = size;
         self
@@ -159,6 +165,64 @@ where
         .height(Length::Fixed(metrics.height))
         .padding([0.0, metrics.horizontal_padding])
         .style(move |theme, status| spectrum_button_style(theme, status, options))
+}
+
+pub fn workflow_icon_button<'a, Message>(
+    icon: WorkflowIcon,
+    label: &'a str,
+    on_press: Option<Message>,
+    options: ButtonOptions,
+) -> Element<'a, Message>
+where
+    Message: Clone + 'a,
+{
+    let metrics = button_metrics(options.size);
+    let icon_size = button_icon_size(options.size);
+    let enabled = on_press.is_some();
+    let icon = svg(icon.handle())
+        .width(Length::Fixed(icon_size))
+        .height(Length::Fixed(icon_size))
+        .style(move |theme, status| {
+            let colors = SpectrumColors::from_theme(theme);
+            let status = match status {
+                svg::Status::Idle => button::Status::Active,
+                svg::Status::Hovered => button::Status::Hovered,
+            };
+            let color = if !enabled {
+                colors.disabled_content
+            } else if options.style == ButtonStyle::Fill
+                && matches!(
+                    options.variant,
+                    ButtonVariant::Accent | ButtonVariant::Negative
+                )
+            {
+                iced::Color::WHITE
+            } else if options.style == ButtonStyle::Fill
+                && options.variant == ButtonVariant::Primary
+            {
+                colors.gray.gray_25
+            } else {
+                colors.neutral_content.for_status(status)
+            };
+            svg::Style { color: Some(color) }
+        });
+    let control = button(icon)
+        .on_press_maybe(on_press)
+        .width(Length::Fixed(metrics.height))
+        .height(Length::Fixed(metrics.height))
+        .padding((metrics.height - icon_size) / 2.0)
+        .style(move |theme, status| spectrum_button_style(theme, status, options));
+
+    tooltip(
+        control,
+        text(label).size(tokens::typography::FONT_SIZE_75),
+        tooltip::Position::Bottom,
+    )
+    .gap(tokens::spacing::BASE_GAP_SMALL)
+    .padding(8)
+    .delay(Duration::from_millis(500))
+    .style(tooltip_style)
+    .into()
 }
 
 pub fn action_button<'a, Message>(
@@ -269,6 +333,27 @@ where
         on_press,
         options,
         ActionButtonPosition::Standalone,
+        tooltip::Position::Bottom,
+    )
+}
+
+pub(super) fn workflow_icon_action_button_with_tooltip<'a, Message>(
+    icon: WorkflowIcon,
+    label: impl text::IntoFragment<'a>,
+    on_press: Option<Message>,
+    options: ActionButtonOptions,
+    tooltip_position: tooltip::Position,
+) -> Element<'a, Message>
+where
+    Message: Clone + 'a,
+{
+    workflow_icon_action_button_at(
+        icon,
+        label,
+        on_press,
+        options,
+        ActionButtonPosition::Standalone,
+        tooltip_position,
     )
 }
 
@@ -282,15 +367,23 @@ pub(super) fn grouped_workflow_icon_action_button<'a, Message>(
 where
     Message: Clone + 'a,
 {
-    workflow_icon_action_button_at(icon, label, on_press, options, position)
+    workflow_icon_action_button_at(
+        icon,
+        label,
+        on_press,
+        options,
+        position,
+        tooltip::Position::Bottom,
+    )
 }
 
 fn workflow_icon_action_button_at<'a, Message>(
     icon: WorkflowIcon,
-    label: &'a str,
+    label: impl text::IntoFragment<'a>,
     on_press: Option<Message>,
     options: ActionButtonOptions,
     position: ActionButtonPosition,
+    tooltip_position: tooltip::Position,
 ) -> Element<'a, Message>
 where
     Message: Clone + 'a,
@@ -311,7 +404,7 @@ where
     tooltip(
         control,
         text(label).size(tokens::typography::FONT_SIZE_75),
-        tooltip::Position::Bottom,
+        tooltip_position,
     )
     .gap(tokens::spacing::BASE_GAP_SMALL)
     .padding(8)
@@ -360,6 +453,15 @@ const fn button_metrics(size: ButtonSize) -> ButtonMetrics {
             font_size: tokens::typography::FONT_SIZE_300,
             horizontal_padding: tokens::spacing::BUTTON_HORIZONTAL_EXTRA_LARGE,
         },
+    }
+}
+
+const fn button_icon_size(size: ButtonSize) -> f32 {
+    match size {
+        ButtonSize::Small => tokens::icon::WORKFLOW_SIZE_75,
+        ButtonSize::Medium => tokens::icon::WORKFLOW_SIZE_100,
+        ButtonSize::Large => tokens::icon::WORKFLOW_SIZE_200,
+        ButtonSize::ExtraLarge => tokens::icon::WORKFLOW_SIZE_300,
     }
 }
 

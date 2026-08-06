@@ -9,9 +9,28 @@ use iced::{
 };
 
 use super::{
+    ActionButtonOptions, ActionButtonSize,
+    button::workflow_icon_action_button_with_tooltip,
     icons::WorkflowIcon,
     tokens::{self, SpectrumColors},
 };
+
+#[derive(Debug, Clone)]
+pub struct TreeViewAction<Message> {
+    pub icon: WorkflowIcon,
+    pub label: String,
+    pub on_press: Option<Message>,
+}
+
+impl<Message> TreeViewAction<Message> {
+    pub fn new(icon: WorkflowIcon, label: impl Into<String>, on_press: Option<Message>) -> Self {
+        Self {
+            icon,
+            label: label.into(),
+            on_press,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TreeViewItem<Message> {
@@ -24,6 +43,8 @@ pub struct TreeViewItem<Message> {
     pub on_press: Option<Message>,
     pub on_context_menu: Option<Message>,
     pub has_children: bool,
+    pub reserve_icon_space: Option<bool>,
+    pub actions: Vec<TreeViewAction<Message>>,
     pub children: Vec<TreeViewItem<Message>>,
 }
 
@@ -43,6 +64,8 @@ impl<Message> TreeViewItem<Message> {
             on_press,
             on_context_menu: None,
             has_children: false,
+            reserve_icon_space: None,
+            actions: Vec::new(),
             children: Vec::new(),
         }
     }
@@ -76,6 +99,16 @@ impl<Message> TreeViewItem<Message> {
 
     pub fn has_children(mut self, has_children: bool) -> Self {
         self.has_children = has_children;
+        self
+    }
+
+    pub fn reserve_icon_space(mut self, reserve: bool) -> Self {
+        self.reserve_icon_space = Some(reserve);
+        self
+    }
+
+    pub fn actions(mut self, actions: Vec<TreeViewAction<Message>>) -> Self {
+        self.actions = actions;
         self
     }
 }
@@ -187,8 +220,11 @@ where
         status_label,
         on_press,
         on_context_menu,
+        reserve_icon_space: item_icon_space,
+        actions,
         ..
     } = item;
+    let reserve_icon_space = item_icon_space.unwrap_or(reserve_icon_space);
     let enabled = on_press.is_some();
     let full_label =
         status_label.map_or_else(|| label.clone(), |status| format!("{label} - {status}"));
@@ -272,8 +308,7 @@ where
         Some(message) => mouse_area(control).on_right_press(message).into(),
         None => control.into(),
     };
-
-    tooltip(
+    let control: Element<'a, Message> = tooltip(
         control,
         text(full_label).size(tokens::typography::FONT_SIZE_75),
         tooltip::Position::Right,
@@ -282,7 +317,37 @@ where
     .padding(8)
     .delay(Duration::from_millis(700))
     .style(tooltip_style)
-    .into()
+    .into();
+
+    if actions.is_empty() {
+        return control;
+    }
+
+    let options = ActionButtonOptions::QUIET.size(ActionButtonSize::Small);
+    let mut row = row![control]
+        .align_y(Alignment::Center)
+        .spacing(tokens::spacing::TREE_VIEW_ACTION_GAP)
+        .width(Length::Fill);
+
+    for action in actions {
+        row = row.push(workflow_icon_action_button_with_tooltip(
+            action.icon,
+            action.label,
+            action.on_press,
+            options,
+            tooltip::Position::Bottom,
+        ));
+    }
+
+    container(row)
+        .width(Length::Fill)
+        .height(Length::Fixed(tokens::dimension::TREE_VIEW_MINIMUM_HEIGHT))
+        .padding(Padding {
+            right: tokens::spacing::TREE_VIEW_ACTION_END_PADDING,
+            ..Padding::ZERO
+        })
+        .style(move |theme| tree_row_background_style(theme, selected, emphasized))
+        .into()
 }
 
 fn tree_status_icon<'a, Message>(icon: WorkflowIcon) -> Element<'a, Message>
@@ -375,6 +440,22 @@ fn tree_row_style(
     }
 }
 
+fn tree_row_background_style(theme: &Theme, selected: bool, emphasized: bool) -> container::Style {
+    let colors = SpectrumColors::from_theme(theme);
+    let background = if selected && emphasized {
+        Some(with_alpha(colors.accent_background.default, 0.10))
+    } else if selected {
+        Some(colors.gray.gray_100)
+    } else {
+        None
+    };
+
+    container::Style {
+        background: background.map(Background::Color),
+        ..container::Style::default()
+    }
+}
+
 fn tooltip_style(theme: &Theme) -> container::Style {
     let colors = SpectrumColors::from_theme(theme);
 
@@ -429,12 +510,25 @@ mod tests {
     #[test]
     fn status_and_context_menu_are_explicit_item_semantics() {
         let item = TreeViewItem::new("main.typ", Some(WorkflowIcon::FileCode), Some(1))
-            .status_icon(WorkflowIcon::Preview, "Exibido no Preview")
+            .status_icon(WorkflowIcon::Visibility, "Exibido no Preview")
             .on_context_menu(2);
 
-        assert_eq!(item.status_icon, Some(WorkflowIcon::Preview));
+        assert_eq!(item.status_icon, Some(WorkflowIcon::Visibility));
         assert_eq!(item.status_label.as_deref(), Some("Exibido no Preview"));
         assert_eq!(item.on_context_menu, Some(2));
+    }
+
+    #[test]
+    fn trailing_actions_keep_their_icon_label_and_message() {
+        let item =
+            TreeViewItem::new("projeto", Some(WorkflowIcon::Project), Some(1)).actions(vec![
+                TreeViewAction::new(WorkflowIcon::FileAdd, "Novo arquivo", Some(2)),
+            ]);
+
+        assert_eq!(item.actions.len(), 1);
+        assert_eq!(item.actions[0].icon, WorkflowIcon::FileAdd);
+        assert_eq!(item.actions[0].label, "Novo arquivo");
+        assert_eq!(item.actions[0].on_press, Some(2));
     }
 
     #[test]
@@ -442,5 +536,12 @@ mod tests {
         let tree = TreeView::<()>::new(Vec::new()).reserve_icon_space(false);
 
         assert!(!tree.reserve_icon_space);
+    }
+
+    #[test]
+    fn an_item_can_override_the_tree_icon_space() {
+        let item = TreeViewItem::<()>::new("PROJETO", None, None).reserve_icon_space(false);
+
+        assert_eq!(item.reserve_icon_space, Some(false));
     }
 }

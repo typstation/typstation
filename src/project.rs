@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rfd::{AsyncFileDialog, AsyncMessageDialog, MessageButtons, MessageDialogResult, MessageLevel};
+use rfd::AsyncFileDialog;
 
 #[derive(Debug, Clone)]
 pub struct ScanOutcome {
@@ -187,22 +187,6 @@ pub async fn delete_entry(root: PathBuf, path: PathBuf, kind: EntryKind) -> Oper
         return OperationOutcome::Failed("a raiz do projeto não pode ser excluída".to_owned());
     }
 
-    let noun = entry_noun(kind);
-    let confirmed = AsyncMessageDialog::new()
-        .set_level(MessageLevel::Warning)
-        .set_title(format!("Excluir {noun} do projeto"))
-        .set_description(format!(
-            "Excluir permanentemente {}? Esta ação não pode ser desfeita.",
-            path.display()
-        ))
-        .set_buttons(MessageButtons::YesNo)
-        .show()
-        .await;
-
-    if confirmed != MessageDialogResult::Yes {
-        return OperationOutcome::Cancelled;
-    }
-
     let result = if kind == EntryKind::Directory {
         tokio::fs::remove_dir_all(&path).await
     } else {
@@ -236,13 +220,6 @@ const fn rename_dialog_title(kind: EntryKind) -> &'static str {
         EntryKind::Directory => "Renomear pasta do projeto",
         EntryKind::TypstFile => "Renomear arquivo Typst",
         EntryKind::File => "Renomear arquivo do projeto",
-    }
-}
-
-const fn entry_noun(kind: EntryKind) -> &'static str {
-    match kind {
-        EntryKind::Directory => "pasta",
-        EntryKind::TypstFile | EntryKind::File => "arquivo",
     }
 }
 

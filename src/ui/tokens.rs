@@ -83,6 +83,20 @@ pub mod dimension {
     pub const TREE_VIEW_DISCLOSURE_WIDTH: f32 = 34.0;
     pub const TREE_VIEW_STATUS_ICON_SLOT_WIDTH: f32 = COMPONENT_HEIGHT_100;
 
+    pub const PROBLEMS_HEADER_HEIGHT: f32 = COMPONENT_HEIGHT_100;
+    pub const PROBLEMS_DIVIDER_HEIGHT: f32 = 1.0;
+    pub const STATUS_LIGHT_DOT_SMALL: f32 = 8.0;
+    pub const STATUS_BAR_HEIGHT: f32 = COMPONENT_HEIGHT_100;
+    pub const STATUS_BAR_INDICATOR_HEIGHT: f32 = COMPONENT_HEIGHT_75;
+
+    pub const FIELD_HEIGHT_MEDIUM: f32 = COMPONENT_HEIGHT_100;
+    pub const CHECKBOX_SIZE_MEDIUM: f32 = 16.0;
+    pub const CHECKBOX_CORNER_RADIUS: f32 = 2.0;
+
+    pub const ALERT_DIALOG_MINIMUM_WIDTH: f32 = 288.0;
+    pub const ALERT_DIALOG_MAXIMUM_WIDTH: f32 = 480.0;
+    pub const ALERT_DIALOG_DIVIDER_HEIGHT: f32 = 1.0;
+
     pub const TAB_ITEM_COMPACT_HEIGHT_MEDIUM: f32 = COMPONENT_HEIGHT_100;
     pub const TAB_SELECTION_INDICATOR_HEIGHT: f32 = BORDER_WIDTH_200;
     pub const TAB_CLOSE_BUTTON_SIZE: f32 = COMPONENT_HEIGHT_75;
@@ -92,10 +106,8 @@ pub mod dimension {
     pub const MENU_POPOVER_CORNER_RADIUS: f32 = CORNER_RADIUS_700;
     pub const MENU_SECTION_DIVIDER_HEIGHT: f32 = 12.0;
 
-    pub const SIDE_NAVIGATION_DEFAULT_WIDTH: f32 = 120.0;
-    pub const SIDE_NAVIGATION_ITEM_HEIGHT: f32 = COMPONENT_HEIGHT_200;
-    pub const SIDE_NAVIGATION_INDICATOR_WIDTH: f32 = BORDER_WIDTH_200;
-    pub const SIDE_NAVIGATION_INDICATOR_HEIGHT: f32 = COMPONENT_HEIGHT_75;
+    pub const SIDE_NAVIGATION_RAIL_WIDTH: f32 = COMPONENT_HEIGHT_300;
+    pub const SIDE_NAVIGATION_NOTIFICATION_SIZE: f32 = 10.0;
 }
 
 pub mod spacing {
@@ -134,11 +146,40 @@ pub mod spacing {
     pub const BUTTON_HORIZONTAL_MEDIUM: f32 = 16.0;
     pub const BUTTON_HORIZONTAL_LARGE: f32 = 20.0;
     pub const BUTTON_HORIZONTAL_EXTRA_LARGE: f32 = 24.0;
+    pub const BUTTON_GROUP_GAP: f32 = 8.0;
 
     pub const TREE_VIEW_EDGE_TO_CONTENT: f32 = 6.0;
     pub const TREE_VIEW_ITEM_GAP: f32 = 8.0;
+    pub const TREE_VIEW_ACTION_GAP: f32 = BASE_GAP_SMALL;
+    // Inclui a área ocupada pelo scrollbar sobreposto e preserva 12 px visíveis.
+    pub const TREE_VIEW_ACTION_END_PADDING: f32 = 24.0;
     pub const TREE_VIEW_LEVEL_INCREMENT: f32 = 16.0;
     pub const TREE_VIEW_TOP_TO_DISCLOSURE: f32 = 4.0;
+
+    pub const PROBLEMS_EDGE_TO_CONTENT: f32 = BASE_PADDING_HORIZONTAL_EXTRA_LARGE;
+    pub const PROBLEMS_SUMMARY_GAP: f32 = BASE_PADDING_HORIZONTAL_MEDIUM;
+    pub const PROBLEMS_MESSAGE_TO_METADATA: f32 = 2.0;
+    pub const STATUS_LIGHT_DOT_TO_LABEL: f32 = BASE_GAP_MEDIUM;
+    pub const STATUS_BAR_EDGE_TO_CONTENT: f32 = 8.0;
+    pub const STATUS_BAR_INDICATOR_GAP: f32 = BASE_GAP_SMALL;
+    pub const STATUS_BAR_ICON_TO_COUNT: f32 = BASE_GAP_SMALL;
+
+    pub const FIELD_EDGE_TO_TEXT_MEDIUM: f32 = 12.0;
+    pub const CHECKBOX_TO_LABEL: f32 = 8.0;
+
+    pub const ALERT_DIALOG_PADDING: f32 = 32.0;
+    pub const ALERT_DIALOG_ICON_TO_TITLE: f32 = 12.0;
+    pub const ALERT_DIALOG_TITLE_TO_DIVIDER: f32 = 16.0;
+    pub const ALERT_DIALOG_DIVIDER_TO_DESCRIPTION: f32 = 16.0;
+    pub const ALERT_DIALOG_DESCRIPTION_TO_BUTTONS: f32 = 24.0;
+    pub const ALERT_DIALOG_BUTTON_GAP: f32 = 8.0;
+
+    pub const SEARCH_FIELD_ICON_SLOT: f32 = 36.0;
+    pub const SEARCH_PANEL_EDGE_TO_CONTENT: f32 = 8.0;
+    pub const SEARCH_PANEL_CONTROL_GAP: f32 = 6.0;
+    pub const SEARCH_PANEL_ROW_GAP: f32 = 6.0;
+    pub const TABLE_ROW_TOP_TO_TEXT_MEDIUM_COMPACT: f32 = 6.0;
+    pub const TABLE_ROW_BOTTOM_TO_TEXT_MEDIUM_COMPACT: f32 = 9.0;
 
     pub const TAB_GAP_HORIZONTAL_MEDIUM: f32 = 24.0;
     pub const TAB_START_TO_EDGE_MEDIUM: f32 = BASE_PADDING_HORIZONTAL_MEDIUM;
@@ -149,11 +190,9 @@ pub mod spacing {
     pub const MENU_TEXT_TO_VALUE: f32 = 24.0;
     pub const MENU_POPOVER_PADDING: f32 = BASE_GAP_SMALL;
 
-    pub const SIDE_NAVIGATION_PADDING_HORIZONTAL: f32 = BASE_GAP_SMALL;
-    pub const SIDE_NAVIGATION_PADDING_VERTICAL: f32 = BASE_PADDING_VERTICAL_MEDIUM;
-    pub const SIDE_NAVIGATION_ITEM_GAP: f32 = BASE_GAP_SMALL;
-    pub const SIDE_NAVIGATION_CONTENT_GAP: f32 = 8.0;
-    pub const SIDE_NAVIGATION_ITEM_PADDING_HORIZONTAL: f32 = 8.0;
+    pub const SIDE_NAVIGATION_PADDING_HORIZONTAL: f32 = 8.0;
+    pub const SIDE_NAVIGATION_PADDING_VERTICAL: f32 = 8.0;
+    pub const SIDE_NAVIGATION_ITEM_GAP: f32 = BASE_GAP_MEDIUM;
 }
 
 pub mod typography {
@@ -163,6 +202,8 @@ pub mod typography {
     pub const FONT_SIZE_200: f32 = 16.0;
     pub const FONT_SIZE_300: f32 = 18.0;
     pub const LINE_HEIGHT_100: f32 = 1.3;
+    pub const ALERT_DIALOG_TITLE: f32 = 22.0;
+    pub const ALERT_DIALOG_DESCRIPTION: f32 = 16.0;
 }
 
 pub mod icon {
@@ -174,7 +215,9 @@ pub mod icon {
 
     pub const TREE_VIEW_DISCLOSURE_SIZE: f32 = 10.0;
     pub const TREE_VIEW_WORKFLOW_SIZE: f32 = 18.0;
-    pub const SIDE_NAVIGATION_WORKFLOW_SIZE: f32 = 18.0;
+    pub const STATUS_BAR_SEVERITY_SIZE: f32 = WORKFLOW_SIZE_50;
+    pub const SEARCH_FIELD_ICON_SIZE: f32 = WORKFLOW_SIZE_75;
+    pub const ALERT_DIALOG_ICON_SIZE: f32 = WORKFLOW_SIZE_200;
     pub const UI_CROSS_100_SIZE: f32 = 8.0;
     pub const UI_CHECKMARK_100_SIZE: f32 = 10.0;
 }
@@ -315,11 +358,19 @@ mod tests {
         assert_eq!(spacing::COMPONENT_EDGE_TO_VISUAL_ONLY_75, 4.0);
         assert_eq!(spacing::COMPONENT_TOP_TO_WORKFLOW_ICON_75, 4.0);
         assert_eq!(spacing::ACTION_GROUP_COMPACT_SPACING, -1.0);
+        assert_eq!(spacing::BUTTON_GROUP_GAP, 8.0);
         assert_eq!(dimension::ACTION_GROUP_COMPACT_RADIUS, 8.0);
         assert_eq!(dimension::TREE_VIEW_MINIMUM_HEIGHT, 40.0);
         assert_eq!(dimension::TREE_VIEW_DISCLOSURE_WIDTH, 34.0);
         assert_eq!(dimension::TREE_VIEW_STATUS_ICON_SLOT_WIDTH, 32.0);
         assert_eq!(spacing::TREE_VIEW_LEVEL_INCREMENT, 16.0);
+        assert_eq!(spacing::TREE_VIEW_ACTION_END_PADDING, 24.0);
+        assert_eq!(dimension::PROBLEMS_HEADER_HEIGHT, 32.0);
+        assert_eq!(dimension::STATUS_LIGHT_DOT_SMALL, 8.0);
+        assert_eq!(spacing::PROBLEMS_EDGE_TO_CONTENT, 16.0);
+        assert_eq!(spacing::STATUS_LIGHT_DOT_TO_LABEL, 6.0);
+        assert_eq!(spacing::TABLE_ROW_TOP_TO_TEXT_MEDIUM_COMPACT, 6.0);
+        assert_eq!(spacing::TABLE_ROW_BOTTOM_TO_TEXT_MEDIUM_COMPACT, 9.0);
         assert_eq!(icon::TREE_VIEW_WORKFLOW_SIZE, 18.0);
         assert_eq!(icon::TREE_VIEW_DISCLOSURE_SIZE, 10.0);
         assert_eq!(dimension::TAB_ITEM_COMPACT_HEIGHT_MEDIUM, 32.0);
@@ -327,10 +378,10 @@ mod tests {
         assert_eq!(dimension::TAB_CLOSE_BUTTON_SIZE, 24.0);
         assert_eq!(spacing::TAB_GAP_HORIZONTAL_MEDIUM, 24.0);
         assert_eq!(icon::UI_CROSS_100_SIZE, 8.0);
-        assert_eq!(dimension::SIDE_NAVIGATION_DEFAULT_WIDTH, 120.0);
-        assert_eq!(dimension::SIDE_NAVIGATION_ITEM_HEIGHT, 40.0);
-        assert_eq!(dimension::SIDE_NAVIGATION_INDICATOR_WIDTH, 2.0);
-        assert_eq!(icon::SIDE_NAVIGATION_WORKFLOW_SIZE, 18.0);
+        assert_eq!(dimension::SIDE_NAVIGATION_RAIL_WIDTH, 48.0);
+        assert_eq!(dimension::SIDE_NAVIGATION_NOTIFICATION_SIZE, 10.0);
+        assert_eq!(spacing::SIDE_NAVIGATION_PADDING_HORIZONTAL, 8.0);
+        assert_eq!(spacing::SIDE_NAVIGATION_ITEM_GAP, 6.0);
     }
 
     #[test]

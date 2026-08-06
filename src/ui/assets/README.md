@@ -15,11 +15,19 @@ Adobe sob a licença Apache-2.0:
 - `file-code.svg`: `FileCodeIcon`;
 - `folder.svg`: `FolderIcon`;
 - `folder-open.svg`: `FolderOpenIcon`;
-- `project.svg`: `BriefcaseIcon`, usado para identificar a raiz do projeto.
+- `project.svg`: `BriefcaseIcon`, disponível no catálogo interno;
 - `file-add.svg`: `FileAddIcon`, usado para criar um documento Typst;
 - `folder-add.svg`: `FolderAddIcon`, usado para criar uma pasta;
 - `refresh.svg`: `RefreshIcon`, usado para atualizar a árvore do projeto;
-- `preview.svg`: `PreviewIcon`, usado para identificar o documento exibido no Preview.
+- `visibility.svg`: `VisibilityIcon`, usado para identificar o documento exibido no Preview.
+- `alert.svg`: `AlertIcon`, usado para avisos de compilação;
+- `alert-circle-filled.svg`: `AlertCircleFilledIcon`, usado para erros e para abrir Problemas.
+- `search.svg`: `SearchIcon`, usado no campo de busca;
+- `find-and-replace.svg`: `FindAndReplaceIcon`, usado para alternar substituição;
+- `chevron-up.svg`: `ChevronUpIcon`, usado para o resultado anterior;
+- `close.svg`: `CloseIcon`, usado para fechar superfícies temporárias;
+- `settings.svg`: `SettingsIcon`, usado na janela de configurações.
+- `more.svg`: `MoreIcon`, usado para abrir ações adicionais de exportação.
 
 O SVG de interface foi extraído de
 `@spectrum-web-components/icons-ui` versão `1.12.2`, sob a mesma licença:

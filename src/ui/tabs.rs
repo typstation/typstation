@@ -134,34 +134,45 @@ where
         on_close,
     } = item;
     let enabled = on_select.is_some();
-    let close_enabled = on_close.is_some();
     let label = text(label)
         .size(tokens::typography::FONT_SIZE_100)
         .line_height(tokens::typography::LINE_HEIGHT_100)
-        .wrapping(text::Wrapping::None);
-    let close_icon = svg(UiIcon::Cross100.handle())
-        .width(Length::Fixed(tokens::icon::UI_CROSS_100_SIZE))
-        .height(Length::Fixed(tokens::icon::UI_CROSS_100_SIZE))
-        .style(move |theme, status| close_icon_style(theme, status, close_enabled));
-    let close_button = button(close_icon)
-        .on_press_maybe(on_close)
-        .width(Length::Fixed(tokens::dimension::TAB_CLOSE_BUTTON_SIZE))
-        .height(Length::Fixed(tokens::dimension::TAB_CLOSE_BUTTON_SIZE))
-        .padding((tokens::dimension::TAB_CLOSE_BUTTON_SIZE - tokens::icon::UI_CROSS_100_SIZE) / 2.0)
-        .style(close_button_style);
-    let close: Element<'a, Message> = tooltip(
-        close_button,
-        text("Fechar aba").size(tokens::typography::FONT_SIZE_75),
-        tooltip::Position::Top,
-    )
-    .gap(tokens::spacing::BASE_GAP_SMALL)
-    .padding(8)
-    .delay(Duration::from_millis(500))
-    .style(tooltip_style)
-    .into();
-    let content = row![label, close]
+        .height(Length::Fill)
         .align_y(Alignment::Center)
-        .spacing(tokens::spacing::TAB_ITEM_CONTENT_GAP);
+        .wrapping(text::Wrapping::None);
+    let content: Element<'a, Message> = match on_close {
+        Some(on_close) => {
+            let close_icon = svg(UiIcon::Cross100.handle())
+                .width(Length::Fixed(tokens::icon::UI_CROSS_100_SIZE))
+                .height(Length::Fixed(tokens::icon::UI_CROSS_100_SIZE))
+                .style(move |theme, status| close_icon_style(theme, status, true));
+            let close_button = button(close_icon)
+                .on_press(on_close)
+                .width(Length::Fixed(tokens::dimension::TAB_CLOSE_BUTTON_SIZE))
+                .height(Length::Fixed(tokens::dimension::TAB_CLOSE_BUTTON_SIZE))
+                .padding(
+                    (tokens::dimension::TAB_CLOSE_BUTTON_SIZE - tokens::icon::UI_CROSS_100_SIZE)
+                        / 2.0,
+                )
+                .style(close_button_style);
+            let close: Element<'a, Message> = tooltip(
+                close_button,
+                text("Fechar aba").size(tokens::typography::FONT_SIZE_75),
+                tooltip::Position::Top,
+            )
+            .gap(tokens::spacing::BASE_GAP_SMALL)
+            .padding(8)
+            .delay(Duration::from_millis(500))
+            .style(tooltip_style)
+            .into();
+
+            row![label, close]
+                .align_y(Alignment::Center)
+                .spacing(tokens::spacing::TAB_ITEM_CONTENT_GAP)
+                .into()
+        }
+        None => label.into(),
+    };
     let control = button(content)
         .on_press_maybe(on_select)
         .height(Length::Fixed(

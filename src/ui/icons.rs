@@ -19,11 +19,19 @@ const PROJECT: &[u8] = include_bytes!("assets/project.svg");
 const FILE_ADD: &[u8] = include_bytes!("assets/file-add.svg");
 const FOLDER_ADD: &[u8] = include_bytes!("assets/folder-add.svg");
 const REFRESH: &[u8] = include_bytes!("assets/refresh.svg");
-const PREVIEW: &[u8] = include_bytes!("assets/preview.svg");
+const VISIBILITY: &[u8] = include_bytes!("assets/visibility.svg");
+const ALERT: &[u8] = include_bytes!("assets/alert.svg");
+const ALERT_CIRCLE_FILLED: &[u8] = include_bytes!("assets/alert-circle-filled.svg");
+const SEARCH: &[u8] = include_bytes!("assets/search.svg");
+const FIND_AND_REPLACE: &[u8] = include_bytes!("assets/find-and-replace.svg");
+const CHEVRON_UP: &[u8] = include_bytes!("assets/chevron-up.svg");
+const CLOSE: &[u8] = include_bytes!("assets/close.svg");
+const SETTINGS: &[u8] = include_bytes!("assets/settings.svg");
+const MORE: &[u8] = include_bytes!("assets/more.svg");
 const CROSS_100: &[u8] = include_bytes!("assets/cross-100.svg");
 const CHECKMARK_100: &[u8] = include_bytes!("assets/checkmark-100.svg");
 
-static HANDLES: LazyLock<[svg::Handle; 16]> = LazyLock::new(|| {
+static HANDLES: LazyLock<[svg::Handle; 24]> = LazyLock::new(|| {
     [
         svg::Handle::from_memory(TEXT_BOLD),
         svg::Handle::from_memory(TEXT_ITALIC),
@@ -40,7 +48,15 @@ static HANDLES: LazyLock<[svg::Handle; 16]> = LazyLock::new(|| {
         svg::Handle::from_memory(FILE_ADD),
         svg::Handle::from_memory(FOLDER_ADD),
         svg::Handle::from_memory(REFRESH),
-        svg::Handle::from_memory(PREVIEW),
+        svg::Handle::from_memory(VISIBILITY),
+        svg::Handle::from_memory(ALERT),
+        svg::Handle::from_memory(ALERT_CIRCLE_FILLED),
+        svg::Handle::from_memory(SEARCH),
+        svg::Handle::from_memory(FIND_AND_REPLACE),
+        svg::Handle::from_memory(CHEVRON_UP),
+        svg::Handle::from_memory(CLOSE),
+        svg::Handle::from_memory(SETTINGS),
+        svg::Handle::from_memory(MORE),
     ]
 });
 
@@ -68,7 +84,15 @@ pub enum WorkflowIcon {
     FileAdd,
     FolderAdd,
     Refresh,
-    Preview,
+    Visibility,
+    Alert,
+    AlertCircleFilled,
+    Search,
+    FindAndReplace,
+    ChevronUp,
+    Close,
+    Settings,
+    More,
 }
 
 impl WorkflowIcon {
@@ -93,7 +117,15 @@ impl WorkflowIcon {
             Self::FileAdd => 12,
             Self::FolderAdd => 13,
             Self::Refresh => 14,
-            Self::Preview => 15,
+            Self::Visibility => 15,
+            Self::Alert => 16,
+            Self::AlertCircleFilled => 17,
+            Self::Search => 18,
+            Self::FindAndReplace => 19,
+            Self::ChevronUp => 20,
+            Self::Close => 21,
+            Self::Settings => 22,
+            Self::More => 23,
         }
     }
 }
@@ -139,7 +171,15 @@ mod tests {
             WorkflowIcon::FileAdd,
             WorkflowIcon::FolderAdd,
             WorkflowIcon::Refresh,
-            WorkflowIcon::Preview,
+            WorkflowIcon::Visibility,
+            WorkflowIcon::Alert,
+            WorkflowIcon::AlertCircleFilled,
+            WorkflowIcon::Search,
+            WorkflowIcon::FindAndReplace,
+            WorkflowIcon::ChevronUp,
+            WorkflowIcon::Close,
+            WorkflowIcon::Settings,
+            WorkflowIcon::More,
         ];
         let ids: Vec<_> = icons.into_iter().map(|icon| icon.handle().id()).collect();
 

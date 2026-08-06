@@ -1,12 +1,13 @@
-//! Navegação lateral de seleção simples baseada no Side Navigation do Spectrum.
+//! Trilho lateral de ícones baseado em um Action Group vertical do Spectrum.
 
 use iced::{
-    Alignment, Background, Border, Element, Font, Length, Theme,
-    font::Weight,
-    widget::{Space, button, column, container, row, svg, text},
+    Alignment, Background, Border, Element, Length, Theme,
+    widget::{Column, Space, Stack, container, tooltip},
 };
 
 use super::{
+    ActionButtonOptions,
+    button::workflow_icon_action_button_with_tooltip,
     icons::WorkflowIcon,
     tokens::{self, SpectrumColors},
 };
@@ -16,7 +17,14 @@ pub struct SideNavigationItem<Message> {
     pub label: String,
     pub icon: WorkflowIcon,
     pub selected: bool,
+    pub notification: Option<SideNavigationNotification>,
     pub on_press: Option<Message>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SideNavigationNotification {
+    Error,
+    Warning,
 }
 
 impl<Message> SideNavigationItem<Message> {
@@ -25,12 +33,18 @@ impl<Message> SideNavigationItem<Message> {
             label: label.into(),
             icon,
             selected: false,
+            notification: None,
             on_press,
         }
     }
 
     pub fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
+        self
+    }
+
+    pub fn notification(mut self, notification: Option<SideNavigationNotification>) -> Self {
+        self.notification = notification;
         self
     }
 }
@@ -56,16 +70,17 @@ impl<Message> SideNavigation<Message> {
     where
         Message: Clone + 'a,
     {
-        let mut items = column![].spacing(tokens::spacing::SIDE_NAVIGATION_ITEM_GAP);
+        let mut items = Column::new()
+            .spacing(tokens::spacing::SIDE_NAVIGATION_ITEM_GAP)
+            .align_x(Alignment::Center)
+            .width(Length::Fill);
 
         for item in self.items {
             items = items.push(side_navigation_item(item));
         }
 
         container(items)
-            .width(Length::Fixed(
-                tokens::dimension::SIDE_NAVIGATION_DEFAULT_WIDTH,
-            ))
+            .width(Length::Fixed(tokens::dimension::SIDE_NAVIGATION_RAIL_WIDTH))
             .height(Length::Fill)
             .padding([
                 tokens::spacing::SIDE_NAVIGATION_PADDING_VERTICAL,
@@ -93,48 +108,42 @@ where
         label,
         icon,
         selected,
+        notification,
         on_press,
     } = item;
-    let enabled = on_press.is_some();
-    let indicator = container(Space::new())
-        .width(Length::Fixed(
-            tokens::dimension::SIDE_NAVIGATION_INDICATOR_WIDTH,
-        ))
-        .height(Length::Fixed(
-            tokens::dimension::SIDE_NAVIGATION_INDICATOR_HEIGHT,
-        ))
-        .style(move |theme| selection_indicator_style(theme, selected && enabled));
-    let icon = svg(icon.handle())
-        .width(Length::Fixed(tokens::icon::SIDE_NAVIGATION_WORKFLOW_SIZE))
-        .height(Length::Fixed(tokens::icon::SIDE_NAVIGATION_WORKFLOW_SIZE))
-        .style(move |theme, status| navigation_icon_style(theme, status, selected, enabled));
-    let label = text(label)
-        .size(tokens::typography::FONT_SIZE_100)
-        .line_height(tokens::typography::LINE_HEIGHT_100)
-        .font(Font {
-            weight: Weight::Medium,
-            ..Font::DEFAULT
-        })
-        .width(Length::Fill)
-        .wrapping(text::Wrapping::None)
-        .align_y(Alignment::Center);
-    let content = row![indicator, icon, label]
-        .align_y(Alignment::Center)
-        .spacing(tokens::spacing::SIDE_NAVIGATION_CONTENT_GAP)
-        .width(Length::Fill)
-        .height(Length::Fill);
 
-    button(content)
-        .on_press_maybe(on_press)
-        .width(Length::Fill)
-        .height(Length::Fixed(
-            tokens::dimension::SIDE_NAVIGATION_ITEM_HEIGHT,
+    let action = workflow_icon_action_button_with_tooltip(
+        icon,
+        label,
+        on_press,
+        ActionButtonOptions::QUIET
+            .selected(selected)
+            .emphasized(true),
+        tooltip::Position::Right,
+    );
+    let Some(notification) = notification else {
+        return action;
+    };
+    let dot = container(Space::new())
+        .width(Length::Fixed(
+            tokens::dimension::SIDE_NAVIGATION_NOTIFICATION_SIZE,
         ))
-        .padding([
-            0.0,
-            tokens::spacing::SIDE_NAVIGATION_ITEM_PADDING_HORIZONTAL,
-        ])
-        .style(move |theme, status| navigation_item_style(theme, status, selected))
+        .height(Length::Fixed(
+            tokens::dimension::SIDE_NAVIGATION_NOTIFICATION_SIZE,
+        ))
+        .style(move |theme| notification_style(theme, notification));
+    let overlay = container(dot)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(1.0)
+        .align_x(Alignment::End)
+        .align_y(Alignment::Start);
+
+    Stack::new()
+        .width(Length::Fixed(tokens::dimension::COMPONENT_HEIGHT_100))
+        .height(Length::Fixed(tokens::dimension::COMPONENT_HEIGHT_100))
+        .push(action)
+        .push(overlay)
         .into()
 }
 
@@ -144,60 +153,23 @@ fn side_navigation_style(theme: &Theme) -> container::Style {
     container::Style::default().background(colors.gray.gray_50)
 }
 
-fn navigation_item_style(theme: &Theme, status: button::Status, selected: bool) -> button::Style {
+fn notification_style(theme: &Theme, notification: SideNavigationNotification) -> container::Style {
     let colors = SpectrumColors::from_theme(theme);
-    let background = match status {
-        button::Status::Pressed => Some(colors.gray.gray_200),
-        button::Status::Hovered => Some(colors.gray.gray_100),
-        button::Status::Active if selected => Some(colors.gray.gray_100),
-        button::Status::Active | button::Status::Disabled => None,
-    };
-    let text_color = if status == button::Status::Disabled {
-        colors.disabled_content
-    } else if selected {
-        colors.accent_background.default
-    } else {
-        colors.gray.gray_800
+    let background = match notification {
+        SideNavigationNotification::Error => colors.negative_background.default,
+        SideNavigationNotification::Warning => colors.notice,
     };
 
-    button::Style {
-        background: background.map(Background::Color),
-        text_color,
-        border: Border::default().rounded(tokens::dimension::CORNER_RADIUS_100),
-        ..button::Style::default()
-    }
-}
-
-fn navigation_icon_style(
-    theme: &Theme,
-    _status: svg::Status,
-    selected: bool,
-    enabled: bool,
-) -> svg::Style {
-    let colors = SpectrumColors::from_theme(theme);
-    let color = if !enabled {
-        colors.disabled_content
-    } else if selected {
-        colors.accent_background.default
-    } else {
-        colors.gray.gray_800
-    };
-
-    svg::Style { color: Some(color) }
-}
-
-fn selection_indicator_style(theme: &Theme, selected: bool) -> container::Style {
-    let colors = SpectrumColors::from_theme(theme);
-
-    if selected {
-        container::Style::default()
-            .background(colors.accent_background.default)
-            .border(Border::default().rounded(
-                tokens::dimension::SIDE_NAVIGATION_INDICATOR_WIDTH
-                    * tokens::dimension::CORNER_RADIUS_FULL_MULTIPLIER,
-            ))
-    } else {
-        container::Style::default()
+    container::Style {
+        background: Some(Background::Color(background)),
+        border: Border {
+            color: colors.gray.gray_50,
+            width: 2.0,
+            radius: (tokens::dimension::SIDE_NAVIGATION_NOTIFICATION_SIZE
+                * tokens::dimension::CORNER_RADIUS_FULL_MULTIPLIER)
+                .into(),
+        },
+        ..container::Style::default()
     }
 }
 
@@ -213,17 +185,31 @@ mod tests {
         assert_eq!(item.label, "Arquivos");
         assert_eq!(item.icon, WorkflowIcon::FolderOpen);
         assert!(item.selected);
+        assert_eq!(item.notification, None);
         assert_eq!(item.on_press, Some(7));
+    }
+
+    #[test]
+    fn item_builder_preserves_a_semantic_notification() {
+        let item = SideNavigationItem::<()>::new(
+            "Problemas: 1 erro",
+            WorkflowIcon::AlertCircleFilled,
+            None,
+        )
+        .notification(Some(SideNavigationNotification::Error));
+
+        assert_eq!(item.notification, Some(SideNavigationNotification::Error));
     }
 
     #[test]
     fn navigation_reports_its_item_count() {
         let navigation = SideNavigation::new(vec![
             SideNavigationItem::<()>::new("Arquivos", WorkflowIcon::FolderOpen, None),
-            SideNavigationItem::new("Tópicos", WorkflowIcon::TextBulleted, None),
+            SideNavigationItem::new("Sumário", WorkflowIcon::TextBulleted, None),
+            SideNavigationItem::new("Problemas", WorkflowIcon::AlertCircleFilled, None),
         ]);
 
-        assert_eq!(navigation.len(), 2);
+        assert_eq!(navigation.len(), 3);
         assert!(!navigation.is_empty());
     }
 }
