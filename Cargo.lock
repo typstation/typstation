@@ -627,7 +627,7 @@ checksum = "fe6d2e5af09e8c8ad56c969f2157a3d4238cebc7c55f0a517728c38f7b200f81"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.1.14",
+ "unicode-width",
 ]
 
 [[package]]
@@ -3612,6 +3612,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pixglyph"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47945e80a49d08350e4a007ac4294c6498d23956c18ea5e6ff480dc93d31643c"
+dependencies = [
+ "ttf-parser",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3755,7 +3764,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "749d63085aa461d80b3233e48781bf9e9dca8147fbc98f577e0697c6827dc418"
 dependencies = [
  "typed-arena",
- "unicode-width 0.2.2",
+ "unicode-width",
 ]
 
 [[package]]
@@ -5369,6 +5378,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "typst-render"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "040ab6e56e91099963ef69dd9f0d284adda66c066b742f1866a20b8295ebb2e3"
+dependencies = [
+ "bytemuck",
+ "comemo",
+ "hayro",
+ "image",
+ "libm",
+ "pixglyph",
+ "resvg 0.47.0",
+ "tiny-skia 0.12.0",
+ "ttf-parser",
+ "typst-assets",
+ "typst-layout",
+ "typst-library",
+ "typst-macros",
+ "typst-timing",
+ "typst-utils",
+]
+
+[[package]]
 name = "typst-svg"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5463,6 +5495,7 @@ dependencies = [
  "typst-kit",
  "typst-layout",
  "typst-pdf",
+ "typst-render",
  "typst-svg",
  "typstyle-core",
 ]
@@ -5480,7 +5513,7 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.18",
  "typst-syntax",
- "unicode-width 0.2.2",
+ "unicode-width",
 ]
 
 [[package]]
@@ -5606,12 +5639,6 @@ name = "unicode-vo"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1d386ff53b415b7fe27b50bb44679e2cc4660272694b7b6f3326d8480823a94"
-
-[[package]]
-name = "unicode-width"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "unicode-width"

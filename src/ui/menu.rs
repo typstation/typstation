@@ -168,17 +168,22 @@ where
             .height(Length::Fixed(tokens::icon::UI_CHECKMARK_100_SIZE))
             .into()
     };
-    let label = text(label)
-        .size(tokens::typography::FONT_SIZE_100)
-        .line_height(tokens::typography::LINE_HEIGHT_100)
-        .font(Font {
-            weight: Weight::Normal,
-            ..Font::DEFAULT
-        })
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_y(Alignment::Center)
-        .wrapping(text::Wrapping::None);
+    let label = container(
+        text(label)
+            .size(tokens::typography::FONT_SIZE_100)
+            .line_height(tokens::typography::LINE_HEIGHT_100)
+            .font(Font {
+                weight: Weight::Normal,
+                ..Font::DEFAULT
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_y(Alignment::Center)
+            .wrapping(text::Wrapping::None),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .clip(true);
     let value: Element<'a, Message> = value.map_or_else(
         || Space::new().height(Length::Fill).into(),
         |value| {

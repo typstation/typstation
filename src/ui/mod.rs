@@ -7,8 +7,11 @@ mod button_group;
 mod form;
 mod icons;
 mod menu;
+mod panel_tabs;
+mod picker;
 mod problems;
-mod side_navigation;
+mod slider;
+mod surface;
 mod tabs;
 mod theme;
 mod tree_view;
@@ -23,11 +26,21 @@ pub use button::{
     workflow_icon_button,
 };
 pub use button_group::{ButtonGroup, ButtonGroupItem, ButtonGroupOrientation};
-pub use form::{search_field, spectrum_checkbox, spectrum_text_field};
+pub use form::{
+    search_field, spectrum_checkbox, spectrum_switch, spectrum_text_field,
+    spectrum_text_field_with_id,
+};
 pub use icons::{UiIcon, WorkflowIcon};
 pub use menu::{Menu, MenuEntry, MenuItem, menu_bar_button};
+pub use panel_tabs::{PanelTabItem, PanelTabNotification, PanelTabs};
+pub use picker::spectrum_picker;
 pub use problems::{ProblemItem, ProblemSeverity, Problems, problem_count_indicator};
-pub use side_navigation::{SideNavigation, SideNavigationItem, SideNavigationNotification};
+pub use slider::spectrum_slider;
+pub use surface::{
+    bar_style, divider_style, elevated_dialog_style, layer_style, metadata_text_style,
+    modal_backdrop_style, selectable_row_style, split_view_style, vertical_divider,
+    with_bottom_divider, with_top_divider,
+};
 pub use tabs::{TabItem, Tabs};
 pub use theme::spectrum_theme;
 pub use tree_view::{TreeView, TreeViewAction, TreeViewItem};

@@ -28,10 +28,15 @@ const CHEVRON_UP: &[u8] = include_bytes!("assets/chevron-up.svg");
 const CLOSE: &[u8] = include_bytes!("assets/close.svg");
 const SETTINGS: &[u8] = include_bytes!("assets/settings.svg");
 const MORE: &[u8] = include_bytes!("assets/more.svg");
+const UNDO: &[u8] = include_bytes!("assets/undo.svg");
+const REDO: &[u8] = include_bytes!("assets/redo.svg");
+const CODE: &[u8] = include_bytes!("assets/code.svg");
+const ZOOM_IN: &[u8] = include_bytes!("assets/zoom-in.svg");
+const ZOOM_OUT: &[u8] = include_bytes!("assets/zoom-out.svg");
 const CROSS_100: &[u8] = include_bytes!("assets/cross-100.svg");
 const CHECKMARK_100: &[u8] = include_bytes!("assets/checkmark-100.svg");
 
-static HANDLES: LazyLock<[svg::Handle; 24]> = LazyLock::new(|| {
+static HANDLES: LazyLock<[svg::Handle; 29]> = LazyLock::new(|| {
     [
         svg::Handle::from_memory(TEXT_BOLD),
         svg::Handle::from_memory(TEXT_ITALIC),
@@ -57,6 +62,11 @@ static HANDLES: LazyLock<[svg::Handle; 24]> = LazyLock::new(|| {
         svg::Handle::from_memory(CLOSE),
         svg::Handle::from_memory(SETTINGS),
         svg::Handle::from_memory(MORE),
+        svg::Handle::from_memory(UNDO),
+        svg::Handle::from_memory(REDO),
+        svg::Handle::from_memory(CODE),
+        svg::Handle::from_memory(ZOOM_IN),
+        svg::Handle::from_memory(ZOOM_OUT),
     ]
 });
 
@@ -93,6 +103,11 @@ pub enum WorkflowIcon {
     Close,
     Settings,
     More,
+    Undo,
+    Redo,
+    Code,
+    ZoomIn,
+    ZoomOut,
 }
 
 impl WorkflowIcon {
@@ -126,6 +141,11 @@ impl WorkflowIcon {
             Self::Close => 21,
             Self::Settings => 22,
             Self::More => 23,
+            Self::Undo => 24,
+            Self::Redo => 25,
+            Self::Code => 26,
+            Self::ZoomIn => 27,
+            Self::ZoomOut => 28,
         }
     }
 }
@@ -180,6 +200,11 @@ mod tests {
             WorkflowIcon::Close,
             WorkflowIcon::Settings,
             WorkflowIcon::More,
+            WorkflowIcon::Undo,
+            WorkflowIcon::Redo,
+            WorkflowIcon::Code,
+            WorkflowIcon::ZoomIn,
+            WorkflowIcon::ZoomOut,
         ];
         let ids: Vec<_> = icons.into_iter().map(|icon| icon.handle().id()).collect();
 

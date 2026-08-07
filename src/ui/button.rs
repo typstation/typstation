@@ -233,6 +233,30 @@ pub fn action_button<'a, Message>(
 where
     Message: Clone + 'a,
 {
+    action_button_at(label, on_press, options, ActionButtonPosition::Standalone)
+}
+
+pub(super) fn grouped_action_button<'a, Message>(
+    label: impl text::IntoFragment<'a>,
+    on_press: Option<Message>,
+    options: ActionButtonOptions,
+    position: ActionButtonPosition,
+) -> Button<'a, Message>
+where
+    Message: Clone + 'a,
+{
+    action_button_at(label, on_press, options, position)
+}
+
+fn action_button_at<'a, Message>(
+    label: impl text::IntoFragment<'a>,
+    on_press: Option<Message>,
+    options: ActionButtonOptions,
+    position: ActionButtonPosition,
+) -> Button<'a, Message>
+where
+    Message: Clone + 'a,
+{
     let metrics = action_button_metrics(options.size);
     let label = text(label)
         .size(metrics.font_size)
@@ -246,9 +270,7 @@ where
         .on_press_maybe(on_press)
         .height(Length::Fixed(metrics.height))
         .padding([0.0, metrics.horizontal_padding])
-        .style(move |theme, status| {
-            action_button_style(theme, status, options, ActionButtonPosition::Standalone)
-        })
+        .style(move |theme, status| action_button_style(theme, status, options, position))
 }
 
 pub fn icon_action_button<'a, Message>(
@@ -594,9 +616,19 @@ fn action_button_style(
 ) -> button::Style {
     let colors = SpectrumColors::from_theme(theme);
     let metrics = action_button_metrics(options.size);
+    let border_color = if options.quiet {
+        iced::Color::TRANSPARENT
+    } else {
+        match status {
+            button::Status::Active => colors.gray.gray_300,
+            button::Status::Hovered | button::Status::Pressed => colors.gray.gray_400,
+            button::Status::Disabled => colors.disabled_border,
+        }
+    };
     let border = Border {
+        color: border_color,
+        width: tokens::dimension::BORDER_WIDTH_100,
         radius: action_button_radius(metrics.radius, position),
-        ..Border::default()
     };
 
     if status == button::Status::Disabled {
@@ -815,5 +847,30 @@ mod tests {
                 bottom_left: 0.0,
             }
         );
+    }
+
+    #[test]
+    fn non_quiet_action_buttons_keep_a_one_pixel_boundary() {
+        let theme = super::super::spectrum_theme(tokens::ColorScheme::Light);
+        let standard = action_button_style(
+            &theme,
+            button::Status::Active,
+            ActionButtonOptions::STANDARD,
+            ActionButtonPosition::Middle,
+        );
+        let quiet = action_button_style(
+            &theme,
+            button::Status::Active,
+            ActionButtonOptions::QUIET,
+            ActionButtonPosition::Standalone,
+        );
+
+        assert_eq!(standard.border.width, tokens::dimension::BORDER_WIDTH_100);
+        assert_eq!(
+            standard.border.color,
+            SpectrumColors::from_theme(&theme).gray.gray_300
+        );
+        assert_eq!(quiet.border.width, tokens::dimension::BORDER_WIDTH_100);
+        assert_eq!(quiet.border.color, iced::Color::TRANSPARENT);
     }
 }

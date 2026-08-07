@@ -22,6 +22,8 @@ use typstation::world::{SourceOverlay, TypstationWorld};
 
 use crate::source_map::{self, SourceRegion, SourceTarget};
 
+const TYPOGRAPHIC_POINTS_PER_INCH: f32 = 72.0;
+
 pub type Sender = UnboundedSender<Request>;
 
 #[derive(Debug)]
@@ -46,6 +48,7 @@ pub enum ExportFormat {
     Pdf,
     Svg,
     Html,
+    Png,
 }
 
 impl ExportFormat {
@@ -54,6 +57,7 @@ impl ExportFormat {
             Self::Pdf => "PDF",
             Self::Svg => "SVG",
             Self::Html => "HTML",
+            Self::Png => "PNG",
         }
     }
 
@@ -62,6 +66,7 @@ impl ExportFormat {
             Self::Pdf => "pdf",
             Self::Svg => "svg",
             Self::Html => "html",
+            Self::Png => "png",
         }
     }
 }
@@ -74,6 +79,9 @@ pub struct ExportOptions {
     pub svg_pretty: bool,
     pub svg_page_gap: u16,
     pub html_pretty: bool,
+    pub png_ppi: u16,
+    pub png_render_bleed: bool,
+    pub png_page_gap: u16,
 }
 
 impl Default for ExportOptions {
@@ -85,6 +93,9 @@ impl Default for ExportOptions {
             svg_pretty: false,
             svg_page_gap: 12,
             html_pretty: true,
+            png_ppi: 144,
+            png_render_bleed: false,
+            png_page_gap: 12,
         }
     }
 }
@@ -271,7 +282,8 @@ fn compile(world: &mut TypstationWorld, request: Request) -> Output {
         }
         Purpose::Preview
         | Purpose::Export(ExportFormat::Pdf)
-        | Purpose::Export(ExportFormat::Svg) => {
+        | Purpose::Export(ExportFormat::Svg)
+        | Purpose::Export(ExportFormat::Png) => {
             compile_paged(world, id, revision, purpose, export_options)
         }
     }
@@ -360,6 +372,27 @@ fn compile_paged(
                         )
                         .into_bytes(),
                     );
+                }
+                Purpose::Export(ExportFormat::Png) => {
+                    let options = typst_render::RenderOptions {
+                        pixel_per_pt: (f64::from(export_options.png_ppi)
+                            / f64::from(TYPOGRAPHIC_POINTS_PER_INCH))
+                        .into(),
+                        render_bleed: export_options.png_render_bleed,
+                    };
+                    let pixmap = typst_render::render_merged(
+                        &document,
+                        &options,
+                        Abs::pt(f64::from(export_options.png_page_gap)),
+                        None,
+                    );
+                    match pixmap.encode_png() {
+                        Ok(png) => output.artifact = Some(png),
+                        Err(error) => {
+                            output.error_count = 1;
+                            output.summary = Some(format!("falha ao codificar PNG: {error}"));
+                        }
+                    }
                 }
                 Purpose::Export(ExportFormat::Html) => unreachable!(),
             }
@@ -763,6 +796,33 @@ mod tests {
         assert!(html.contains("Título exportado"));
         assert!(html.contains("Conteúdo do documento."));
         assert!(html.contains('\n'));
+    }
+
+    #[test]
+    fn compiler_exports_merged_png_at_the_selected_resolution() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut world = TypstationWorld::new(root);
+        let output = compile(
+            &mut world,
+            Request {
+                id: 1,
+                revision: 1,
+                source: Some("Primeira página\n#pagebreak()\nSegunda página".to_owned()),
+                overlays: Vec::new(),
+                reset_files: true,
+                purpose: Purpose::Export(ExportFormat::Png),
+                export_options: ExportOptions {
+                    png_ppi: 72,
+                    png_page_gap: 24,
+                    ..ExportOptions::default()
+                },
+            },
+        );
+
+        let png = output.artifact.expect("PNG should be generated");
+        assert_eq!(output.error_count, 0);
+        assert_eq!(output.page_count, 2);
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 
     #[test]

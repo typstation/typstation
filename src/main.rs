@@ -32,7 +32,7 @@ use iced::{
     time::{self, Instant},
     widget::{
         Id, Space, Stack, column, container, mouse_area, operation, pane_grid, responsive, row,
-        scrollable, slider, svg, text,
+        scrollable, svg, text,
     },
     window,
 };
@@ -53,9 +53,9 @@ const PREVIEW_PAGE_SPACING: f32 = 12.0;
 const PREVIEW_LABEL_HEIGHT: f32 = 18.0;
 const PREVIEW_LABEL_SPACING: f32 = 4.0;
 const PREVIEW_HIT_DISTANCE: f32 = 12.0;
+const PREVIEW_TOOLBAR_HEIGHT: f32 = 40.0;
 const TYPOGRAPHIC_POINTS_PER_INCH: f32 = 72.0;
 const APP_BAR_HEIGHT: f32 = 40.0;
-const APP_BAR_HORIZONTAL_PADDING: f32 = 4.0;
 const PANE_DRAG_HANDLE_HEIGHT: f32 = 8.0;
 const FILE_MENU_TRIGGER_WIDTH: f32 = 72.0;
 const EDIT_MENU_TRIGGER_WIDTH: f32 = 64.0;
@@ -76,6 +76,35 @@ fn preview_scale(zoom_percent: u16, logical_pixels_per_inch: f32) -> f32 {
 
 fn preview_canvas_width(viewport_width: f32, maximum_page_width: f32) -> f32 {
     viewport_width.max(maximum_page_width + PREVIEW_PADDING * 2.0)
+}
+
+fn fitted_preview_scale(
+    mode: settings::PreviewMode,
+    zoom_percent: u16,
+    logical_pixels_per_inch: f32,
+    maximum_page_width: f32,
+    maximum_page_height: f32,
+    viewport: iced::Size,
+) -> f32 {
+    let actual = preview_scale(100, logical_pixels_per_inch);
+    let custom = preview_scale(zoom_percent, logical_pixels_per_inch);
+    let available_width = (viewport.width - PREVIEW_PADDING * 2.0).max(1.0);
+    let available_height = (viewport.height
+        - PREVIEW_TOOLBAR_HEIGHT
+        - PREVIEW_PADDING * 2.0
+        - PREVIEW_LABEL_HEIGHT
+        - PREVIEW_LABEL_SPACING)
+        .max(1.0);
+    let fit_width = available_width / maximum_page_width.max(1.0);
+    let fit_page = fit_width.min(available_height / maximum_page_height.max(1.0));
+
+    match mode {
+        settings::PreviewMode::ActualSize => actual,
+        settings::PreviewMode::FitWidth => fit_width,
+        settings::PreviewMode::FitPage => fit_page,
+        settings::PreviewMode::Custom => custom,
+    }
+    .clamp(0.05, 10.0)
 }
 
 fn main() -> iced::Result {
@@ -129,7 +158,11 @@ struct App {
     preview_status: PreviewStatus,
     preview_scroll_id: Id,
     preview_pointer: Option<PreviewPointer>,
-    preview_highlight: Option<PreviewHighlight>,
+    preview_highlights: Vec<PreviewHighlight>,
+    current_preview_page: usize,
+    preview_render_scale: f32,
+    suppress_preview_scroll_sync: bool,
+    preview_needs_cursor_sync: bool,
     modifiers: keyboard::Modifiers,
     file_busy: bool,
     pending_after_save: Option<DestructiveFileAction>,
@@ -193,6 +226,18 @@ struct PreviewPointer {
 struct PreviewHighlight {
     page: usize,
     bounds: source_map::SourceBounds,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreviewPageChoice {
+    page: u16,
+    total: u16,
+}
+
+impl std::fmt::Display for PreviewPageChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} / {}", self.page, self.total)
+    }
 }
 
 struct PendingSourceReveal {
@@ -283,19 +328,36 @@ enum Message {
     PreviewZoomOut,
     PreviewZoomReset,
     PreviewZoomChanged(u16),
+    PreviewModeChanged(settings::PreviewMode, iced::Size),
+    PreviewSyncChanged(bool),
+    PreviewPageSelected {
+        page: u16,
+        scale: f32,
+    },
+    PreviewScrolled {
+        offset_y: f32,
+        viewport_height: f32,
+        scale: f32,
+    },
     PdfTaggedChanged(bool),
     PdfPrettyChanged(bool),
     SvgRenderBleedChanged(bool),
     SvgPrettyChanged(bool),
     SvgPageGapChanged(u16),
     HtmlPrettyChanged(bool),
+    PngPpiChanged(u16),
+    PngRenderBleedChanged(bool),
+    PngPageGapChanged(u16),
     RevealInPreview,
     PreviewPointerMoved {
         page: usize,
         position: Point,
     },
     PreviewPointerLeft(usize),
-    PreviewClicked(usize),
+    PreviewClicked {
+        page: usize,
+        scale: f32,
+    },
     ModifiersChanged(keyboard::Modifiers),
     OpenSearch,
     OpenProjectSearch,
@@ -561,17 +623,6 @@ enum TreeNavigation {
     First,
     Last,
     Activate,
-}
-
-impl ProjectNavigation {
-    const fn title(self) -> &'static str {
-        match self {
-            Self::Files => "Arquivos",
-            Self::Search => "Busca",
-            Self::Topics => "Sumário",
-            Self::Problems => "Problemas",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -876,7 +927,11 @@ impl App {
             preview_status: PreviewStatus::Waiting,
             preview_scroll_id: Id::unique(),
             preview_pointer: None,
-            preview_highlight: None,
+            preview_highlights: Vec::new(),
+            current_preview_page: 0,
+            preview_render_scale: preview_scale(100, display::FALLBACK_LOGICAL_PPI),
+            suppress_preview_scroll_sync: false,
+            preview_needs_cursor_sync: false,
             modifiers: keyboard::Modifiers::NONE,
             file_busy: false,
             pending_after_save: None,
@@ -1142,6 +1197,7 @@ impl App {
                 }
                 let reveal_in_preview =
                     self.modifiers.command() && matches!(action, Action::MoveTo(_));
+                let cursor_moved = action_moves_cursor(&action);
                 let snippet = self.accepted_snippet(&action);
                 let changed = self.document.perform(action);
 
@@ -1160,6 +1216,8 @@ impl App {
 
                 if reveal_in_preview {
                     self.reveal_cursor_in_preview()
+                } else if cursor_moved && self.settings.preview_sync {
+                    self.follow_cursor_in_preview()
                 } else {
                     Task::none()
                 }
@@ -1283,14 +1341,47 @@ impl App {
             }
             Message::PreviewZoomReset => {
                 self.settings.preview_zoom = 100;
+                self.settings.preview_mode = settings::PreviewMode::ActualSize;
+                self.preview_render_scale = preview_scale(100, self.preview_logical_ppi);
+                self.preview_needs_cursor_sync = self.settings.preview_sync;
                 self.settings_changed(false);
                 Task::none()
             }
             Message::PreviewZoomChanged(zoom) => {
                 self.settings.preview_zoom = zoom.clamp(25, 300);
+                self.settings.preview_mode = settings::PreviewMode::Custom;
+                self.preview_render_scale =
+                    preview_scale(self.settings.preview_zoom, self.preview_logical_ppi);
+                self.preview_needs_cursor_sync = self.settings.preview_sync;
                 self.settings_changed(false);
                 Task::none()
             }
+            Message::PreviewModeChanged(mode, viewport) => {
+                self.settings.preview_mode = mode;
+                self.preview_render_scale = self.preview_scale_for_viewport(viewport);
+                self.preview_needs_cursor_sync = self.settings.preview_sync;
+                self.settings_changed(false);
+                Task::none()
+            }
+            Message::PreviewSyncChanged(sync) => {
+                self.settings.preview_sync = sync;
+                self.settings_changed(false);
+                if sync {
+                    self.preview_needs_cursor_sync = false;
+                    self.follow_cursor_in_preview()
+                } else {
+                    self.preview_needs_cursor_sync = false;
+                    Task::none()
+                }
+            }
+            Message::PreviewPageSelected { page, scale } => {
+                self.scroll_preview_to_page(usize::from(page.saturating_sub(1)), scale)
+            }
+            Message::PreviewScrolled {
+                offset_y,
+                viewport_height,
+                scale,
+            } => self.preview_scrolled(offset_y, viewport_height, scale),
             Message::PdfTaggedChanged(tagged) => {
                 self.settings.pdf_tagged = tagged;
                 self.settings_changed(false);
@@ -1321,6 +1412,21 @@ impl App {
                 self.settings_changed(false);
                 Task::none()
             }
+            Message::PngPpiChanged(ppi) => {
+                self.settings.png_ppi = ppi.clamp(72, 600);
+                self.settings_changed(false);
+                Task::none()
+            }
+            Message::PngRenderBleedChanged(render_bleed) => {
+                self.settings.png_render_bleed = render_bleed;
+                self.settings_changed(false);
+                Task::none()
+            }
+            Message::PngPageGapChanged(page_gap) => {
+                self.settings.png_page_gap = page_gap.min(72);
+                self.settings_changed(false);
+                Task::none()
+            }
             Message::RevealInPreview => self.reveal_cursor_in_preview(),
             Message::PreviewPointerMoved { page, position } => {
                 self.preview_pointer = Some(PreviewPointer { page, position });
@@ -1335,7 +1441,10 @@ impl App {
                 }
                 Task::none()
             }
-            Message::PreviewClicked(page) => self.reveal_preview_source(page),
+            Message::PreviewClicked { page, scale } => {
+                self.preview_render_scale = scale;
+                self.reveal_preview_source(page, scale)
+            }
             Message::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers;
                 Task::none()
@@ -1959,22 +2068,29 @@ impl App {
 
         vec![
             AppMenuEntry::item(
-                "Exportar como SVG…",
+                "Exportar como SVG",
                 None,
                 false,
                 enabled,
                 MenuCommand::Export(compiler::ExportFormat::Svg),
             ),
             AppMenuEntry::item(
-                "Exportar como HTML…",
+                "Exportar como HTML",
                 None,
                 false,
                 enabled,
                 MenuCommand::Export(compiler::ExportFormat::Html),
             ),
+            AppMenuEntry::item(
+                "Exportar como PNG",
+                None,
+                false,
+                enabled,
+                MenuCommand::Export(compiler::ExportFormat::Png),
+            ),
             AppMenuEntry::Divider,
             AppMenuEntry::item(
-                "Configurações de exportação…",
+                "Configurações de exportação",
                 None,
                 false,
                 true,
@@ -1997,14 +2113,14 @@ impl App {
                         MenuCommand::NewDocument,
                     ),
                     AppMenuEntry::item(
-                        "Abrir arquivo…",
+                        "Abrir arquivo",
                         Some(command_shortcut("O")),
                         false,
                         !self.file_busy,
                         MenuCommand::OpenDocument,
                     ),
                     AppMenuEntry::item(
-                        "Abrir projeto…",
+                        "Abrir projeto",
                         Some(command_shift_shortcut("O")),
                         false,
                         !self.file_busy,
@@ -2019,7 +2135,7 @@ impl App {
                         MenuCommand::SaveDocument,
                     ),
                     AppMenuEntry::item(
-                        "Salvar como…",
+                        "Salvar como",
                         Some(command_shift_shortcut("S")),
                         false,
                         !self.file_busy,
@@ -2037,25 +2153,32 @@ impl App {
                         MenuCommand::SaveAllDocuments,
                     ),
                     AppMenuEntry::item(
-                        "Exportar PDF…",
+                        "Exportar PDF",
                         None,
                         false,
                         !self.file_busy && self.compiler.is_some(),
                         MenuCommand::Export(compiler::ExportFormat::Pdf),
                     ),
                     AppMenuEntry::item(
-                        "Exportar SVG…",
+                        "Exportar SVG",
                         None,
                         false,
                         !self.file_busy && self.compiler.is_some(),
                         MenuCommand::Export(compiler::ExportFormat::Svg),
                     ),
                     AppMenuEntry::item(
-                        "Exportar HTML…",
+                        "Exportar HTML",
                         None,
                         false,
                         !self.file_busy && self.compiler.is_some(),
                         MenuCommand::Export(compiler::ExportFormat::Html),
+                    ),
+                    AppMenuEntry::item(
+                        "Exportar PNG",
+                        None,
+                        false,
+                        !self.file_busy && self.compiler.is_some(),
+                        MenuCommand::Export(compiler::ExportFormat::Png),
                     ),
                     AppMenuEntry::Divider,
                     AppMenuEntry::item(
@@ -2141,21 +2264,21 @@ impl App {
                 ),
                 AppMenuEntry::Divider,
                 AppMenuEntry::item(
-                    "Buscar…",
+                    "Buscar",
                     Some(command_shortcut("F")),
                     false,
                     true,
                     MenuCommand::OpenSearch,
                 ),
                 AppMenuEntry::item(
-                    "Buscar no projeto…",
+                    "Buscar no projeto",
                     Some(command_shift_shortcut("F")),
                     false,
                     true,
                     MenuCommand::OpenProjectSearch,
                 ),
                 AppMenuEntry::item(
-                    "Substituir…",
+                    "Substituir",
                     Some(command_shortcut("H")),
                     false,
                     true,
@@ -2177,7 +2300,7 @@ impl App {
                     MenuCommand::FindReferences,
                 ),
                 AppMenuEntry::item(
-                    "Renomear símbolo…",
+                    "Renomear símbolo",
                     Some("F2".to_owned()),
                     false,
                     can_edit,
@@ -2221,7 +2344,7 @@ impl App {
                 ),
                 AppMenuEntry::Divider,
                 AppMenuEntry::item(
-                    "Configurações…",
+                    "Configurações",
                     None,
                     false,
                     true,
@@ -2418,7 +2541,7 @@ impl App {
                 MenuCommand::FindReferences,
             ),
             AppMenuEntry::item(
-                "Renomear símbolo…",
+                "Renomear símbolo",
                 Some("F2".to_owned()),
                 false,
                 can_edit,
@@ -2463,14 +2586,14 @@ impl App {
                 ));
                 entries.push(AppMenuEntry::Divider);
                 entries.push(AppMenuEntry::item(
-                    "Novo arquivo Typst…",
+                    "Novo arquivo Typst",
                     None,
                     false,
                     enabled,
                     MenuCommand::CreateProjectFileAt(target_directory.clone()),
                 ));
                 entries.push(AppMenuEntry::item(
-                    "Nova pasta…",
+                    "Nova pasta",
                     None,
                     false,
                     enabled,
@@ -2480,14 +2603,14 @@ impl App {
                 if !is_root {
                     entries.push(AppMenuEntry::Divider);
                     entries.push(AppMenuEntry::item(
-                        "Renomear…",
+                        "Renomear",
                         None,
                         false,
                         enabled,
                         MenuCommand::RenameProjectEntry(context.path.clone(), context.kind),
                     ));
                     entries.push(AppMenuEntry::item(
-                        "Excluir…",
+                        "Excluir",
                         None,
                         false,
                         enabled,
@@ -2520,14 +2643,14 @@ impl App {
                 ));
                 entries.push(AppMenuEntry::Divider);
                 entries.push(AppMenuEntry::item(
-                    "Renomear…",
+                    "Renomear",
                     None,
                     false,
                     enabled,
                     MenuCommand::RenameProjectEntry(context.path.clone(), context.kind),
                 ));
                 entries.push(AppMenuEntry::item(
-                    "Excluir…",
+                    "Excluir",
                     None,
                     false,
                     enabled,
@@ -2536,14 +2659,14 @@ impl App {
             }
             project::EntryKind::File => {
                 entries.push(AppMenuEntry::item(
-                    "Renomear…",
+                    "Renomear",
                     None,
                     false,
                     enabled,
                     MenuCommand::RenameProjectEntry(context.path.clone(), context.kind),
                 ));
                 entries.push(AppMenuEntry::item(
-                    "Excluir…",
+                    "Excluir",
                     None,
                     false,
                     enabled,
@@ -2569,7 +2692,7 @@ impl App {
                 MenuCommand::DuplicateProjectEntry(context.path.clone(), context.kind),
             ));
             entries.push(AppMenuEntry::item(
-                "Mover para…",
+                "Mover para",
                 None,
                 false,
                 enabled,
@@ -2618,7 +2741,7 @@ impl App {
                 .split(pane_grid::Axis::Vertical, editor, Pane::Project)
         {
             self.panes.swap(editor, project);
-            self.panes.resize(split, 0.24);
+            self.panes.resize(split, 0.34);
             self.file_status = Some("Painel lateral exibido".to_owned());
             self.mark_session_changed();
         }
@@ -2639,12 +2762,9 @@ impl App {
                 Pane::Editor => self.editor_view(),
                 Pane::Preview => self.preview_view(),
             };
-            let title_bar: Element<'_, Message> = match pane {
-                Pane::Project => self.project_pane_title_bar(),
-                Pane::Editor | Pane::Preview => Space::new()
-                    .height(iced::Length::Fixed(PANE_DRAG_HANDLE_HEIGHT))
-                    .into(),
-            };
+            let title_bar: Element<'_, Message> = Space::new()
+                .height(iced::Length::Fixed(PANE_DRAG_HANDLE_HEIGHT))
+                .into();
 
             pane_grid::Content::new(content).title_bar(pane_grid::TitleBar::new(title_bar))
         })
@@ -2652,6 +2772,7 @@ impl App {
         .height(Fill)
         .spacing(0)
         .min_size(200)
+        .style(ui::split_view_style)
         .on_drag(Message::PaneDragged)
         .on_resize(10, Message::PaneResized);
 
@@ -2659,7 +2780,7 @@ impl App {
         let status = container(
             row![
                 text(self.status_text())
-                    .size(13)
+                    .size(ui::tokens::typography::FONT_SIZE_75)
                     .width(Fill)
                     .wrapping(text::Wrapping::None),
                 ui::problem_count_indicator(
@@ -2686,7 +2807,8 @@ impl App {
         ))
         .padding([0.0, ui::tokens::spacing::STATUS_BAR_EDGE_TO_CONTENT])
         .align_y(Alignment::Center)
-        .style(status_bar_style);
+        .style(ui::bar_style);
+        let status = ui::with_top_divider(status);
 
         let content = column![self.app_bar_view(), self.text_action_bar_view()];
 
@@ -2739,7 +2861,7 @@ impl App {
                 container(Space::new())
                     .width(Fill)
                     .height(Fill)
-                    .style(modal_backdrop_style),
+                    .style(ui::modal_backdrop_style),
             )
             .on_press(Message::CloseAbout);
             layers = layers.push(backdrop).push(self.about_overlay());
@@ -2795,18 +2917,7 @@ impl App {
         )
         .width(iced::Length::Fixed(APP_ACTIONS_WIDTH))
         .align_x(iced::alignment::Horizontal::Left);
-        let title = if self.document.is_dirty() {
-            format!("{} *", self.document.display_name())
-        } else {
-            self.document.display_name()
-        };
-        let title = container(
-            text(title)
-                .size(ui::tokens::typography::FONT_SIZE_100)
-                .wrapping(text::Wrapping::None),
-        )
-        .width(Fill)
-        .center_x(Fill);
+        let center = Space::new().width(Fill);
         let save = ui::spectrum_button(
             "Salvar",
             (!self.file_busy && self.document.is_dirty())
@@ -2833,21 +2944,25 @@ impl App {
         let actions = container(
             row![save, export_group]
                 .align_y(Alignment::Center)
-                .spacing(12),
+                .spacing(ui::tokens::spacing::APP_BAR_ACTION_GAP),
         )
         .width(iced::Length::Fixed(APP_ACTIONS_WIDTH))
         .align_x(iced::alignment::Horizontal::Right);
-        let bar = row![menus, title, actions]
+        let bar = row![menus, center, actions]
             .align_y(Alignment::Center)
             .width(Fill)
             .height(Fill);
 
-        container(bar)
+        let bar = container(bar)
             .width(Fill)
             .height(iced::Length::Fixed(APP_BAR_HEIGHT))
-            .padding([4.0, APP_BAR_HORIZONTAL_PADDING])
-            .style(app_bar_style)
-            .into()
+            .padding([
+                ui::tokens::spacing::APP_BAR_PADDING_VERTICAL,
+                ui::tokens::spacing::APP_BAR_PADDING_HORIZONTAL,
+            ])
+            .style(ui::bar_style);
+
+        ui::with_bottom_divider(bar)
     }
 
     fn menu_overlay(&self, menu: AppMenu) -> Element<'_, Message> {
@@ -2881,7 +2996,9 @@ impl App {
             row![
                 Space::new().width(Fill),
                 popup,
-                Space::new().width(iced::Length::Fixed(APP_BAR_HORIZONTAL_PADDING)),
+                Space::new().width(iced::Length::Fixed(
+                    ui::tokens::spacing::APP_BAR_PADDING_HORIZONTAL,
+                )),
             ],
         ]
         .width(Fill)
@@ -2963,11 +3080,11 @@ impl App {
                     .size(ui::tokens::typography::FONT_SIZE_100),
                 row![Space::new().width(Fill), close],
             ]
-            .spacing(12),
+            .spacing(ui::tokens::spacing::APP_BAR_ACTION_GAP),
         )
         .width(iced::Length::Fixed(380.0))
-        .padding(24)
-        .style(modal_dialog_style);
+        .padding(ui::tokens::spacing::SETTINGS_EDGE_TO_CONTENT)
+        .style(ui::elevated_dialog_style);
 
         container(dialog)
             .width(Fill)
@@ -3050,18 +3167,21 @@ impl App {
         }
     }
 
-    fn rename_symbol_dialog_view(&self, rename: &RenameSymbolDialog) -> Element<'_, Message> {
+    fn rename_symbol_dialog_view<'a>(
+        &'a self,
+        rename: &'a RenameSymbolDialog,
+    ) -> Element<'a, Message> {
         let valid = valid_symbol_name(rename.kind, &rename.value)
             && rename.value != rename.original
             && !rename.locations.is_empty();
-        let field = ui::spectrum_text_field(
+        let field = ui::spectrum_text_field_with_id(
             "Novo nome",
             &rename.value,
+            self.rename_input_id.clone(),
             Message::RenameSymbolChanged,
             valid.then_some(Message::ConfirmRenameSymbol),
             Fill,
-        )
-        .id(self.rename_input_id.clone());
+        );
         let actions = row![
             Space::new().width(Fill),
             ui::spectrum_button(
@@ -3093,19 +3213,19 @@ impl App {
                 field,
                 actions,
             ]
-            .spacing(16),
+            .spacing(ui::tokens::spacing::SETTINGS_CONTROL_GAP),
         )
         .width(Fill)
         .max_width(ui::tokens::dimension::ALERT_DIALOG_MAXIMUM_WIDTH)
         .padding(ui::tokens::spacing::ALERT_DIALOG_PADDING)
-        .style(modal_dialog_style);
+        .style(ui::elevated_dialog_style);
         let overlay = container(dialog)
             .width(Fill)
             .height(Fill)
             .padding(ui::tokens::spacing::BASE_PADDING_HORIZONTAL_EXTRA_LARGE)
             .center_x(Fill)
             .center_y(Fill)
-            .style(modal_backdrop_style);
+            .style(ui::modal_backdrop_style);
 
         mouse_area(overlay)
             .on_press(Message::CloseRenameSymbol)
@@ -3113,43 +3233,93 @@ impl App {
     }
 
     fn preview_view(&self) -> Element<'_, Message> {
-        let scale = preview_scale(self.settings.preview_zoom, self.preview_logical_ppi);
-        let controls = row![
-            message_icon_button(
-                "−",
-                "Diminuir zoom",
-                Message::PreviewZoomOut,
-                self.settings.preview_zoom > 25,
-            ),
-            ui::action_button(
-                format!("{}%", self.settings.preview_zoom),
-                Some(Message::PreviewZoomReset),
-                ui::ActionButtonOptions::STANDARD,
-            ),
-            message_icon_button(
-                "+",
-                "Aumentar zoom",
-                Message::PreviewZoomIn,
-                self.settings.preview_zoom < 300,
-            ),
-            message_action_button(
-                "Localizar",
-                Message::RevealInPreview,
-                self.preview_navigation_ready(),
-            ),
-            text(format!("Principal: {}", self.compilation_display_name())).size(13),
-            text(format!("{} página(s)", self.preview.len())).size(13),
-        ]
-        .align_y(Alignment::Center)
-        .spacing(4)
-        .padding([4, 8]);
+        responsive(move |viewport| self.preview_sized_view(viewport)).into()
+    }
+
+    fn preview_sized_view(&self, viewport: iced::Size) -> Element<'_, Message> {
+        let scale = self.preview_scale_for_viewport(viewport);
+        let mode = self.settings.preview_mode;
+        let actual_scale = preview_scale(100, self.preview_logical_ppi);
+        let effective_zoom = (scale / actual_scale * 100.0).round().clamp(25.0, 300.0) as u16;
+        let zoom_out = effective_zoom.saturating_sub(10).max(25);
+        let zoom_in = effective_zoom.saturating_add(10).min(300);
+        let mode_control = ui::spectrum_picker(
+            settings::PreviewMode::ALL,
+            Some(mode),
+            move |selected| Message::PreviewModeChanged(selected, viewport),
+            116.0,
+        );
+        let page_count = self.preview.len().max(1).min(usize::from(u16::MAX)) as u16;
+        let current_page = (self.current_preview_page + 1).min(usize::from(page_count)) as u16;
+        let page_options = (1..=page_count)
+            .map(|page| PreviewPageChoice {
+                page,
+                total: page_count,
+            })
+            .collect::<Vec<_>>();
+        let selected_page = PreviewPageChoice {
+            page: current_page,
+            total: page_count,
+        };
+        let page_control = ui::spectrum_picker(
+            page_options,
+            Some(selected_page),
+            move |selected| Message::PreviewPageSelected {
+                page: selected.page,
+                scale,
+            },
+            80.0,
+        );
+        let zoom = ui::compact_action_group(
+            [
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::ZoomOut,
+                    "Diminuir zoom",
+                    (effective_zoom > 25).then_some(Message::PreviewZoomChanged(zoom_out)),
+                ),
+                ui::ActionGroupItem::text(
+                    format!("{effective_zoom}%"),
+                    Some(Message::PreviewZoomReset),
+                ),
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::ZoomIn,
+                    "Aumentar zoom",
+                    (effective_zoom < 300).then_some(Message::PreviewZoomChanged(zoom_in)),
+                ),
+            ],
+            ui::ActionButtonOptions::STANDARD,
+        );
+        let controls = scrollable(
+            row![
+                zoom,
+                mode_control,
+                page_control,
+                ui::workflow_icon_action_button(
+                    ui::WorkflowIcon::Visibility,
+                    "Localizar cursor no preview",
+                    self.preview_navigation_ready()
+                        .then_some(Message::RevealInPreview),
+                    ui::ActionButtonOptions::STANDARD,
+                ),
+            ]
+            .align_y(Alignment::Center)
+            .spacing(ui::tokens::spacing::BASE_GAP_SMALL)
+            .padding([
+                ui::tokens::spacing::BASE_GAP_SMALL,
+                ui::tokens::spacing::PANEL_EDGE_TO_CONTENT,
+            ]),
+        )
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::hidden(),
+        ))
+        .height(iced::Length::Fixed(PREVIEW_TOOLBAR_HEIGHT));
         let content: Element<'_, Message> = if self.preview.is_empty() {
             container(text("Preview indisponível"))
                 .center_x(Fill)
                 .center_y(Fill)
                 .into()
         } else {
-            responsive(move |viewport| self.preview_canvas_view(scale, viewport.width)).into()
+            self.preview_canvas_view(scale, viewport.width)
         };
 
         column![controls, content].width(Fill).height(Fill).into()
@@ -3179,8 +3349,9 @@ impl App {
                         .height(iced::Length::Fixed(height)),
                 );
 
-            if let Some(highlight) = self
-                .preview_highlight
+            for highlight in self
+                .preview_highlights
+                .iter()
                 .filter(|highlight| highlight.page == index)
             {
                 let bounds = highlight.bounds;
@@ -3191,14 +3362,15 @@ impl App {
                 let marker = container(Space::new())
                     .width(iced::Length::Fixed(marker_width))
                     .height(iced::Length::Fixed(marker_height))
-                    .style(|_theme: &Theme| {
+                    .style(|theme: &Theme| {
+                        let colors = ui::tokens::SpectrumColors::from_theme(theme);
+
                         iced::widget::container::Style::default()
-                            .background(Color::from_rgba8(0x18, 0x9A, 0xD3, 0.20))
-                            .border(
-                                Border::default()
-                                    .color(Color::from_rgb8(0x00, 0x70, 0xA8))
-                                    .width(1),
-                            )
+                            .background(Color {
+                                a: 0.20,
+                                ..colors.accent_background.default
+                            })
+                            .border(Border::default().color(colors.focus_indicator).width(1))
                     });
                 let highlight_layer: Element<'_, Message> = column![
                     Space::new().height(iced::Length::Fixed(y)),
@@ -3216,13 +3388,16 @@ impl App {
                     position,
                 })
                 .on_exit(Message::PreviewPointerLeft(index))
-                .on_press(Message::PreviewClicked(index))
+                .on_press(Message::PreviewClicked { page: index, scale })
                 .interaction(mouse::Interaction::Pointer);
             pages = pages.push(
                 column![
-                    container(text(format!("Página {}", index + 1)).size(12))
-                        .height(iced::Length::Fixed(PREVIEW_LABEL_HEIGHT))
-                        .center_y(iced::Length::Fill),
+                    container(
+                        text(format!("Página {}", index + 1))
+                            .size(ui::tokens::typography::FONT_SIZE_75),
+                    )
+                    .height(iced::Length::Fixed(PREVIEW_LABEL_HEIGHT))
+                    .center_y(iced::Length::Fill),
                     interactive_page,
                 ]
                 .align_x(Alignment::Center)
@@ -3240,6 +3415,11 @@ impl App {
         .direction(scrollable::Direction::Both {
             vertical: scrollable::Scrollbar::default(),
             horizontal: scrollable::Scrollbar::default(),
+        })
+        .on_scroll(move |viewport| Message::PreviewScrolled {
+            offset_y: viewport.absolute_offset().y,
+            viewport_height: viewport.bounds().height,
+            scale,
         })
         .width(Fill)
         .height(Fill)
@@ -3261,18 +3441,21 @@ impl App {
                     }),
             ]
             .align_y(Alignment::Center)
-            .spacing(12),
+            .spacing(ui::tokens::spacing::APP_BAR_ACTION_GAP),
         )
         .width(Fill)
-        .height(iced::Length::Fixed(56.0))
-        .padding([0, 24])
+        .height(iced::Length::Fixed(
+            ui::tokens::dimension::SETTINGS_HEADER_HEIGHT,
+        ))
+        .padding([0.0, ui::tokens::spacing::SETTINGS_EDGE_TO_CONTENT])
         .align_y(Alignment::Center)
-        .style(settings_band_style);
+        .style(ui::bar_style);
+        let heading = ui::with_bottom_divider(heading);
 
         let tab_width = settings_slider_row(
             "Largura da tabulação",
             format!("{} espaços", self.settings.tab_width),
-            slider(
+            ui::spectrum_slider(
                 1..=8,
                 self.settings.tab_width as u16,
                 Message::TabWidthChanged,
@@ -3282,7 +3465,7 @@ impl App {
         let editor_font_size = settings_slider_row(
             "Tamanho da fonte",
             format!("{} px", self.settings.editor_font_size),
-            slider(
+            ui::spectrum_slider(
                 10..=30,
                 self.settings.editor_font_size,
                 Message::EditorFontSizeChanged,
@@ -3292,7 +3475,7 @@ impl App {
         let preview_zoom = settings_slider_row(
             "Zoom padrão",
             format!("{}%", self.settings.preview_zoom),
-            slider(
+            ui::spectrum_slider(
                 25..=300,
                 self.settings.preview_zoom,
                 Message::PreviewZoomChanged,
@@ -3303,10 +3486,27 @@ impl App {
         let svg_page_gap = settings_slider_row(
             "Espaço entre páginas",
             format!("{} pt", self.settings.svg_page_gap),
-            slider(
+            ui::spectrum_slider(
                 0..=72,
                 self.settings.svg_page_gap,
                 Message::SvgPageGapChanged,
+            )
+            .width(Fill),
+        );
+        let png_ppi = settings_slider_row(
+            "Resolução PNG",
+            format!("{} ppp", self.settings.png_ppi),
+            ui::spectrum_slider(72..=600, self.settings.png_ppi, Message::PngPpiChanged)
+                .step(12u16)
+                .width(Fill),
+        );
+        let png_page_gap = settings_slider_row(
+            "Espaço entre páginas",
+            format!("{} pt", self.settings.png_page_gap),
+            ui::spectrum_slider(
+                0..=72,
+                self.settings.png_page_gap,
+                Message::PngPageGapChanged,
             )
             .width(Fill),
         );
@@ -3315,79 +3515,99 @@ impl App {
             SettingsPage::Editor => column![
                 tab_width,
                 editor_font_size,
-                ui::spectrum_checkbox(
+                ui::spectrum_switch(
                     "Fechar pares automaticamente",
                     self.settings.auto_pairs,
                     Message::AutoPairsChanged,
                 ),
-                ui::spectrum_checkbox(
+                ui::spectrum_switch(
                     "Aplicar indentação automática",
                     self.settings.auto_indent,
                     Message::AutoIndentChanged,
                 ),
-                ui::spectrum_checkbox(
+                ui::spectrum_switch(
                     "Quebrar linhas longas",
                     self.settings.wrap_lines,
                     Message::WrapLinesChanged,
                 ),
-                ui::spectrum_checkbox(
+                ui::spectrum_switch(
                     "Mostrar números de linha",
                     self.settings.show_gutter,
                     Message::ShowGutterChanged,
                 ),
-                ui::spectrum_checkbox(
+                ui::spectrum_switch(
                     "Salvar automaticamente arquivos já nomeados",
                     self.settings.auto_save,
                     Message::AutoSaveChanged,
                 ),
             ]
-            .spacing(16)
+            .spacing(ui::tokens::spacing::SETTINGS_CONTROL_GAP)
             .into(),
-            SettingsPage::Preview => column![preview_zoom].spacing(16).into(),
+            SettingsPage::Preview => column![
+                preview_zoom,
+                ui::spectrum_switch(
+                    "Sincronizar editor e preview durante a navegação",
+                    self.settings.preview_sync,
+                    Message::PreviewSyncChanged,
+                ),
+            ]
+            .spacing(ui::tokens::spacing::SETTINGS_CONTROL_GAP)
+            .into(),
             SettingsPage::Export => column![
                 settings_subsection_title("PDF"),
-                ui::spectrum_checkbox(
+                ui::spectrum_switch(
                     "Incluir marcação de acessibilidade",
                     self.settings.pdf_tagged,
                     Message::PdfTaggedChanged,
                 ),
-                ui::spectrum_checkbox(
+                ui::spectrum_switch(
                     "Formatar arquivo para inspeção",
                     self.settings.pdf_pretty,
                     Message::PdfPrettyChanged,
                 ),
                 settings_subsection_title("SVG"),
-                ui::spectrum_checkbox(
+                ui::spectrum_switch(
                     "Renderizar área de sangria",
                     self.settings.svg_render_bleed,
                     Message::SvgRenderBleedChanged,
                 ),
-                ui::spectrum_checkbox(
+                ui::spectrum_switch(
                     "Formatar arquivo para inspeção",
                     self.settings.svg_pretty,
                     Message::SvgPrettyChanged,
                 ),
                 svg_page_gap,
                 settings_subsection_title("HTML (experimental)"),
-                ui::spectrum_checkbox(
+                ui::spectrum_switch(
                     "Formatar arquivo para inspeção",
                     self.settings.html_pretty,
                     Message::HtmlPrettyChanged,
                 ),
+                settings_subsection_title("PNG"),
+                png_ppi,
+                ui::spectrum_switch(
+                    "Renderizar área de sangria",
+                    self.settings.png_render_bleed,
+                    Message::PngRenderBleedChanged,
+                ),
+                png_page_gap,
             ]
-            .spacing(16)
+            .spacing(ui::tokens::spacing::SETTINGS_CONTROL_GAP)
             .into(),
-            SettingsPage::Appearance => column![ui::spectrum_checkbox(
+            SettingsPage::Appearance => column![ui::spectrum_switch(
                 "Usar tema claro",
                 self.settings.theme == settings::ThemeMode::Light,
                 Message::LightThemeChanged,
             )]
-            .spacing(16)
+            .spacing(ui::tokens::spacing::SETTINGS_CONTROL_GAP)
             .into(),
         };
-        let panel = scrollable(container(page).width(Fill).padding([24, 32]))
-            .width(Fill)
-            .height(Fill);
+        let panel = scrollable(container(page).width(Fill).padding([
+            ui::tokens::spacing::SETTINGS_EDGE_TO_CONTENT,
+            ui::tokens::spacing::SETTINGS_PANEL_HORIZONTAL_PADDING,
+        ]))
+        .width(Fill)
+        .height(Fill);
         let tabs = SettingsPage::ALL
             .into_iter()
             .map(|page| {
@@ -3409,32 +3629,36 @@ impl App {
             ),
         ])
         .width(Fill)
-        .height(iced::Length::Fixed(64.0))
-        .padding([16, 24])
+        .height(iced::Length::Fixed(
+            ui::tokens::dimension::SETTINGS_FOOTER_HEIGHT,
+        ))
+        .padding([
+            ui::tokens::spacing::SETTINGS_CONTROL_GAP,
+            ui::tokens::spacing::SETTINGS_EDGE_TO_CONTENT,
+        ])
         .align_y(Alignment::Center)
-        .style(settings_band_style);
+        .style(ui::bar_style);
+        let footer = ui::with_top_divider(footer);
 
         container(column![heading, body, footer])
             .width(Fill)
             .height(Fill)
-            .style(settings_window_background_style)
+            .style(ui::layer_style)
             .into()
     }
 
     fn text_action_bar_view(&self) -> Element<'_, Message> {
         let can_edit = !self.file_busy;
-        let options = ui::ActionButtonOptions::STANDARD
-            .size(ui::ActionButtonSize::Medium)
-            .emphasized(true);
+        let options = ui::ActionButtonOptions::QUIET.size(ui::ActionButtonSize::Medium);
         let history = ui::compact_action_group(
             [
-                ui::ActionGroupItem::symbol(
-                    "↶",
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::Undo,
                     "Desfazer",
                     can_edit.then_some(Message::Editor(Action::Undo)),
                 ),
-                ui::ActionGroupItem::symbol(
-                    "↷",
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::Redo,
                     "Refazer",
                     can_edit.then_some(Message::Editor(Action::Redo)),
                 ),
@@ -3476,23 +3700,35 @@ impl App {
             ],
             options,
         );
-        let comment = ui::icon_action_button(
-            "//",
+        let comment = ui::workflow_icon_action_button(
+            ui::WorkflowIcon::Code,
             "Alternar comentário de linha",
             can_edit.then_some(Message::Editor(Action::ToggleLineComment)),
             options,
         );
 
-        container(
-            row![history, text_style, lists, comment]
-                .align_y(Alignment::Center)
-                .spacing(ui::tokens::spacing::BASE_GAP_MEDIUM),
+        let toolbar = container(
+            row![
+                history,
+                ui::vertical_divider(ui::tokens::icon::WORKFLOW_SIZE_75),
+                text_style,
+                ui::vertical_divider(ui::tokens::icon::WORKFLOW_SIZE_75),
+                lists,
+                ui::vertical_divider(ui::tokens::icon::WORKFLOW_SIZE_75),
+                comment
+            ]
+            .align_y(Alignment::Center)
+            .spacing(ui::tokens::spacing::BASE_GAP_MEDIUM),
         )
         .width(Fill)
         .height(iced::Length::Fixed(APP_BAR_HEIGHT))
-        .padding([4, 8])
-        .style(action_bar_style)
-        .into()
+        .padding([
+            ui::tokens::spacing::BASE_GAP_SMALL,
+            ui::tokens::spacing::PANEL_EDGE_TO_CONTENT,
+        ])
+        .style(ui::bar_style);
+
+        ui::with_bottom_divider(toolbar)
     }
 
     fn editor_view(&self) -> Element<'_, Message> {
@@ -3558,20 +3794,20 @@ impl App {
     fn project_view(&self) -> Element<'_, Message> {
         let (error_count, warning_count) = self.diagnostic_counts();
         let problems_notification = if error_count > 0 {
-            Some(ui::SideNavigationNotification::Error)
+            Some(ui::PanelTabNotification::Error)
         } else if warning_count > 0 {
-            Some(ui::SideNavigationNotification::Warning)
+            Some(ui::PanelTabNotification::Warning)
         } else {
             None
         };
-        let navigation: Element<'_, Message> = ui::SideNavigation::new(vec![
-            ui::SideNavigationItem::new(
+        let navigation: Element<'_, Message> = ui::PanelTabs::new(vec![
+            ui::PanelTabItem::new(
                 "Arquivos",
                 ui::WorkflowIcon::FolderOpen,
                 Some(Message::ProjectNavigationSelected(ProjectNavigation::Files)),
             )
             .selected(self.project_navigation == ProjectNavigation::Files),
-            ui::SideNavigationItem::new(
+            ui::PanelTabItem::new(
                 "Buscar no projeto",
                 ui::WorkflowIcon::Search,
                 Some(Message::ProjectNavigationSelected(
@@ -3579,7 +3815,7 @@ impl App {
                 )),
             )
             .selected(self.project_navigation == ProjectNavigation::Search),
-            ui::SideNavigationItem::new(
+            ui::PanelTabItem::new(
                 "Sumário",
                 ui::WorkflowIcon::TextBulleted,
                 Some(Message::ProjectNavigationSelected(
@@ -3587,7 +3823,7 @@ impl App {
                 )),
             )
             .selected(self.project_navigation == ProjectNavigation::Topics),
-            ui::SideNavigationItem::new(
+            ui::PanelTabItem::new(
                 problems_navigation_label(error_count, warning_count),
                 ui::WorkflowIcon::AlertCircleFilled,
                 Some(Message::ProjectNavigationSelected(
@@ -3598,10 +3834,6 @@ impl App {
             .notification(problems_notification),
         ])
         .into();
-        let divider = container(Space::new())
-            .width(iced::Length::Fixed(1.0))
-            .height(Fill)
-            .style(project_navigation_divider_style);
         let panel = match self.project_navigation {
             ProjectNavigation::Files => self.project_files_view(),
             ProjectNavigation::Search => self.project_search_view(),
@@ -3609,50 +3841,7 @@ impl App {
             ProjectNavigation::Problems => self.problems_view(),
         };
 
-        row![navigation, divider, panel]
-            .width(Fill)
-            .height(Fill)
-            .into()
-    }
-
-    fn project_pane_title_bar(&self) -> Element<'_, Message> {
-        let pane_title = if self.project_navigation == ProjectNavigation::Search
-            && self.semantic_results.is_some()
-        {
-            "Referências"
-        } else {
-            self.project_navigation.title()
-        };
-        let title = text(pane_title)
-            .size(ui::tokens::typography::FONT_SIZE_100)
-            .font(iced::Font {
-                weight: iced::font::Weight::Bold,
-                ..iced::Font::DEFAULT
-            });
-        let content = row![
-            Space::new().width(iced::Length::Fixed(
-                ui::tokens::dimension::SIDE_NAVIGATION_RAIL_WIDTH + 1.0
-            )),
-            container(title)
-                .width(Fill)
-                .height(iced::Length::Fixed(
-                    ui::tokens::dimension::COMPONENT_HEIGHT_100
-                ))
-                .padding([0.0, ui::tokens::spacing::BASE_PADDING_HORIZONTAL_MEDIUM])
-                .align_y(Alignment::Center),
-        ]
-        .width(Fill)
-        .height(iced::Length::Fixed(
-            ui::tokens::dimension::COMPONENT_HEIGHT_100,
-        ));
-
-        container(content)
-            .width(Fill)
-            .height(iced::Length::Fixed(
-                ui::tokens::dimension::COMPONENT_HEIGHT_100,
-            ))
-            .style(project_pane_title_style)
-            .into()
+        row![navigation, panel].width(Fill).height(Fill).into()
     }
 
     fn project_files_view(&self) -> Element<'_, Message> {
@@ -3738,15 +3927,19 @@ impl App {
         let header = container(header)
             .width(Fill)
             .padding(ui::tokens::spacing::SEARCH_PANEL_EDGE_TO_CONTENT)
-            .style(search_panel_style);
+            .style(ui::bar_style);
+        let header = ui::with_bottom_divider(header);
         let mut results = column![
             container(
                 text(summary)
                     .size(ui::tokens::typography::FONT_SIZE_75)
-                    .style(search_metadata_text_style),
+                    .style(ui::metadata_text_style),
             )
             .width(Fill)
-            .padding([8, 10])
+            .padding([
+                ui::tokens::spacing::PANEL_EDGE_TO_CONTENT,
+                ui::tokens::spacing::BASE_PADDING_HORIZONTAL_SMALL,
+            ])
         ];
 
         for found in &self.project_search.results {
@@ -3764,7 +3957,7 @@ impl App {
                     .size(ui::tokens::typography::FONT_SIZE_75)
                     .wrapping(text::Wrapping::None),
             ]
-            .spacing(2);
+            .spacing(ui::tokens::spacing::SPACING_50);
             results = results.push(
                 iced::widget::button(content)
                     .on_press(Message::ProjectSearchResultPressed(
@@ -3772,8 +3965,11 @@ impl App {
                         found.range.clone(),
                     ))
                     .width(Fill)
-                    .padding([7, 10])
-                    .style(project_search_result_style),
+                    .padding([
+                        ui::tokens::spacing::BASE_PADDING_VERTICAL_MEDIUM,
+                        ui::tokens::spacing::BASE_PADDING_HORIZONTAL_SMALL,
+                    ])
+                    .style(ui::selectable_row_style),
             );
         }
 
@@ -3805,15 +4001,19 @@ impl App {
         )
         .width(Fill)
         .padding(ui::tokens::spacing::SEARCH_PANEL_EDGE_TO_CONTENT)
-        .style(search_panel_style);
+        .style(ui::bar_style);
+        let header = ui::with_bottom_divider(header);
         let mut locations = column![
             container(
                 text(format!("{} ocorrência(s)", results.locations.len()))
                     .size(ui::tokens::typography::FONT_SIZE_75)
-                    .style(search_metadata_text_style),
+                    .style(ui::metadata_text_style),
             )
             .width(Fill)
-            .padding([8, 10])
+            .padding([
+                ui::tokens::spacing::PANEL_EDGE_TO_CONTENT,
+                ui::tokens::spacing::BASE_PADDING_HORIZONTAL_SMALL,
+            ])
         ];
         for location in &results.locations {
             let path = location
@@ -3835,13 +4035,16 @@ impl App {
                     .size(ui::tokens::typography::FONT_SIZE_75)
                     .wrapping(text::Wrapping::None),
             ]
-            .spacing(2);
+            .spacing(ui::tokens::spacing::SPACING_50);
             locations = locations.push(
                 iced::widget::button(content)
                     .on_press(Message::SemanticLocationPressed(location.clone()))
                     .width(Fill)
-                    .padding([7, 10])
-                    .style(project_search_result_style),
+                    .padding([
+                        ui::tokens::spacing::BASE_PADDING_VERTICAL_MEDIUM,
+                        ui::tokens::spacing::BASE_PADDING_HORIZONTAL_SMALL,
+                    ])
+                    .style(ui::selectable_row_style),
             );
         }
 
@@ -3906,7 +4109,10 @@ impl App {
                 .wrapping(text::Wrapping::None),
         )
         .width(Fill)
-        .padding([10, 8]);
+        .padding([
+            ui::tokens::spacing::BASE_PADDING_HORIZONTAL_SMALL,
+            ui::tokens::spacing::PANEL_EDGE_TO_CONTENT,
+        ]);
         let body: Element<'_, Message> = if self.document_outline.is_empty() {
             let status = match self.preview_status {
                 PreviewStatus::Waiting | PreviewStatus::Compiling => {
@@ -3918,7 +4124,10 @@ impl App {
 
             container(text(status).size(ui::tokens::typography::FONT_SIZE_75))
                 .width(Fill)
-                .padding([12, 10])
+                .padding([
+                    ui::tokens::spacing::BASE_PADDING_HORIZONTAL_MEDIUM,
+                    ui::tokens::spacing::BASE_PADDING_HORIZONTAL_SMALL,
+                ])
                 .into()
         } else {
             let selected = self.current_outline_key();
@@ -4118,11 +4327,13 @@ impl App {
             Some(ExternalChangeKind::Deleted) => "O arquivo foi removido fora do Typstation",
             None => "",
         };
-        let mut actions = row![text(message)].spacing(8).push(ui::spectrum_button(
-            "Manter local",
-            Some(Message::KeepLocalAfterExternal),
-            ui::ButtonOptions::SECONDARY,
-        ));
+        let mut actions = row![text(message)]
+            .spacing(ui::tokens::spacing::SPACING_100)
+            .push(ui::spectrum_button(
+                "Manter local",
+                Some(Message::KeepLocalAfterExternal),
+                ui::ButtonOptions::SECONDARY,
+            ));
 
         if kind == Some(ExternalChangeKind::Modified) {
             actions = actions.push(ui::spectrum_button(
@@ -4138,7 +4349,13 @@ impl App {
             ));
         }
 
-        container(actions).width(Fill).padding([4, 8]).into()
+        container(actions)
+            .width(Fill)
+            .padding([
+                ui::tokens::spacing::BASE_GAP_SMALL,
+                ui::tokens::spacing::PANEL_EDGE_TO_CONTENT,
+            ])
+            .into()
     }
 
     fn search_view(&self) -> Element<'_, Message> {
@@ -4170,7 +4387,7 @@ impl App {
         let result = container(
             text(count_label)
                 .size(ui::tokens::typography::FONT_SIZE_75)
-                .style(search_metadata_text_style),
+                .style(ui::metadata_text_style),
         )
         .width(iced::Length::Fixed(82.0))
         .align_x(Alignment::Center);
@@ -4233,7 +4450,9 @@ impl App {
                     scrollable::Scrollbar::default(),
                 ))
                 .width(Fill)
-                .height(iced::Length::Fixed(40.0));
+                .height(iced::Length::Fixed(
+                    ui::tokens::dimension::PANEL_HEADER_HEIGHT,
+                ));
             column![
                 row![query, close]
                     .align_y(Alignment::Center)
@@ -4278,11 +4497,12 @@ impl App {
             };
         }
 
-        container(panel)
+        let search = container(panel)
             .width(Fill)
             .padding(ui::tokens::spacing::SEARCH_PANEL_EDGE_TO_CONTENT)
-            .style(search_panel_style)
-            .into()
+            .style(ui::bar_style);
+
+        ui::with_bottom_divider(search)
     }
 
     fn request_destructive_action(&mut self, action: DestructiveFileAction) -> Task<Message> {
@@ -5875,7 +6095,7 @@ impl App {
         self.search.visible = false;
         self.apply_editor_settings();
         self.replace_editor_pane_identity();
-        self.preview_highlight = None;
+        self.preview_highlights.clear();
         self.mark_session_changed();
     }
 
@@ -5892,7 +6112,8 @@ impl App {
             self.preview.clear();
             self.preview_revision = None;
             self.preview_pointer = None;
-            self.preview_highlight = None;
+            self.preview_highlights.clear();
+            self.current_preview_page = 0;
             self.document_outline.clear();
             self.collapsed_outline_entries.clear();
         }
@@ -6279,6 +6500,9 @@ impl App {
             svg_pretty: self.settings.svg_pretty,
             svg_page_gap: self.settings.svg_page_gap,
             html_pretty: self.settings.html_pretty,
+            png_ppi: self.settings.png_ppi,
+            png_render_bleed: self.settings.png_render_bleed,
+            png_page_gap: self.settings.png_page_gap,
         }
     }
 
@@ -6317,7 +6541,33 @@ impl App {
     fn change_preview_zoom(&mut self, delta: i16) {
         let zoom = i32::from(self.settings.preview_zoom) + i32::from(delta);
         self.settings.preview_zoom = zoom.clamp(25, 300) as u16;
+        self.settings.preview_mode = settings::PreviewMode::Custom;
+        self.preview_render_scale =
+            preview_scale(self.settings.preview_zoom, self.preview_logical_ppi);
+        self.preview_needs_cursor_sync = self.settings.preview_sync;
         self.settings_changed(false);
+    }
+
+    fn preview_scale_for_viewport(&self, viewport: iced::Size) -> f32 {
+        let maximum_page_width = self
+            .preview
+            .iter()
+            .map(|page| page.width)
+            .fold(1.0_f32, f32::max);
+        let maximum_page_height = self
+            .preview
+            .iter()
+            .map(|page| page.height)
+            .fold(1.0_f32, f32::max);
+
+        fitted_preview_scale(
+            self.settings.preview_mode,
+            self.settings.preview_zoom,
+            self.preview_logical_ppi,
+            maximum_page_width,
+            maximum_page_height,
+            viewport,
+        )
     }
 
     fn preview_map_ready(&self) -> bool {
@@ -6340,36 +6590,151 @@ impl App {
     }
 
     fn reveal_cursor_in_preview(&mut self) -> Task<Message> {
+        self.reveal_cursor_in_preview_with_status(true)
+    }
+
+    fn follow_cursor_in_preview(&mut self) -> Task<Message> {
+        self.reveal_cursor_in_preview_with_status(false)
+    }
+
+    fn reveal_cursor_in_preview_with_status(&mut self, report_status: bool) -> Task<Message> {
         if !self.preview_navigation_ready() {
-            self.file_status =
-                Some("Aguarde um preview atualizado antes de localizar o cursor".to_owned());
+            if report_status {
+                self.file_status =
+                    Some("Aguarde um preview atualizado antes de localizar o cursor".to_owned());
+            }
             return Task::none();
         }
 
         let offset = self.document.cursor_offset();
         let Some(target) = self.active_source_target() else {
-            self.file_status = Some("A aba ativa não pertence ao preview principal".to_owned());
+            if report_status {
+                self.file_status = Some("A aba ativa não pertence ao preview principal".to_owned());
+            }
             return Task::none();
         };
         let Some((page_index, region)) = find_source_region(&self.preview, &target, offset) else {
-            self.file_status = Some("O cursor não produziu uma região no preview".to_owned());
+            if report_status {
+                self.file_status = Some("O cursor não produziu uma região no preview".to_owned());
+            }
             return Task::none();
         };
         let scroll_offset = self.preview_scroll_offset(page_index, region.bounds);
 
-        self.preview_highlight = Some(PreviewHighlight {
-            page: page_index,
-            bounds: region.bounds,
-        });
-        self.file_status = Some(format!(
-            "Cursor localizado no preview, página {}",
-            page_index + 1
-        ));
+        self.preview_highlights =
+            matching_preview_highlights(&self.preview, &region.target, &region.range);
+        self.current_preview_page = page_index;
+        self.suppress_preview_scroll_sync = true;
+        if report_status {
+            self.file_status = Some(format!(
+                "Cursor localizado no preview, página {}",
+                page_index + 1
+            ));
+        }
 
         operation::scroll_to(self.preview_scroll_id.clone(), scroll_offset)
     }
 
-    fn reveal_preview_source(&mut self, page_index: usize) -> Task<Message> {
+    fn scroll_preview_to_page(&mut self, page_index: usize, scale: f32) -> Task<Message> {
+        let Some(page_index) =
+            (!self.preview.is_empty()).then(|| page_index.min(self.preview.len() - 1))
+        else {
+            return Task::none();
+        };
+        self.preview_render_scale = scale;
+        self.current_preview_page = page_index;
+        self.suppress_preview_scroll_sync = true;
+
+        operation::scroll_to(
+            self.preview_scroll_id.clone(),
+            scrollable::AbsoluteOffset {
+                x: 0.0,
+                y: preview_page_top(&self.preview, page_index, scale),
+            },
+        )
+    }
+
+    fn preview_scrolled(
+        &mut self,
+        offset_y: f32,
+        viewport_height: f32,
+        scale: f32,
+    ) -> Task<Message> {
+        self.preview_render_scale = scale;
+        let Some(page_index) =
+            preview_page_at_offset(&self.preview, offset_y + viewport_height / 2.0, scale)
+        else {
+            return Task::none();
+        };
+        self.current_preview_page = page_index;
+
+        if std::mem::take(&mut self.preview_needs_cursor_sync)
+            && self.settings.preview_sync
+            && self.preview_map_ready()
+        {
+            return self.follow_cursor_in_preview();
+        }
+
+        if std::mem::take(&mut self.suppress_preview_scroll_sync)
+            || !self.settings.preview_sync
+            || !self.preview_map_ready()
+        {
+            return Task::none();
+        }
+
+        let page_top = preview_page_content_top(&self.preview, page_index, scale);
+        let local_y = ((offset_y + viewport_height / 2.0 - page_top) / scale)
+            .clamp(0.0, self.preview[page_index].height);
+        let page = &self.preview[page_index];
+        let Some(region) = find_nearest_preview_region(page, page.width / 2.0, local_y) else {
+            return Task::none();
+        };
+        let cursor = self.document.cursor_offset();
+        if self.active_source_target().as_ref() == Some(&region.target)
+            && region.range.start <= cursor
+            && cursor <= region.range.end
+        {
+            return Task::none();
+        }
+
+        let highlights = matching_preview_highlights(&self.preview, &region.target, &region.range);
+        let task = self.reveal_preview_region_silently(region);
+        self.preview_highlights = highlights;
+        task
+    }
+
+    fn reveal_preview_region_silently(
+        &mut self,
+        region: source_map::SourceRegion,
+    ) -> Task<Message> {
+        let target = match region.target {
+            source_map::SourceTarget::Main => self
+                .project_main
+                .clone()
+                .map(source_map::SourceTarget::ProjectFile)
+                .unwrap_or(source_map::SourceTarget::Main),
+            target => target,
+        };
+
+        match target {
+            source_map::SourceTarget::Main => {
+                self.document.reveal_range(region.range);
+            }
+            source_map::SourceTarget::ProjectFile(path) => {
+                let Some(id) = self.document.find_path(&path) else {
+                    return Task::none();
+                };
+                self.activate_document(id);
+                if let Some(document) = self.document.get_mut(id) {
+                    document.reveal_range(region.range);
+                }
+            }
+        }
+
+        Task::none()
+    }
+
+    fn reveal_preview_source(&mut self, page_index: usize, scale: f32) -> Task<Message> {
         if !self.preview_map_ready() {
             self.file_status =
                 Some("Aguarde um preview atualizado antes de navegar para o texto".to_owned());
@@ -6384,7 +6749,7 @@ impl App {
         let Some(page) = self.preview.get(page_index) else {
             return Task::none();
         };
-        let scale = preview_scale(self.settings.preview_zoom, self.preview_logical_ppi);
+        self.current_preview_page = page_index;
         let x = pointer.position.x / scale;
         let y = pointer.position.y / scale;
         let Some(region) = find_preview_region(page, x, y) else {
@@ -6392,10 +6757,8 @@ impl App {
             return Task::none();
         };
 
-        self.preview_highlight = Some(PreviewHighlight {
-            page: page_index,
-            bounds: region.bounds,
-        });
+        self.preview_highlights =
+            matching_preview_highlights(&self.preview, &region.target, &region.range);
         self.reveal_source_target(
             region.target,
             region.range,
@@ -6408,7 +6771,7 @@ impl App {
         page_index: usize,
         bounds: source_map::SourceBounds,
     ) -> scrollable::AbsoluteOffset {
-        let scale = preview_scale(self.settings.preview_zoom, self.preview_logical_ppi);
+        let scale = self.preview_render_scale;
         let widest_page = self
             .preview
             .iter()
@@ -6973,7 +7336,7 @@ impl App {
             reset_files,
         });
         self.compilation_revision = self.compilation_revision.wrapping_add(1);
-        self.preview_highlight = None;
+        self.preview_highlights.clear();
         self.preview_status = PreviewStatus::Waiting;
     }
 
@@ -7082,11 +7445,15 @@ impl App {
             .collect();
         self.preview_revision = Some(output.revision);
         self.preview_pointer = None;
-        self.preview_highlight = None;
+        self.preview_highlights.clear();
+        self.current_preview_page = self
+            .current_preview_page
+            .min(self.preview.len().saturating_sub(1));
         self.preview_status = PreviewStatus::Ready {
             pages: output.page_count,
             warnings: output.warning_count,
         };
+        self.preview_needs_cursor_sync = self.settings.preview_sync;
         Task::none()
     }
 
@@ -7185,6 +7552,71 @@ fn find_source_region(
         .map(|(page_index, region)| (page_index, region.clone()))
 }
 
+fn matching_preview_highlights(
+    pages: &[PreviewPage],
+    target: &source_map::SourceTarget,
+    range: &Range<usize>,
+) -> Vec<PreviewHighlight> {
+    pages
+        .iter()
+        .enumerate()
+        .flat_map(|(page, preview)| {
+            preview
+                .regions
+                .iter()
+                .filter(move |region| {
+                    &region.target == target
+                        && region.range.start < range.end
+                        && range.start < region.range.end
+                })
+                .map(move |region| PreviewHighlight {
+                    page,
+                    bounds: region.bounds,
+                })
+        })
+        .collect()
+}
+
+fn preview_page_content_top(pages: &[PreviewPage], page_index: usize, scale: f32) -> f32 {
+    PREVIEW_PADDING
+        + pages
+            .iter()
+            .take(page_index)
+            .map(|page| {
+                PREVIEW_LABEL_HEIGHT
+                    + PREVIEW_LABEL_SPACING
+                    + page.height * scale
+                    + PREVIEW_PAGE_SPACING
+            })
+            .sum::<f32>()
+        + PREVIEW_LABEL_HEIGHT
+        + PREVIEW_LABEL_SPACING
+}
+
+fn preview_page_top(pages: &[PreviewPage], page_index: usize, scale: f32) -> f32 {
+    (preview_page_content_top(pages, page_index, scale)
+        - PREVIEW_LABEL_HEIGHT
+        - PREVIEW_LABEL_SPACING)
+        .max(0.0)
+}
+
+fn preview_page_at_offset(pages: &[PreviewPage], offset_y: f32, scale: f32) -> Option<usize> {
+    pages
+        .iter()
+        .enumerate()
+        .min_by(|(left_index, left), (right_index, right)| {
+            let left_center =
+                preview_page_content_top(pages, *left_index, scale) + left.height * scale / 2.0;
+            let right_center =
+                preview_page_content_top(pages, *right_index, scale) + right.height * scale / 2.0;
+            (left_center - offset_y)
+                .abs()
+                .partial_cmp(&(right_center - offset_y).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index)
+}
+
 fn collect_outline_keys(entries: &[compiler::DocumentOutlineItem], keys: &mut HashSet<OutlineKey>) {
     for entry in entries {
         keys.insert(OutlineKey::new(entry.target.clone(), entry.range.start));
@@ -7239,6 +7671,37 @@ fn find_preview_region(page: &PreviewPage, x: f32, y: f32) -> Option<source_map:
                 })
         })
         .cloned()
+}
+
+fn find_nearest_preview_region(
+    page: &PreviewPage,
+    x: f32,
+    y: f32,
+) -> Option<source_map::SourceRegion> {
+    page.regions
+        .iter()
+        .min_by(|left, right| {
+            left.bounds
+                .distance_squared(x, y)
+                .partial_cmp(&right.bounds.distance_squared(x, y))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.kind.hit_priority().cmp(&right.kind.hit_priority()))
+        })
+        .cloned()
+}
+
+fn action_moves_cursor(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Move(_)
+            | Action::Select(_)
+            | Action::MoveTo(_)
+            | Action::SelectTo(_)
+            | Action::SelectWord(_)
+            | Action::SelectLine(_)
+            | Action::SelectAll
+            | Action::ExpandSelection
+    )
 }
 
 fn panes_from_layout(layout: session::PaneLayout) -> pane_grid::State<Pane> {
@@ -7380,7 +7843,7 @@ fn menu_command_at(entries: &[AppMenuEntry], target: usize) -> Option<MenuComman
 }
 
 fn menu_horizontal_offset(menu: AppMenu) -> f32 {
-    APP_BAR_HORIZONTAL_PADDING
+    ui::tokens::spacing::APP_BAR_PADDING_HORIZONTAL
         + match menu {
             AppMenu::File => 0.0,
             AppMenu::Edit => FILE_MENU_TRIGGER_WIDTH,
@@ -7393,7 +7856,8 @@ fn menu_horizontal_offset(menu: AppMenu) -> f32 {
 
 fn menu_popup_width(menu: AppMenu) -> f32 {
     match menu {
-        AppMenu::File => 280.0,
+        // Comporta simultaneamente o maior rótulo e o maior atalho do menu.
+        AppMenu::File => 384.0,
         AppMenu::Edit => 304.0,
         AppMenu::View => 320.0,
         AppMenu::Help => 256.0,
@@ -7438,12 +7902,12 @@ fn settings_slider_row<'a>(
             Space::new().width(Fill),
             text(value)
                 .size(ui::tokens::typography::FONT_SIZE_75)
-                .style(search_metadata_text_style),
+                .style(ui::metadata_text_style),
         ]
         .align_y(Alignment::Center),
         control.into(),
     ]
-    .spacing(8)
+    .spacing(ui::tokens::spacing::FIELD_LABEL_TO_CONTROL)
     .into()
 }
 
@@ -7465,167 +7929,6 @@ fn settings_icon_style(theme: &Theme, _status: svg::Status) -> svg::Style {
                 .default,
         ),
     }
-}
-
-fn settings_band_style(theme: &Theme) -> iced::widget::container::Style {
-    let colors = ui::tokens::SpectrumColors::from_theme(theme);
-
-    iced::widget::container::Style::default()
-        .background(colors.gray.gray_50)
-        .border(Border {
-            color: colors.gray.gray_300,
-            width: 1.0,
-            ..Border::default()
-        })
-}
-
-fn settings_window_background_style(theme: &Theme) -> iced::widget::container::Style {
-    iced::widget::container::Style::default()
-        .background(ui::tokens::SpectrumColors::from_theme(theme).gray.gray_25)
-}
-
-fn search_panel_style(theme: &Theme) -> iced::widget::container::Style {
-    let colors = ui::tokens::SpectrumColors::from_theme(theme);
-
-    iced::widget::container::Style::default()
-        .background(colors.gray.gray_50)
-        .border(Border {
-            color: colors.gray.gray_300,
-            width: 1.0,
-            ..Border::default()
-        })
-}
-
-fn search_metadata_text_style(theme: &Theme) -> text::Style {
-    text::Style {
-        color: Some(ui::tokens::SpectrumColors::from_theme(theme).gray.gray_600),
-    }
-}
-
-fn project_search_result_style(
-    theme: &Theme,
-    status: iced::widget::button::Status,
-) -> iced::widget::button::Style {
-    let colors = ui::tokens::SpectrumColors::from_theme(theme);
-    let background = match status {
-        iced::widget::button::Status::Hovered => {
-            Some(iced::Background::Color(colors.gray.gray_100))
-        }
-        iced::widget::button::Status::Pressed => {
-            Some(iced::Background::Color(colors.gray.gray_200))
-        }
-        iced::widget::button::Status::Active | iced::widget::button::Status::Disabled => None,
-    };
-
-    iced::widget::button::Style {
-        background,
-        text_color: colors.gray.gray_800,
-        border: Border::default(),
-        ..iced::widget::button::Style::default()
-    }
-}
-
-fn app_bar_style(theme: &Theme) -> iced::widget::container::Style {
-    let colors = ui::tokens::SpectrumColors::from_theme(theme);
-
-    iced::widget::container::Style::default()
-        .background(colors.gray.gray_50)
-        .border(Border {
-            color: colors.gray.gray_300,
-            width: 1.0,
-            ..Border::default()
-        })
-}
-
-fn action_bar_style(theme: &Theme) -> iced::widget::container::Style {
-    let colors = ui::tokens::SpectrumColors::from_theme(theme);
-
-    iced::widget::container::Style::default()
-        .background(colors.gray.gray_50)
-        .border(Border {
-            color: colors.gray.gray_300,
-            width: 1.0,
-            ..Border::default()
-        })
-}
-
-fn project_navigation_divider_style(theme: &Theme) -> iced::widget::container::Style {
-    let colors = ui::tokens::SpectrumColors::from_theme(theme);
-
-    iced::widget::container::Style::default().background(colors.gray.gray_300)
-}
-
-fn project_pane_title_style(theme: &Theme) -> iced::widget::container::Style {
-    let colors = ui::tokens::SpectrumColors::from_theme(theme);
-
-    iced::widget::container::Style::default()
-        .background(colors.gray.gray_50)
-        .border(Border {
-            color: colors.gray.gray_300,
-            width: 1.0,
-            ..Border::default()
-        })
-}
-
-fn status_bar_style(theme: &Theme) -> iced::widget::container::Style {
-    let colors = ui::tokens::SpectrumColors::from_theme(theme);
-
-    iced::widget::container::Style::default()
-        .background(colors.gray.gray_50)
-        .border(Border {
-            color: colors.gray.gray_300,
-            width: 1.0,
-            ..Border::default()
-        })
-}
-
-fn modal_backdrop_style(_theme: &Theme) -> iced::widget::container::Style {
-    iced::widget::container::Style::default().background(Color::from_rgba(0.0, 0.0, 0.0, 0.32))
-}
-
-fn modal_dialog_style(theme: &Theme) -> iced::widget::container::Style {
-    let colors = ui::tokens::SpectrumColors::from_theme(theme);
-
-    iced::widget::container::Style {
-        background: Some(iced::Background::Color(colors.gray.gray_50)),
-        border: Border {
-            color: colors.gray.gray_300,
-            width: 1.0,
-            radius: ui::tokens::dimension::CORNER_RADIUS_500.into(),
-        },
-        shadow: iced::Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.24),
-            offset: iced::Vector::new(0.0, 4.0),
-            blur_radius: 12.0,
-        },
-        ..iced::widget::container::Style::default()
-    }
-}
-
-fn message_action_button<'a>(
-    label: &'a str,
-    message: Message,
-    enabled: bool,
-) -> iced::widget::Button<'a, Message> {
-    ui::action_button(
-        label,
-        enabled.then_some(message),
-        ui::ActionButtonOptions::STANDARD,
-    )
-}
-
-fn message_icon_button<'a>(
-    symbol: &'a str,
-    description: &'a str,
-    message: Message,
-    enabled: bool,
-) -> Element<'a, Message> {
-    ui::icon_action_button(
-        symbol,
-        description,
-        enabled.then_some(message),
-        ui::ActionButtonOptions::STANDARD,
-    )
 }
 
 async fn open_document(directory: PathBuf) -> OpenOutcome {
@@ -8439,6 +8742,30 @@ mod tests {
     }
 
     #[test]
+    fn fitted_preview_modes_use_the_available_viewport() {
+        let viewport = iced::Size::new(620.0, 840.0);
+        let width = fitted_preview_scale(
+            settings::PreviewMode::FitWidth,
+            100,
+            96.0,
+            595.0,
+            842.0,
+            viewport,
+        );
+        let page = fitted_preview_scale(
+            settings::PreviewMode::FitPage,
+            100,
+            96.0,
+            595.0,
+            842.0,
+            viewport,
+        );
+
+        assert!((width - 596.0 / 595.0).abs() < 0.001);
+        assert!(page < width);
+    }
+
+    #[test]
     fn save_as_adds_the_typst_extension_when_missing() {
         assert_eq!(
             with_typst_extension(Path::new("documento")),
@@ -8452,6 +8779,7 @@ mod tests {
             (compiler::ExportFormat::Pdf, "documento.pdf"),
             (compiler::ExportFormat::Svg, "documento.svg"),
             (compiler::ExportFormat::Html, "documento.html"),
+            (compiler::ExportFormat::Png, "documento.png"),
         ] {
             assert_eq!(
                 with_export_extension(Path::new("documento"), format),
@@ -8792,9 +9120,10 @@ mod tests {
         assert_eq!(
             labels,
             vec![
-                "Exportar como SVG…",
-                "Exportar como HTML…",
-                "Configurações de exportação…",
+                "Exportar como SVG",
+                "Exportar como HTML",
+                "Exportar como PNG",
+                "Configurações de exportação",
             ]
         );
 
@@ -8900,6 +9229,80 @@ mod tests {
     }
 
     #[test]
+    fn one_source_range_can_highlight_regions_on_multiple_pages() {
+        let target = source_map::SourceTarget::Main;
+        let pages = vec![
+            mapped_preview_page(vec![mapped_region(
+                target.clone(),
+                10..20,
+                source_map::SourceBounds {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 30.0,
+                    height: 10.0,
+                },
+                source_map::SourceRegionKind::Text,
+            )]),
+            mapped_preview_page(vec![mapped_region(
+                target.clone(),
+                15..18,
+                source_map::SourceBounds {
+                    x: 12.0,
+                    y: 24.0,
+                    width: 20.0,
+                    height: 10.0,
+                },
+                source_map::SourceRegionKind::Text,
+            )]),
+        ];
+
+        let highlights = matching_preview_highlights(&pages, &target, &(14..17));
+
+        assert_eq!(highlights.len(), 2);
+        assert_eq!(highlights[0].page, 0);
+        assert_eq!(highlights[1].page, 1);
+    }
+
+    #[test]
+    fn preview_scroll_offset_identifies_the_page_nearest_the_viewport_center() {
+        let pages = vec![
+            mapped_preview_page(Vec::new()),
+            mapped_preview_page(Vec::new()),
+        ];
+        let second_center = preview_page_content_top(&pages, 1, 1.0) + 50.0;
+
+        assert_eq!(preview_page_at_offset(&pages, second_center, 1.0), Some(1));
+    }
+
+    #[test]
+    fn preview_scroll_synchronizes_the_editor_without_rewriting_the_status() {
+        let mut app = App::new();
+        app.document.perform(Action::MoveTo(0));
+        app.preview = vec![mapped_preview_page(vec![mapped_region(
+            source_map::SourceTarget::Main,
+            5..10,
+            source_map::SourceBounds {
+                x: 40.0,
+                y: 12.0,
+                width: 20.0,
+                height: 10.0,
+            },
+            source_map::SourceRegionKind::Text,
+        )])];
+        app.preview_revision = Some(app.compilation_revision);
+        app.preview_status = PreviewStatus::Ready {
+            pages: 1,
+            warnings: 0,
+        };
+        app.file_status = Some("estado preservado".to_owned());
+
+        let _ = app.preview_scrolled(0.0, 100.0, 1.0);
+
+        assert_eq!(app.document.content().selection(), 5..10);
+        assert_eq!(app.file_status.as_deref(), Some("estado preservado"));
+    }
+
+    #[test]
     fn preview_hit_testing_prefers_text_over_an_overlapping_shape() {
         let bounds = source_map::SourceBounds {
             x: 10.0,
@@ -8951,7 +9354,7 @@ mod tests {
 
         let _ = app.reveal_cursor_in_preview();
 
-        assert!(app.preview_highlight.is_none());
+        assert!(app.preview_highlights.is_empty());
         assert!(
             app.file_status
                 .as_deref()
@@ -8982,7 +9385,7 @@ mod tests {
 
         let _ = app.update(Message::Editor(Action::MoveTo(7)));
 
-        assert!(app.preview_highlight.is_some_and(|highlight| {
+        assert!(app.preview_highlights.iter().any(|highlight| {
             highlight.page == 0 && highlight.bounds.x == 12.0 && highlight.bounds.y == 24.0
         }));
     }
@@ -9020,7 +9423,7 @@ mod tests {
 
         let _ = app.reveal_cursor_in_preview();
 
-        assert!(app.preview_highlight.is_some_and(|highlight| {
+        assert!(app.preview_highlights.iter().any(|highlight| {
             highlight.page == 0 && highlight.bounds.x == 18.0 && highlight.bounds.y == 26.0
         }));
     }
@@ -9067,7 +9470,7 @@ mod tests {
             position: Point::new(15.0 * scale, 25.0 * scale),
         });
 
-        let _ = app.reveal_preview_source(0);
+        let _ = app.reveal_preview_source(0, scale);
 
         assert_eq!(app.document.active_id(), part);
         assert_eq!(app.document.content().selection(), 2..8);
@@ -9146,25 +9549,28 @@ mod tests {
     }
 
     #[test]
-    fn project_side_navigation_switches_between_all_destinations() {
+    fn project_panel_tabs_switch_between_all_destinations() {
         let mut app = App::new();
 
         assert_eq!(app.project_navigation, ProjectNavigation::Files);
-        assert_eq!(app.project_navigation.title(), "Arquivos");
+
+        let _ = app.update(Message::ProjectNavigationSelected(
+            ProjectNavigation::Search,
+        ));
+
+        assert_eq!(app.project_navigation, ProjectNavigation::Search);
 
         let _ = app.update(Message::ProjectNavigationSelected(
             ProjectNavigation::Topics,
         ));
 
         assert_eq!(app.project_navigation, ProjectNavigation::Topics);
-        assert_eq!(app.project_navigation.title(), "Sumário");
 
         let _ = app.update(Message::ProjectNavigationSelected(
             ProjectNavigation::Problems,
         ));
 
         assert_eq!(app.project_navigation, ProjectNavigation::Problems);
-        assert_eq!(app.project_navigation.title(), "Problemas");
     }
 
     #[test]
@@ -9408,11 +9814,11 @@ mod tests {
         let root_entries = app.project_context_entries(&root_context);
         let root_labels = menu_labels(&root_entries);
 
-        assert!(root_labels.contains(&"Novo arquivo Typst…"));
-        assert!(root_labels.contains(&"Nova pasta…"));
+        assert!(root_labels.contains(&"Novo arquivo Typst"));
+        assert!(root_labels.contains(&"Nova pasta"));
         assert!(root_labels.contains(&"Atualizar árvore"));
-        assert!(!root_labels.contains(&"Renomear…"));
-        assert!(!root_labels.contains(&"Excluir…"));
+        assert!(!root_labels.contains(&"Renomear"));
+        assert!(!root_labels.contains(&"Excluir"));
 
         let folder_context = ProjectContextMenu {
             path: root.join("capitulos"),
@@ -9422,8 +9828,8 @@ mod tests {
         let folder_entries = app.project_context_entries(&folder_context);
         let folder_labels = menu_labels(&folder_entries);
 
-        assert!(folder_labels.contains(&"Renomear…"));
-        assert!(folder_labels.contains(&"Excluir…"));
+        assert!(folder_labels.contains(&"Renomear"));
+        assert!(folder_labels.contains(&"Excluir"));
     }
 
     #[test]

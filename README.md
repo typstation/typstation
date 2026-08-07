@@ -14,10 +14,11 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
 - An [Iced](https://iced.rs) interface with movable project, editor, and preview panes.
 - Debounced live compilation in a persistent background worker that coalesces
   stale preview requests without dropping exports.
-- A scrollable SVG preview with separate pages and persistent zoom controls.
-- Bidirectional source navigation: click the preview to reveal its Typst source,
-  or use the platform command modifier with click/J, or the preview's Locate
-  command, to reveal the editor cursor in the rendered page.
+- A scrollable SVG preview with separate pages, physical-size zoom, fit-width
+  and fit-page modes, direct page navigation, and a live current-page indicator.
+- Continuous bidirectional source navigation: moving the editor cursor follows
+  the matching rendered regions, while scrolling or clicking the preview reveals
+  its Typst source. Synchronization can be disabled in Preview settings.
 - Typst errors and warnings attached to their source ranges, including errors
   in imported project files and navigation from the Problems panel.
 - Typst-aware completion and snippets, semantic hover documentation, go to
@@ -32,7 +33,9 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
 - Keyboard shortcuts for file operations and inline formatting.
 - Atomic document replacement that preserves existing file permissions and
   symbolic links.
-- PDF, SVG, and experimental HTML export from the current editor snapshot.
+- PDF, SVG, PNG, and experimental HTML export from the current editor snapshot,
+  with format-specific options for accessibility, bleed, resolution, spacing,
+  and readable output.
 - Unicode-aware search and replace with match navigation, whole-word and case
   options, and single-step undo for Replace All.
 - Project-wide search and replace with navigation to file, line, and column.
@@ -85,6 +88,8 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
 - [x] Save all, autosave, recent projects, and complete tab shortcuts
 - [x] Navigate and manipulate the project tree with the keyboard
 - [x] Add Typst-aware editing intelligence and syntax formatting
+- [x] Add adaptive preview modes, page navigation, continuous synchronization,
+      multi-region highlighting, and PNG export
 
 ## Building
 

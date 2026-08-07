@@ -28,6 +28,11 @@ Adobe sob a licença Apache-2.0:
 - `close.svg`: `CloseIcon`, usado para fechar superfícies temporárias;
 - `settings.svg`: `SettingsIcon`, usado na janela de configurações.
 - `more.svg`: `MoreIcon`, usado para abrir ações adicionais de exportação.
+- `undo.svg`: `UndoIcon`, usado para desfazer edições;
+- `redo.svg`: `RedoIcon`, usado para refazer edições;
+- `code.svg`: `CodeIcon`, usado para alternar comentários de código;
+- `zoom-in.svg`: `ZoomInIcon`, usado para aumentar o Preview;
+- `zoom-out.svg`: `ZoomOutIcon`, usado para diminuir o Preview.
 
 O SVG de interface foi extraído de
 `@spectrum-web-components/icons-ui` versão `1.12.2`, sob a mesma licença:

@@ -5,7 +5,8 @@ use iced::{Element, widget::Row};
 use super::{
     ActionButtonOptions, WorkflowIcon,
     button::{
-        ActionButtonPosition, grouped_icon_action_button, grouped_workflow_icon_action_button,
+        ActionButtonPosition, grouped_action_button, grouped_icon_action_button,
+        grouped_workflow_icon_action_button,
     },
     tokens,
 };
@@ -13,6 +14,7 @@ use super::{
 enum ActionGroupIcon<'a> {
     Symbol(&'a str),
     Workflow(WorkflowIcon),
+    Text(String),
 }
 
 pub struct ActionGroupItem<'a, Message> {
@@ -37,6 +39,14 @@ impl<'a, Message> ActionGroupItem<'a, Message> {
             on_press,
         }
     }
+
+    pub fn text(label: impl Into<String>, on_press: Option<Message>) -> Self {
+        Self {
+            icon: ActionGroupIcon::Text(label.into()),
+            label: "",
+            on_press,
+        }
+    }
 }
 
 pub fn compact_action_group<'a, Message, const N: usize>(
@@ -46,10 +56,15 @@ pub fn compact_action_group<'a, Message, const N: usize>(
 where
     Message: Clone + 'a,
 {
-    let mut group = Row::new().spacing(tokens::spacing::ACTION_GROUP_COMPACT_SPACING);
+    let spacing = if options.quiet {
+        0.0
+    } else {
+        tokens::spacing::ACTION_GROUP_COMPACT_SPACING
+    };
+    let mut group = Row::new().spacing(spacing);
 
     for (index, item) in items.into_iter().enumerate() {
-        let position = ActionButtonPosition::in_group(index, N);
+        let position = action_group_position(options.quiet, index, N);
         let control = match item.icon {
             ActionGroupIcon::Symbol(symbol) => {
                 grouped_icon_action_button(symbol, item.label, item.on_press, options, position)
@@ -61,12 +76,23 @@ where
                 options,
                 position,
             ),
+            ActionGroupIcon::Text(label) => {
+                grouped_action_button(label, item.on_press, options, position).into()
+            }
         };
 
         group = group.push(control);
     }
 
     group.into()
+}
+
+fn action_group_position(quiet: bool, index: usize, len: usize) -> ActionButtonPosition {
+    if quiet {
+        ActionButtonPosition::Standalone
+    } else {
+        ActionButtonPosition::in_group(index, len)
+    }
 }
 
 #[cfg(test)]
@@ -90,6 +116,22 @@ mod tests {
         assert_eq!(
             ActionButtonPosition::in_group(0, 1),
             ActionButtonPosition::Standalone
+        );
+    }
+
+    #[test]
+    fn quiet_groups_keep_each_action_visually_independent() {
+        assert_eq!(
+            action_group_position(true, 0, 3),
+            ActionButtonPosition::Standalone
+        );
+        assert_eq!(
+            action_group_position(true, 1, 3),
+            ActionButtonPosition::Standalone
+        );
+        assert_eq!(
+            action_group_position(false, 1, 3),
+            ActionButtonPosition::Middle
         );
     }
 }

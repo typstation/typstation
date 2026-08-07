@@ -62,6 +62,7 @@ pub mod dimension {
     pub const COMPONENT_HEIGHT_200: f32 = 40.0;
     pub const COMPONENT_HEIGHT_300: f32 = 48.0;
 
+    pub const BORDER_WIDTH_100: f32 = 1.0;
     pub const BORDER_WIDTH_200: f32 = 2.0;
     pub const FOCUS_RING_THICKNESS: f32 = 2.0;
     pub const FOCUS_RING_GAP: f32 = 2.0;
@@ -90,8 +91,17 @@ pub mod dimension {
     pub const STATUS_BAR_INDICATOR_HEIGHT: f32 = COMPONENT_HEIGHT_75;
 
     pub const FIELD_HEIGHT_MEDIUM: f32 = COMPONENT_HEIGHT_100;
+    pub const PICKER_MINIMUM_WIDTH_MEDIUM: f32 = FIELD_HEIGHT_MEDIUM * 2.0;
+    pub const PICKER_HANDLE_SIZE_MEDIUM: f32 = 10.0;
     pub const CHECKBOX_SIZE_MEDIUM: f32 = 16.0;
     pub const CHECKBOX_CORNER_RADIUS: f32 = 2.0;
+    pub const SWITCH_CONTROL_HEIGHT_MEDIUM: f32 = 16.0;
+    pub const SWITCH_HANDLE_SIZE_MEDIUM: f32 = 10.0;
+    pub const SLIDER_HANDLE_SIZE_MEDIUM: f32 = 16.0;
+    pub const SLIDER_TRACK_THICKNESS: f32 = 2.0;
+    pub const SLIDER_CONTROL_HEIGHT_MEDIUM: f32 = COMPONENT_HEIGHT_75;
+    pub const SPLIT_VIEW_DIVIDER_THICKNESS: f32 = 1.0;
+    pub const SPLIT_VIEW_DIVIDER_INTERACTION_THICKNESS: f32 = 2.0;
 
     pub const ALERT_DIALOG_MINIMUM_WIDTH: f32 = 288.0;
     pub const ALERT_DIALOG_MAXIMUM_WIDTH: f32 = 480.0;
@@ -106,11 +116,26 @@ pub mod dimension {
     pub const MENU_POPOVER_CORNER_RADIUS: f32 = CORNER_RADIUS_700;
     pub const MENU_SECTION_DIVIDER_HEIGHT: f32 = 12.0;
 
-    pub const SIDE_NAVIGATION_RAIL_WIDTH: f32 = COMPONENT_HEIGHT_300;
-    pub const SIDE_NAVIGATION_NOTIFICATION_SIZE: f32 = 10.0;
+    pub const PANEL_TABS_RAIL_WIDTH: f32 = COMPONENT_HEIGHT_300;
+    pub const PANEL_TAB_ITEM_SIZE: f32 = COMPONENT_HEIGHT_200;
+    pub const PANEL_TAB_SELECTION_INDICATOR_WIDTH: f32 = BORDER_WIDTH_200;
+    pub const PANEL_TAB_NOTIFICATION_SIZE: f32 = 10.0;
+
+    pub const APP_HEADER_HEIGHT: f32 = COMPONENT_HEIGHT_200;
+    pub const PANEL_HEADER_HEIGHT: f32 = COMPONENT_HEIGHT_200;
+    pub const SETTINGS_HEADER_HEIGHT: f32 = 56.0;
+    pub const SETTINGS_FOOTER_HEIGHT: f32 = 64.0;
 }
 
 pub mod spacing {
+    pub const SPACING_50: f32 = 2.0;
+    pub const SPACING_75: f32 = 4.0;
+    pub const SPACING_100: f32 = 8.0;
+    pub const SPACING_200: f32 = 12.0;
+    pub const SPACING_300: f32 = 16.0;
+    pub const SPACING_400: f32 = 24.0;
+    pub const SPACING_500: f32 = 32.0;
+
     pub const BASE_GAP_SMALL: f32 = 4.0;
     pub const BASE_GAP_MEDIUM: f32 = 6.0;
     pub const BASE_GAP_LARGE: f32 = 6.0;
@@ -165,7 +190,12 @@ pub mod spacing {
     pub const STATUS_BAR_ICON_TO_COUNT: f32 = BASE_GAP_SMALL;
 
     pub const FIELD_EDGE_TO_TEXT_MEDIUM: f32 = 12.0;
+    pub const FIELD_TOP_TO_TEXT_MEDIUM: f32 = 6.0;
+    pub const PICKER_EDGE_TO_TEXT_MEDIUM: f32 = FIELD_EDGE_TO_TEXT_MEDIUM;
+    pub const PICKER_TEXT_TO_HANDLE_MEDIUM: f32 = SPACING_100;
+    pub const PICKER_TO_MENU_MEDIUM: f32 = SPACING_100;
     pub const CHECKBOX_TO_LABEL: f32 = 8.0;
+    pub const SWITCH_TO_LABEL: f32 = SPACING_100;
 
     pub const ALERT_DIALOG_PADDING: f32 = 32.0;
     pub const ALERT_DIALOG_ICON_TO_TITLE: f32 = 12.0;
@@ -190,9 +220,20 @@ pub mod spacing {
     pub const MENU_TEXT_TO_VALUE: f32 = 24.0;
     pub const MENU_POPOVER_PADDING: f32 = BASE_GAP_SMALL;
 
-    pub const SIDE_NAVIGATION_PADDING_HORIZONTAL: f32 = 8.0;
-    pub const SIDE_NAVIGATION_PADDING_VERTICAL: f32 = 8.0;
-    pub const SIDE_NAVIGATION_ITEM_GAP: f32 = BASE_GAP_MEDIUM;
+    pub const PANEL_TABS_PADDING_HORIZONTAL: f32 = SPACING_75;
+    pub const PANEL_TABS_PADDING_VERTICAL: f32 = SPACING_100;
+    pub const PANEL_TABS_ITEM_GAP: f32 = SPACING_50;
+    pub const PANEL_TAB_NOTIFICATION_OFFSET: f32 = SPACING_50;
+
+    pub const APP_BAR_PADDING_VERTICAL: f32 = BASE_GAP_SMALL;
+    pub const APP_BAR_PADDING_HORIZONTAL: f32 = SPACING_100;
+    pub const APP_BAR_ACTION_GAP: f32 = SPACING_200;
+    pub const PANEL_EDGE_TO_CONTENT: f32 = 8.0;
+    pub const SETTINGS_EDGE_TO_CONTENT: f32 = 24.0;
+    pub const SETTINGS_PANEL_HORIZONTAL_PADDING: f32 = 32.0;
+    pub const SETTINGS_CONTROL_GAP: f32 = 16.0;
+    pub const FIELD_LABEL_TO_CONTROL: f32 = 8.0;
+    pub const TOOLTIP_EDGE_TO_CONTENT: f32 = SPACING_100;
 }
 
 pub mod typography {
@@ -378,10 +419,14 @@ mod tests {
         assert_eq!(dimension::TAB_CLOSE_BUTTON_SIZE, 24.0);
         assert_eq!(spacing::TAB_GAP_HORIZONTAL_MEDIUM, 24.0);
         assert_eq!(icon::UI_CROSS_100_SIZE, 8.0);
-        assert_eq!(dimension::SIDE_NAVIGATION_RAIL_WIDTH, 48.0);
-        assert_eq!(dimension::SIDE_NAVIGATION_NOTIFICATION_SIZE, 10.0);
-        assert_eq!(spacing::SIDE_NAVIGATION_PADDING_HORIZONTAL, 8.0);
-        assert_eq!(spacing::SIDE_NAVIGATION_ITEM_GAP, 6.0);
+        assert_eq!(dimension::PANEL_TABS_RAIL_WIDTH, 48.0);
+        assert_eq!(dimension::PANEL_TAB_ITEM_SIZE, 40.0);
+        assert_eq!(dimension::PANEL_TAB_SELECTION_INDICATOR_WIDTH, 2.0);
+        assert_eq!(dimension::PANEL_TAB_NOTIFICATION_SIZE, 10.0);
+        assert_eq!(spacing::PANEL_TABS_PADDING_HORIZONTAL, 4.0);
+        assert_eq!(spacing::PANEL_TABS_ITEM_GAP, 2.0);
+        assert_eq!(spacing::APP_BAR_PADDING_VERTICAL, 4.0);
+        assert_eq!(spacing::APP_BAR_PADDING_HORIZONTAL, 8.0);
     }
 
     #[test]

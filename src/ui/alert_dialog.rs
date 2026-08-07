@@ -1,7 +1,7 @@
 //! Alert Dialog modal baseado na anatomia e nas variantes do Adobe Spectrum.
 
 use iced::{
-    Alignment, Background, Border, Color, Element, Font, Length, Theme,
+    Alignment, Element, Font, Length, Theme,
     font::Weight,
     widget::{Column, Row, Space, container, mouse_area, svg, text},
 };
@@ -144,14 +144,14 @@ impl<Message> AlertDialog<Message> {
             .width(Length::Fill)
             .max_width(tokens::dimension::ALERT_DIALOG_MAXIMUM_WIDTH)
             .padding(tokens::spacing::ALERT_DIALOG_PADDING)
-            .style(dialog_style);
+            .style(super::surface::elevated_dialog_style);
         let overlay = container(dialog)
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(tokens::spacing::BASE_PADDING_HORIZONTAL_EXTRA_LARGE)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
-            .style(backdrop_style);
+            .style(super::surface::modal_backdrop_style);
 
         mouse_area(overlay).on_press(self.blocked_message).into()
     }
@@ -191,29 +191,6 @@ fn alert_icon_style(
     };
 
     svg::Style { color: Some(color) }
-}
-
-fn backdrop_style(_theme: &Theme) -> container::Style {
-    container::Style::default().background(Color::from_rgba(0.0, 0.0, 0.0, 0.40))
-}
-
-fn dialog_style(theme: &Theme) -> container::Style {
-    let colors = SpectrumColors::from_theme(theme);
-
-    container::Style {
-        background: Some(Background::Color(colors.gray.gray_50)),
-        border: Border {
-            color: colors.gray.gray_300,
-            width: 1.0,
-            radius: tokens::dimension::CORNER_RADIUS_500.into(),
-        },
-        shadow: iced::Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.28),
-            offset: iced::Vector::new(0.0, 6.0),
-            blur_radius: 18.0,
-        },
-        ..container::Style::default()
-    }
 }
 
 fn divider_style(theme: &Theme) -> container::Style {

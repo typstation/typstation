@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -11,12 +12,17 @@ pub struct Settings {
     pub show_gutter: bool,
     pub editor_font_size: u16,
     pub preview_zoom: u16,
+    pub preview_mode: PreviewMode,
+    pub preview_sync: bool,
     pub pdf_tagged: bool,
     pub pdf_pretty: bool,
     pub svg_render_bleed: bool,
     pub svg_pretty: bool,
     pub svg_page_gap: u16,
     pub html_pretty: bool,
+    pub png_ppi: u16,
+    pub png_render_bleed: bool,
+    pub png_page_gap: u16,
     pub theme: ThemeMode,
 }
 
@@ -31,12 +37,17 @@ impl Default for Settings {
             show_gutter: true,
             editor_font_size: 16,
             preview_zoom: 100,
+            preview_mode: PreviewMode::ActualSize,
+            preview_sync: true,
             pdf_tagged: true,
             pdf_pretty: false,
             svg_render_bleed: false,
             svg_pretty: false,
             svg_page_gap: 12,
             html_pretty: true,
+            png_ppi: 144,
+            png_render_bleed: false,
+            png_page_gap: 12,
             theme: ThemeMode::Dark,
         }
     }
@@ -48,7 +59,39 @@ impl Settings {
         self.editor_font_size = self.editor_font_size.clamp(10, 30);
         self.preview_zoom = self.preview_zoom.clamp(25, 300);
         self.svg_page_gap = self.svg_page_gap.min(72);
+        self.png_ppi = self.png_ppi.clamp(72, 600);
+        self.png_page_gap = self.png_page_gap.min(72);
         self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewMode {
+    #[default]
+    ActualSize,
+    FitWidth,
+    FitPage,
+    Custom,
+}
+
+impl PreviewMode {
+    pub const ALL: [Self; 4] = [
+        Self::ActualSize,
+        Self::FitWidth,
+        Self::FitPage,
+        Self::Custom,
+    ];
+}
+
+impl fmt::Display for PreviewMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ActualSize => "100%",
+            Self::FitWidth => "Largura",
+            Self::FitPage => "Página",
+            Self::Custom => "Personalizado",
+        })
     }
 }
 
@@ -70,6 +113,8 @@ mod tests {
             editor_font_size: 100,
             preview_zoom: 5,
             svg_page_gap: 100,
+            png_ppi: 10,
+            png_page_gap: 100,
             ..Settings::default()
         }
         .validate();
@@ -78,6 +123,8 @@ mod tests {
         assert_eq!(settings.editor_font_size, 30);
         assert_eq!(settings.preview_zoom, 25);
         assert_eq!(settings.svg_page_gap, 72);
+        assert_eq!(settings.png_ppi, 72);
+        assert_eq!(settings.png_page_gap, 72);
     }
 
     #[test]
@@ -94,5 +141,17 @@ mod tests {
         assert!(!settings.svg_render_bleed);
         assert_eq!(settings.svg_page_gap, 12);
         assert!(settings.html_pretty);
+        assert_eq!(settings.preview_mode, PreviewMode::ActualSize);
+        assert!(settings.preview_sync);
+        assert_eq!(settings.png_ppi, 144);
+    }
+
+    #[test]
+    fn preview_modes_have_compact_portuguese_labels() {
+        assert_eq!(PreviewMode::ALL.len(), 4);
+        assert_eq!(PreviewMode::ActualSize.to_string(), "100%");
+        assert_eq!(PreviewMode::FitWidth.to_string(), "Largura");
+        assert_eq!(PreviewMode::FitPage.to_string(), "Página");
+        assert_eq!(PreviewMode::Custom.to_string(), "Personalizado");
     }
 }

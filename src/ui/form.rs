@@ -2,7 +2,10 @@
 
 use iced::{
     Background, Border, Color, Element, Length, Padding, Theme,
-    widget::{Checkbox, Stack, TextInput, checkbox, container, row, svg, text, text_input},
+    widget::{
+        Checkbox, Stack, TextInput, Toggler, checkbox, column, container, row, svg, text,
+        text_input, toggler,
+    },
 };
 
 use super::{
@@ -29,9 +32,80 @@ where
         .style(spectrum_checkbox_style)
 }
 
+pub fn spectrum_switch<'a, Message>(
+    label: impl text::IntoFragment<'a>,
+    is_toggled: bool,
+    on_toggle: impl Fn(bool) -> Message + 'a,
+) -> Toggler<'a, Message>
+where
+    Message: 'a,
+{
+    toggler(is_toggled)
+        .label(label)
+        .on_toggle(on_toggle)
+        .size(tokens::dimension::SWITCH_CONTROL_HEIGHT_MEDIUM)
+        .spacing(tokens::spacing::SWITCH_TO_LABEL)
+        .text_size(tokens::typography::FONT_SIZE_100)
+        .style(spectrum_switch_style)
+}
+
 pub fn spectrum_text_field<'a, Message>(
-    label: &str,
-    value: &str,
+    label: &'a str,
+    value: &'a str,
+    on_input: impl Fn(String) -> Message + 'a,
+    on_submit: Option<Message>,
+    width: Length,
+) -> Element<'a, Message>
+where
+    Message: Clone + 'a,
+{
+    labeled_text_field(label, value, on_input, on_submit, width, None)
+}
+
+pub fn spectrum_text_field_with_id<'a, Message>(
+    label: &'a str,
+    value: &'a str,
+    id: iced::widget::Id,
+    on_input: impl Fn(String) -> Message + 'a,
+    on_submit: Option<Message>,
+    width: Length,
+) -> Element<'a, Message>
+where
+    Message: Clone + 'a,
+{
+    labeled_text_field(label, value, on_input, on_submit, width, Some(id))
+}
+
+fn labeled_text_field<'a, Message>(
+    label: &'a str,
+    value: &'a str,
+    on_input: impl Fn(String) -> Message + 'a,
+    on_submit: Option<Message>,
+    width: Length,
+    id: Option<iced::widget::Id>,
+) -> Element<'a, Message>
+where
+    Message: Clone + 'a,
+{
+    let label = text(label)
+        .size(tokens::typography::FONT_SIZE_75)
+        .line_height(tokens::typography::LINE_HEIGHT_100)
+        .style(field_label_style);
+    let control = text_field_control("", value, on_input, on_submit, width);
+    let control = match id {
+        Some(id) => control.id(id),
+        None => control,
+    };
+
+    column![label, control]
+        .width(width)
+        .spacing(tokens::spacing::FIELD_LABEL_TO_CONTROL)
+        .into()
+}
+
+fn text_field_control<'a, Message>(
+    prompt: &'a str,
+    value: &'a str,
     on_input: impl Fn(String) -> Message + 'a,
     on_submit: Option<Message>,
     width: Length,
@@ -39,19 +113,22 @@ pub fn spectrum_text_field<'a, Message>(
 where
     Message: Clone + 'a,
 {
-    text_input(label, value)
+    text_input(prompt, value)
         .on_input(on_input)
         .on_submit_maybe(on_submit)
         .width(width)
-        .padding([6.0, tokens::spacing::FIELD_EDGE_TO_TEXT_MEDIUM])
+        .padding([
+            tokens::spacing::FIELD_TOP_TO_TEXT_MEDIUM,
+            tokens::spacing::FIELD_EDGE_TO_TEXT_MEDIUM,
+        ])
         .size(tokens::typography::FONT_SIZE_100)
         .line_height(text::LineHeight::Absolute(iced::Pixels(20.0)))
         .style(spectrum_text_field_style)
 }
 
 pub fn search_field<'a, Message>(
-    label: &str,
-    value: &str,
+    label: &'a str,
+    value: &'a str,
     id: iced::widget::Id,
     on_input: impl Fn(String) -> Message + 'a,
     on_submit: Message,
@@ -61,12 +138,12 @@ pub fn search_field<'a, Message>(
 where
     Message: Clone + 'a,
 {
-    let field = spectrum_text_field(label, value, on_input, Some(on_submit), width)
+    let field = text_field_control(label, value, on_input, Some(on_submit), width)
         .id(id)
         .padding(Padding {
-            top: 6.0,
+            top: tokens::spacing::FIELD_TOP_TO_TEXT_MEDIUM,
             right: tokens::spacing::SEARCH_FIELD_ICON_SLOT,
-            bottom: 6.0,
+            bottom: tokens::spacing::FIELD_TOP_TO_TEXT_MEDIUM,
             left: tokens::spacing::SEARCH_FIELD_ICON_SLOT,
         });
     let search_icon = svg(WorkflowIcon::Search.handle())
@@ -203,8 +280,69 @@ fn spectrum_checkbox_style(theme: &Theme, status: checkbox::Status) -> checkbox:
     }
 }
 
+fn spectrum_switch_style(theme: &Theme, status: toggler::Status) -> toggler::Style {
+    let colors = SpectrumColors::from_theme(theme);
+    let (is_toggled, hovered, disabled) = match status {
+        toggler::Status::Active { is_toggled } => (is_toggled, false, false),
+        toggler::Status::Hovered { is_toggled } => (is_toggled, true, false),
+        toggler::Status::Disabled { is_toggled } => (is_toggled, false, true),
+    };
+    let background = if disabled {
+        colors.disabled_background
+    } else if is_toggled {
+        if hovered {
+            colors.accent_background.hover
+        } else {
+            colors.accent_background.default
+        }
+    } else if hovered {
+        colors.gray.gray_500
+    } else {
+        colors.gray.gray_400
+    };
+    let background_border_color = if disabled {
+        colors.disabled_border
+    } else if is_toggled {
+        Color::TRANSPARENT
+    } else if hovered {
+        colors.gray.gray_700
+    } else {
+        colors.gray.gray_600
+    };
+    let foreground = if disabled {
+        colors.disabled_content
+    } else {
+        Color::WHITE
+    };
+    let padding_ratio = (tokens::dimension::SWITCH_CONTROL_HEIGHT_MEDIUM
+        - tokens::dimension::SWITCH_HANDLE_SIZE_MEDIUM)
+        / (2.0 * tokens::dimension::SWITCH_CONTROL_HEIGHT_MEDIUM);
+
+    toggler::Style {
+        background: Background::Color(background),
+        background_border_width: 1.0,
+        background_border_color,
+        foreground: Background::Color(foreground),
+        foreground_border_width: 0.0,
+        foreground_border_color: Color::TRANSPARENT,
+        text_color: Some(if disabled {
+            colors.disabled_content
+        } else {
+            colors.neutral_content.default
+        }),
+        border_radius: None,
+        padding_ratio,
+    }
+}
+
 fn search_icon_style(theme: &Theme, _status: svg::Status) -> svg::Style {
     svg::Style {
+        color: Some(SpectrumColors::from_theme(theme).neutral_content.default),
+    }
+}
+
+fn field_label_style(theme: &Theme) -> text::Style {
+    text::Style {
         color: Some(SpectrumColors::from_theme(theme).neutral_content.default),
     }
 }
@@ -220,5 +358,15 @@ mod tests {
             tokens::dimension::COMPONENT_HEIGHT_100
         );
         assert_eq!(tokens::spacing::SEARCH_FIELD_ICON_SLOT, 36.0);
+    }
+
+    #[test]
+    fn medium_switch_uses_a_ten_pixel_handle() {
+        let padding = (tokens::dimension::SWITCH_CONTROL_HEIGHT_MEDIUM
+            - tokens::dimension::SWITCH_HANDLE_SIZE_MEDIUM)
+            / 2.0;
+
+        assert_eq!(tokens::dimension::SWITCH_CONTROL_HEIGHT_MEDIUM, 16.0);
+        assert_eq!(padding, 3.0);
     }
 }
