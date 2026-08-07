@@ -170,6 +170,8 @@ struct App {
     search: SearchState,
     search_input_id: Id,
     rename_input_id: Id,
+    quick_switcher: Option<QuickSwitcherState>,
+    quick_switcher_input_id: Id,
     project_navigation: ProjectNavigation,
     project_search: ProjectSearchState,
     project_tree: Vec<project::ProjectEntry>,
@@ -206,6 +208,7 @@ struct App {
     editor_context_menu: Option<EditorContextMenu>,
     cursor_position: Point,
     about_visible: bool,
+    document_info_visible: bool,
     file_status: Option<String>,
 }
 
@@ -290,6 +293,28 @@ struct EditorContextMenu {
     position: Point,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuickSwitcherMode {
+    Files,
+    Commands,
+}
+
+#[derive(Debug)]
+struct QuickSwitcherState {
+    mode: QuickSwitcherMode,
+    query: String,
+    focus: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuickSwitcherNavigation {
+    Previous,
+    Next,
+    First,
+    Last,
+    Activate,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     Editor(Action),
@@ -312,6 +337,7 @@ enum Message {
     Italic,
     Underline,
     PrefixLines(String),
+    InsertTypstSnippet(formatting::TypstSnippet),
     OpenSettings,
     OpenExportSettings,
     CloseSettingsWindow,
@@ -372,6 +398,12 @@ enum Message {
     SearchPrevious,
     ReplaceCurrent,
     ReplaceAll,
+    OpenQuickSwitcher(QuickSwitcherMode),
+    QuickSwitcherQueryChanged(String),
+    QuickSwitcherFocused(usize),
+    QuickSwitcherNavigate(QuickSwitcherNavigation),
+    QuickSwitcherSelected(QuickSwitcherAction),
+    CloseQuickSwitcher,
     ActivateDocument(DocumentId),
     ActivateRelativeDocument(bool),
     MoveActiveDocument(bool),
@@ -440,6 +472,7 @@ enum Message {
     EscapePressed,
     ExitApplication,
     CloseAbout,
+    CloseDocumentInfo,
     AlertDialogBlocked,
     DismissAlertDialog,
     ConfirmProjectDeletion,
@@ -504,6 +537,11 @@ enum MenuCommand {
     SaveDocument,
     SaveDocumentAs,
     SaveAllDocuments,
+    AutoSave(bool),
+    CopyActiveDocumentPath,
+    RevealActiveDocument,
+    ToggleActiveDocumentMain,
+    ShowDocumentInfo,
     Export(compiler::ExportFormat),
     CloseDocument(DocumentId),
     Exit,
@@ -521,6 +559,8 @@ enum MenuCommand {
     OpenSearch,
     OpenProjectSearch,
     OpenReplace,
+    OpenQuickSwitcher(QuickSwitcherMode),
+    RevealInPreview,
     ActivateRelativeDocument(bool),
     MoveActiveDocument(bool),
     ReopenClosedDocument,
@@ -546,6 +586,22 @@ enum MenuCommand {
     SetProjectMain(PathBuf),
     ClearProjectMain,
     RefreshProjectTree,
+}
+
+#[derive(Debug, Clone)]
+enum QuickSwitcherAction {
+    OpenFile(PathBuf),
+    Run(MenuCommand),
+    SwitchMode(QuickSwitcherMode),
+}
+
+#[derive(Debug, Clone)]
+struct QuickSwitcherEntry {
+    icon: ui::WorkflowIcon,
+    label: String,
+    detail: String,
+    shortcut: Option<String>,
+    action: QuickSwitcherAction,
 }
 
 #[derive(Debug, Clone)]
@@ -939,6 +995,8 @@ impl App {
             search: SearchState::default(),
             search_input_id: Id::unique(),
             rename_input_id: Id::unique(),
+            quick_switcher: None,
+            quick_switcher_input_id: Id::unique(),
             project_navigation: ProjectNavigation::Files,
             project_search: ProjectSearchState::default(),
             project_tree: Vec::new(),
@@ -975,6 +1033,7 @@ impl App {
             editor_context_menu: None,
             cursor_position: Point::ORIGIN,
             about_visible: false,
+            document_info_visible: false,
             file_status: Some(file_status),
         };
         let active_project_path = app
@@ -1027,6 +1086,7 @@ impl App {
                 self.open_menu = None;
                 self.project_context_menu = None;
                 self.editor_context_menu = None;
+                self.quick_switcher = None;
                 self.menu_bar_drag_active = false;
                 self.export_menu_visible = !self.export_menu_visible;
                 if self.export_menu_visible {
@@ -1094,6 +1154,9 @@ impl App {
                 if self.rename_symbol.take().is_some() {
                     return Task::none();
                 }
+                if self.quick_switcher.take().is_some() {
+                    return Task::none();
+                }
                 if self.snippet_session.is_some() {
                     self.cancel_snippet_session();
                     return Task::none();
@@ -1118,6 +1181,10 @@ impl App {
                     self.about_visible = false;
                     return Task::none();
                 }
+                if self.document_info_visible {
+                    self.document_info_visible = false;
+                    return Task::none();
+                }
                 if self.search.visible {
                     self.search.visible = false;
                     self.document.clear_search_matches();
@@ -1129,6 +1196,10 @@ impl App {
             }
             Message::CloseAbout => {
                 self.about_visible = false;
+                Task::none()
+            }
+            Message::CloseDocumentInfo => {
+                self.document_info_visible = false;
                 Task::none()
             }
             Message::Language(event) => self.handle_language_event(event),
@@ -1274,6 +1345,7 @@ impl App {
 
                 Task::none()
             }
+            Message::InsertTypstSnippet(snippet) => self.insert_typst_snippet(snippet),
             Message::OpenSettings => self.open_settings_window(),
             Message::OpenExportSettings => {
                 self.settings_page = SettingsPage::Export;
@@ -1493,6 +1565,26 @@ impl App {
             }
             Message::ReplaceAll => {
                 self.replace_all_matches();
+                Task::none()
+            }
+            Message::OpenQuickSwitcher(mode) => self.open_quick_switcher(mode),
+            Message::QuickSwitcherQueryChanged(query) => {
+                if let Some(switcher) = self.quick_switcher.as_mut() {
+                    switcher.query = query;
+                    switcher.focus = 0;
+                }
+                Task::none()
+            }
+            Message::QuickSwitcherFocused(index) => {
+                if let Some(switcher) = self.quick_switcher.as_mut() {
+                    switcher.focus = index;
+                }
+                Task::none()
+            }
+            Message::QuickSwitcherNavigate(navigation) => self.navigate_quick_switcher(navigation),
+            Message::QuickSwitcherSelected(action) => self.run_quick_switcher_action(action),
+            Message::CloseQuickSwitcher => {
+                self.quick_switcher = None;
                 Task::none()
             }
             Message::PaneDragged(event) => {
@@ -1802,6 +1894,10 @@ impl App {
             rename_dialog_keyboard_subscription()
         } else if self.pending_alert_dialog.is_some() {
             alert_dialog_keyboard_subscription()
+        } else if self.document_info_visible {
+            document_info_keyboard_subscription()
+        } else if self.quick_switcher.is_some() {
+            quick_switcher_keyboard_subscription()
         } else if self.open_menu.is_some()
             || self.project_context_menu.is_some()
             || self.editor_context_menu.is_some()
@@ -1849,6 +1945,7 @@ impl App {
         self.project_context_menu = None;
         self.editor_context_menu = None;
         self.export_menu_visible = false;
+        self.quick_switcher = None;
 
         if let Some(window) = self.settings_window {
             return window::gain_focus(window);
@@ -1880,6 +1977,7 @@ impl App {
         self.project_context_menu = None;
         self.editor_context_menu = None;
         self.export_menu_visible = false;
+        self.quick_switcher = None;
         self.open_menu = Some(menu);
         self.menu_focus = first_enabled_menu_item(&self.menu_entries(menu)).unwrap_or(0);
     }
@@ -1946,6 +2044,7 @@ impl App {
         self.project_context_menu = None;
         self.editor_context_menu = None;
         self.export_menu_visible = false;
+        self.quick_switcher = None;
         self.menu_bar_drag_active = false;
 
         match command {
@@ -1955,6 +2054,42 @@ impl App {
             MenuCommand::SaveDocument => self.update(Message::SaveDocument),
             MenuCommand::SaveDocumentAs => self.update(Message::SaveDocumentAs),
             MenuCommand::SaveAllDocuments => self.update(Message::SaveAllDocuments),
+            MenuCommand::AutoSave(auto_save) => self.update(Message::AutoSaveChanged(auto_save)),
+            MenuCommand::CopyActiveDocumentPath => {
+                let Some(path) = self.document.path().map(Path::to_path_buf) else {
+                    return Task::none();
+                };
+                self.file_status = Some("Caminho do documento copiado".to_owned());
+                iced::clipboard::write(path.to_string_lossy().into_owned())
+            }
+            MenuCommand::RevealActiveDocument => {
+                let Some(path) = self.document.path().map(Path::to_path_buf) else {
+                    return Task::none();
+                };
+                self.file_status = Some(match reveal_in_file_manager(&path) {
+                    Ok(()) => "Documento mostrado no gerenciador de arquivos".to_owned(),
+                    Err(error) => {
+                        eprintln!("erro ao mostrar documento no gerenciador de arquivos: {error}");
+                        format!("Não foi possível mostrar o documento: {error}")
+                    }
+                });
+                Task::none()
+            }
+            MenuCommand::ToggleActiveDocumentMain => {
+                let Some(path) = self.document.path().map(Path::to_path_buf) else {
+                    return Task::none();
+                };
+                if self.project_main.as_deref() == Some(path.as_path()) {
+                    self.clear_project_main();
+                } else {
+                    self.set_project_main(path);
+                }
+                Task::none()
+            }
+            MenuCommand::ShowDocumentInfo => {
+                self.document_info_visible = true;
+                Task::none()
+            }
             MenuCommand::Export(format) => self.update(Message::Export(format)),
             MenuCommand::CloseDocument(id) => self.update(Message::CloseDocument(id)),
             MenuCommand::Exit => self.update(Message::ExitApplication),
@@ -1981,6 +2116,8 @@ impl App {
             MenuCommand::OpenSearch => self.update(Message::OpenSearch),
             MenuCommand::OpenProjectSearch => self.update(Message::OpenProjectSearch),
             MenuCommand::OpenReplace => self.update(Message::OpenReplace),
+            MenuCommand::OpenQuickSwitcher(mode) => self.update(Message::OpenQuickSwitcher(mode)),
+            MenuCommand::RevealInPreview => self.update(Message::RevealInPreview),
             MenuCommand::ActivateRelativeDocument(reverse) => {
                 self.update(Message::ActivateRelativeDocument(reverse))
             }
@@ -2104,6 +2241,13 @@ impl App {
 
         match menu {
             AppMenu::File => {
+                let active_path = self.document.path();
+                let active_is_main =
+                    active_path.is_some_and(|path| self.project_main.as_deref() == Some(path));
+                let can_set_main = active_path.is_some_and(|path| {
+                    path.starts_with(&self.workspace_root)
+                        && path.extension().is_some_and(|extension| extension == "typ")
+                });
                 let mut entries = vec![
                     AppMenuEntry::item(
                         "Novo documento",
@@ -2125,6 +2269,13 @@ impl App {
                         false,
                         !self.file_busy,
                         MenuCommand::OpenProject,
+                    ),
+                    AppMenuEntry::item(
+                        "Abertura rápida",
+                        Some(command_shortcut("P")),
+                        false,
+                        !self.file_busy,
+                        MenuCommand::OpenQuickSwitcher(QuickSwitcherMode::Files),
                     ),
                     AppMenuEntry::Divider,
                     AppMenuEntry::item(
@@ -2151,6 +2302,13 @@ impl App {
                                 .iter()
                                 .any(|(_, document)| document.is_dirty()),
                         MenuCommand::SaveAllDocuments,
+                    ),
+                    AppMenuEntry::item(
+                        "Salvamento automático",
+                        None,
+                        self.settings.auto_save,
+                        true,
+                        MenuCommand::AutoSave(!self.settings.auto_save),
                     ),
                     AppMenuEntry::item(
                         "Exportar PDF",
@@ -2182,6 +2340,39 @@ impl App {
                     ),
                     AppMenuEntry::Divider,
                     AppMenuEntry::item(
+                        "Propriedades do documento",
+                        None,
+                        false,
+                        true,
+                        MenuCommand::ShowDocumentInfo,
+                    ),
+                    AppMenuEntry::item(
+                        "Mostrar no gerenciador de arquivos",
+                        None,
+                        false,
+                        active_path.is_some(),
+                        MenuCommand::RevealActiveDocument,
+                    ),
+                    AppMenuEntry::item(
+                        "Copiar caminho do documento",
+                        None,
+                        false,
+                        active_path.is_some(),
+                        MenuCommand::CopyActiveDocumentPath,
+                    ),
+                    AppMenuEntry::item(
+                        if active_is_main {
+                            "Remover como documento principal"
+                        } else {
+                            "Definir como documento principal"
+                        },
+                        None,
+                        active_is_main,
+                        can_set_main,
+                        MenuCommand::ToggleActiveDocumentMain,
+                    ),
+                    AppMenuEntry::Divider,
+                    AppMenuEntry::item(
                         "Fechar documento",
                         Some(command_shortcut("W")),
                         false,
@@ -2196,34 +2387,6 @@ impl App {
                         MenuCommand::ReopenClosedDocument,
                     ),
                     AppMenuEntry::item(
-                        "Próxima aba",
-                        Some("Ctrl+Tab".to_owned()),
-                        false,
-                        !self.file_busy && self.document.len() > 1,
-                        MenuCommand::ActivateRelativeDocument(false),
-                    ),
-                    AppMenuEntry::item(
-                        "Aba anterior",
-                        Some("Ctrl+Shift+Tab".to_owned()),
-                        false,
-                        !self.file_busy && self.document.len() > 1,
-                        MenuCommand::ActivateRelativeDocument(true),
-                    ),
-                    AppMenuEntry::item(
-                        "Mover aba para a esquerda",
-                        Some("Ctrl+Shift+PageUp".to_owned()),
-                        false,
-                        !self.file_busy && self.document.active_index() > 0,
-                        MenuCommand::MoveActiveDocument(true),
-                    ),
-                    AppMenuEntry::item(
-                        "Mover aba para a direita",
-                        Some("Ctrl+Shift+PageDown".to_owned()),
-                        false,
-                        !self.file_busy && self.document.active_index() + 1 < self.document.len(),
-                        MenuCommand::MoveActiveDocument(false),
-                    ),
-                    AppMenuEntry::item(
                         "Sair",
                         Some(command_shortcut("Q")),
                         false,
@@ -2233,7 +2396,7 @@ impl App {
                 ];
                 if !self.recent_projects.is_empty() {
                     let mut recent = vec![AppMenuEntry::Divider];
-                    recent.extend(self.recent_projects.iter().take(5).cloned().map(|path| {
+                    recent.extend(self.recent_projects.iter().take(1).cloned().map(|path| {
                         let label = format!("Projeto recente: {}", path.display());
                         AppMenuEntry::item(
                             label,
@@ -2243,7 +2406,7 @@ impl App {
                             MenuCommand::OpenRecentProject(path),
                         )
                     }));
-                    entries.splice(3..3, recent);
+                    entries.splice(4..4, recent);
                 }
                 entries
             }
@@ -2353,6 +2516,14 @@ impl App {
             ],
             AppMenu::View => vec![
                 AppMenuEntry::item(
+                    "Paleta de comandos",
+                    Some(command_shift_shortcut("P")),
+                    false,
+                    true,
+                    MenuCommand::OpenQuickSwitcher(QuickSwitcherMode::Commands),
+                ),
+                AppMenuEntry::Divider,
+                AppMenuEntry::item(
                     "Mostrar árvore do projeto",
                     None,
                     self.project_pane_visible(),
@@ -2374,6 +2545,13 @@ impl App {
                     MenuCommand::WrapLines(!self.settings.wrap_lines),
                 ),
                 AppMenuEntry::Divider,
+                AppMenuEntry::item(
+                    "Localizar cursor no Preview",
+                    Some(command_shortcut("J")),
+                    false,
+                    self.compiler.is_some(),
+                    MenuCommand::RevealInPreview,
+                ),
                 AppMenuEntry::item(
                     "Diminuir zoom do preview",
                     Some(command_shortcut("−")),
@@ -2810,7 +2988,7 @@ impl App {
         .style(ui::bar_style);
         let status = ui::with_top_divider(status);
 
-        let content = column![self.app_bar_view(), self.text_action_bar_view()];
+        let content = column![self.app_bar_view(), self.application_toolbar_view()];
 
         let base: Element<'_, Message> = content
             .push(panes)
@@ -2856,6 +3034,17 @@ impl App {
                 .push(self.editor_context_menu_overlay(context));
         }
 
+        if self.quick_switcher.is_some() {
+            let backdrop = mouse_area(
+                container(Space::new())
+                    .width(Fill)
+                    .height(Fill)
+                    .style(ui::modal_backdrop_style),
+            )
+            .on_press(Message::CloseQuickSwitcher);
+            layers = layers.push(backdrop).push(self.quick_switcher_overlay());
+        }
+
         if self.about_visible {
             let backdrop = mouse_area(
                 container(Space::new())
@@ -2865,6 +3054,17 @@ impl App {
             )
             .on_press(Message::CloseAbout);
             layers = layers.push(backdrop).push(self.about_overlay());
+        }
+
+        if self.document_info_visible {
+            let backdrop = mouse_area(
+                container(Space::new())
+                    .width(Fill)
+                    .height(Fill)
+                    .style(ui::modal_backdrop_style),
+            )
+            .on_press(Message::CloseDocumentInfo);
+            layers = layers.push(backdrop).push(self.document_info_overlay());
         }
 
         if let Some(pending) = self.pending_alert_dialog.as_ref() {
@@ -2918,12 +3118,6 @@ impl App {
         .width(iced::Length::Fixed(APP_ACTIONS_WIDTH))
         .align_x(iced::alignment::Horizontal::Left);
         let center = Space::new().width(Fill);
-        let save = ui::spectrum_button(
-            "Salvar",
-            (!self.file_busy && self.document.is_dirty())
-                .then_some(Message::MenuCommand(MenuCommand::SaveDocument)),
-            ui::ButtonOptions::ACCENT.size(ui::ButtonSize::Medium),
-        );
         let can_export = !self.file_busy && self.compiler.is_some();
         let additional_exports = ui::workflow_icon_button(
             ui::WorkflowIcon::More,
@@ -2941,13 +3135,9 @@ impl App {
             )])
             .trailing(additional_exports)
             .into();
-        let actions = container(
-            row![save, export_group]
-                .align_y(Alignment::Center)
-                .spacing(ui::tokens::spacing::APP_BAR_ACTION_GAP),
-        )
-        .width(iced::Length::Fixed(APP_ACTIONS_WIDTH))
-        .align_x(iced::alignment::Horizontal::Right);
+        let actions = container(export_group)
+            .width(iced::Length::Fixed(APP_ACTIONS_WIDTH))
+            .align_x(iced::alignment::Horizontal::Right);
         let bar = row![menus, center, actions]
             .align_y(Alignment::Center)
             .width(Fill)
@@ -3060,6 +3250,52 @@ impl App {
         .into()
     }
 
+    fn quick_switcher_overlay(&self) -> Element<'_, Message> {
+        let Some(switcher) = self.quick_switcher.as_ref() else {
+            return Space::new().into();
+        };
+        let (title, prompt, empty_label) = match switcher.mode {
+            QuickSwitcherMode::Files => (
+                "Abertura rápida",
+                "Buscar arquivo Typst",
+                "Nenhum arquivo correspondente",
+            ),
+            QuickSwitcherMode::Commands => (
+                "Paleta de comandos",
+                "Buscar comando",
+                "Nenhum comando correspondente",
+            ),
+        };
+        let items = self
+            .quick_switcher_entries()
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                ui::QuickSwitcherItem::new(
+                    entry.icon,
+                    entry.label,
+                    Message::QuickSwitcherSelected(entry.action),
+                )
+                .detail(entry.detail)
+                .shortcut(entry.shortcut)
+                .selected(index == switcher.focus)
+                .on_focus(Message::QuickSwitcherFocused(index))
+            })
+            .collect();
+
+        ui::quick_switcher(
+            title,
+            prompt,
+            &switcher.query,
+            self.quick_switcher_input_id.clone(),
+            Message::QuickSwitcherQueryChanged,
+            Message::QuickSwitcherNavigate(QuickSwitcherNavigation::Activate),
+            Some(Message::QuickSwitcherQueryChanged(String::new())),
+            items,
+            empty_label,
+        )
+    }
+
     fn about_overlay(&self) -> Element<'_, Message> {
         let close = ui::spectrum_button(
             "Fechar",
@@ -3089,6 +3325,80 @@ impl App {
         container(dialog)
             .width(Fill)
             .height(Fill)
+            .center_x(Fill)
+            .center_y(Fill)
+            .into()
+    }
+
+    fn document_info_overlay(&self) -> Element<'_, Message> {
+        let document = self.document.active();
+        let path = document
+            .path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "Documento ainda não salvo".to_owned());
+        let storage = if document.is_dirty() {
+            "Alterações não salvas"
+        } else {
+            "Salvo"
+        };
+        let preview = if document
+            .path()
+            .is_some_and(|path| self.project_main.as_deref() == Some(path))
+        {
+            "Documento principal"
+        } else if self.project_main.is_some() {
+            "Documento importado"
+        } else {
+            "Acompanha a aba ativa"
+        };
+        let property = |label: &'static str, value: String| {
+            row![
+                text(label)
+                    .size(ui::tokens::typography::FONT_SIZE_75)
+                    .font(iced::Font {
+                        weight: iced::font::Weight::Bold,
+                        ..iced::Font::DEFAULT
+                    })
+                    .width(iced::Length::Fixed(128.0)),
+                text(value)
+                    .size(ui::tokens::typography::FONT_SIZE_100)
+                    .width(Fill)
+                    .wrapping(text::Wrapping::WordOrGlyph),
+            ]
+            .align_y(Alignment::Start)
+            .spacing(ui::tokens::spacing::SPACING_200)
+        };
+        let close = ui::spectrum_button(
+            "Fechar",
+            Some(Message::CloseDocumentInfo),
+            ui::ButtonOptions::SECONDARY,
+        );
+        let dialog = container(
+            column![
+                text("Propriedades do documento")
+                    .size(ui::tokens::typography::FONT_SIZE_300)
+                    .font(iced::Font {
+                        weight: iced::font::Weight::Bold,
+                        ..iced::Font::DEFAULT
+                    }),
+                property("Nome", document.display_name()),
+                property("Caminho", path),
+                property("Armazenamento", storage.to_owned()),
+                property("Preview", preview.to_owned()),
+                property("Revisão", document.revision().to_string()),
+                row![Space::new().width(Fill), close],
+            ]
+            .spacing(ui::tokens::spacing::SETTINGS_CONTROL_GAP),
+        )
+        .width(Fill)
+        .max_width(560.0)
+        .padding(ui::tokens::spacing::ALERT_DIALOG_PADDING)
+        .style(ui::elevated_dialog_style);
+
+        container(dialog)
+            .width(Fill)
+            .height(Fill)
+            .padding(ui::tokens::spacing::SPACING_400)
             .center_x(Fill)
             .center_y(Fill)
             .into()
@@ -3647,7 +3957,7 @@ impl App {
             .into()
     }
 
-    fn text_action_bar_view(&self) -> Element<'_, Message> {
+    fn application_toolbar_view(&self) -> Element<'_, Message> {
         let can_edit = !self.file_busy;
         let options = ui::ActionButtonOptions::QUIET.size(ui::ActionButtonSize::Medium);
         let history = ui::compact_action_group(
@@ -3685,8 +3995,13 @@ impl App {
             ],
             options,
         );
-        let lists = ui::compact_action_group(
+        let structure = ui::compact_action_group(
             [
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::TextSize,
+                    "Alternar título de seção",
+                    can_edit.then_some(Message::PrefixLines("= ".into())),
+                ),
                 ui::ActionGroupItem::workflow(
                     ui::WorkflowIcon::TextBulleted,
                     "Lista com marcadores",
@@ -3700,10 +4015,77 @@ impl App {
             ],
             options,
         );
+        let references = ui::compact_action_group(
+            [
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::Link,
+                    "Inserir link",
+                    can_edit.then_some(Message::InsertTypstSnippet(formatting::TypstSnippet::Link)),
+                ),
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::BookmarkSingleOutline,
+                    "Inserir label",
+                    can_edit
+                        .then_some(Message::InsertTypstSnippet(formatting::TypstSnippet::Label)),
+                ),
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::LinkPage,
+                    "Inserir referência",
+                    can_edit.then_some(Message::InsertTypstSnippet(
+                        formatting::TypstSnippet::Reference,
+                    )),
+                ),
+            ],
+            options,
+        );
+        let content = ui::compact_action_group(
+            [
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::Function,
+                    "Inserir equação",
+                    can_edit.then_some(Message::InsertTypstSnippet(formatting::TypstSnippet::Math)),
+                ),
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::Image,
+                    "Inserir figura",
+                    can_edit.then_some(Message::InsertTypstSnippet(
+                        formatting::TypstSnippet::Figure,
+                    )),
+                ),
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::Table,
+                    "Inserir tabela",
+                    can_edit
+                        .then_some(Message::InsertTypstSnippet(formatting::TypstSnippet::Table)),
+                ),
+            ],
+            options,
+        );
         let comment = ui::workflow_icon_action_button(
             ui::WorkflowIcon::Code,
             "Alternar comentário de linha",
             can_edit.then_some(Message::Editor(Action::ToggleLineComment)),
+            options,
+        );
+        let project_actions = ui::compact_action_group(
+            [
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::FileAdd,
+                    "Novo arquivo Typst",
+                    (!self.file_busy).then_some(Message::CreateProjectFile),
+                ),
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::FolderAdd,
+                    "Nova pasta",
+                    (!self.file_busy).then_some(Message::CreateProjectDirectory),
+                ),
+                ui::ActionGroupItem::workflow(
+                    ui::WorkflowIcon::Refresh,
+                    "Atualizar projeto",
+                    (!self.file_busy && !self.project_scan_busy)
+                        .then_some(Message::RefreshProjectTree),
+                ),
+            ],
             options,
         );
 
@@ -3713,9 +4095,15 @@ impl App {
                 ui::vertical_divider(ui::tokens::icon::WORKFLOW_SIZE_75),
                 text_style,
                 ui::vertical_divider(ui::tokens::icon::WORKFLOW_SIZE_75),
-                lists,
+                structure,
                 ui::vertical_divider(ui::tokens::icon::WORKFLOW_SIZE_75),
-                comment
+                references,
+                ui::vertical_divider(ui::tokens::icon::WORKFLOW_SIZE_75),
+                content,
+                ui::vertical_divider(ui::tokens::icon::WORKFLOW_SIZE_75),
+                comment,
+                Space::new().width(Fill),
+                project_actions
             ]
             .align_y(Alignment::Center)
             .spacing(ui::tokens::spacing::BASE_GAP_MEDIUM),
@@ -4219,23 +4607,6 @@ impl App {
             self.workspace_root.clone(),
             project::EntryKind::Directory,
         ))
-        .actions(vec![
-            ui::TreeViewAction::new(
-                ui::WorkflowIcon::FileAdd,
-                "Novo arquivo Typst",
-                (!self.file_busy).then_some(Message::CreateProjectFile),
-            ),
-            ui::TreeViewAction::new(
-                ui::WorkflowIcon::FolderAdd,
-                "Nova pasta",
-                (!self.file_busy).then_some(Message::CreateProjectDirectory),
-            ),
-            ui::TreeViewAction::new(
-                ui::WorkflowIcon::Refresh,
-                "Atualizar árvore do projeto",
-                (!self.file_busy && !self.project_scan_busy).then_some(Message::RefreshProjectTree),
-            ),
-        ])
         .has_children(true)
         .children(children)
     }
@@ -6827,6 +7198,32 @@ impl App {
         self.refresh_search_matches(None, false);
     }
 
+    fn insert_typst_snippet(&mut self, snippet: formatting::TypstSnippet) -> Task<Message> {
+        if self.file_busy {
+            return Task::none();
+        }
+
+        let selection = self.document.content().selection();
+        let selected_text = self.document.selection_text();
+        let expansion = snippet.expand(selected_text.as_deref());
+        let base = selection.start;
+
+        self.cancel_snippet_session();
+        if self.document.perform(Action::Replace {
+            range: selection,
+            text: expansion.text,
+        }) {
+            self.after_formatting();
+            self.start_snippet_session(language::SnippetCompletion {
+                replace: base..base,
+                insert: String::new(),
+                placeholders: expansion.placeholders,
+            });
+        }
+
+        Task::none()
+    }
+
     fn accepted_snippet(&self, action: &Action) -> Option<language::SnippetCompletion> {
         let Action::Replace { range, text } = action else {
             return None;
@@ -7062,6 +7459,168 @@ impl App {
         self.search.replace_visible = replace_visible;
         self.refresh_search_matches(Some(0), true);
         operation::focus(self.search_input_id.clone())
+    }
+
+    fn open_quick_switcher(&mut self, mode: QuickSwitcherMode) -> Task<Message> {
+        self.open_menu = None;
+        self.project_context_menu = None;
+        self.editor_context_menu = None;
+        self.export_menu_visible = false;
+        self.menu_bar_drag_active = false;
+        self.quick_switcher = Some(QuickSwitcherState {
+            mode,
+            query: String::new(),
+            focus: 0,
+        });
+
+        operation::focus(self.quick_switcher_input_id.clone())
+    }
+
+    fn quick_switcher_entries(&self) -> Vec<QuickSwitcherEntry> {
+        let Some(switcher) = self.quick_switcher.as_ref() else {
+            return Vec::new();
+        };
+        let entries = match switcher.mode {
+            QuickSwitcherMode::Files => collect_project_files(&self.project_tree)
+                .into_iter()
+                .filter(|path| path.extension().is_some_and(|extension| extension == "typ"))
+                .map(|path| {
+                    let relative = path
+                        .strip_prefix(&self.workspace_root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned();
+                    let label = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| relative.clone());
+
+                    QuickSwitcherEntry {
+                        icon: ui::WorkflowIcon::FileCode,
+                        label,
+                        detail: relative,
+                        shortcut: None,
+                        action: QuickSwitcherAction::OpenFile(path),
+                    }
+                })
+                .collect(),
+            QuickSwitcherMode::Commands => {
+                let mut entries = vec![QuickSwitcherEntry {
+                    icon: ui::WorkflowIcon::Search,
+                    label: "Abrir arquivo rapidamente".to_owned(),
+                    detail: "Navegação".to_owned(),
+                    shortcut: Some(command_shortcut("P")),
+                    action: QuickSwitcherAction::SwitchMode(QuickSwitcherMode::Files),
+                }];
+                let mut labels = HashSet::new();
+                for (menu, category, icon) in [
+                    (AppMenu::File, "Arquivo", ui::WorkflowIcon::Document),
+                    (AppMenu::Edit, "Edição", ui::WorkflowIcon::Code),
+                    (AppMenu::View, "Exibição", ui::WorkflowIcon::Visibility),
+                    (AppMenu::Help, "Ajuda", ui::WorkflowIcon::Alert),
+                ] {
+                    for entry in self.menu_entries(menu) {
+                        let AppMenuEntry::Item {
+                            label,
+                            value,
+                            enabled: true,
+                            command,
+                            ..
+                        } = entry
+                        else {
+                            continue;
+                        };
+                        if matches!(command, MenuCommand::OpenQuickSwitcher(_)) {
+                            continue;
+                        }
+                        if !labels.insert(label.clone()) {
+                            continue;
+                        }
+                        entries.push(QuickSwitcherEntry {
+                            icon,
+                            label,
+                            detail: category.to_owned(),
+                            shortcut: value,
+                            action: QuickSwitcherAction::Run(command),
+                        });
+                    }
+                }
+                for (label, shortcut, enabled, command) in [
+                    (
+                        "Próxima aba",
+                        "Ctrl+Tab",
+                        !self.file_busy && self.document.len() > 1,
+                        MenuCommand::ActivateRelativeDocument(false),
+                    ),
+                    (
+                        "Aba anterior",
+                        "Ctrl+Shift+Tab",
+                        !self.file_busy && self.document.len() > 1,
+                        MenuCommand::ActivateRelativeDocument(true),
+                    ),
+                    (
+                        "Mover aba para a esquerda",
+                        "Ctrl+Shift+PageUp",
+                        !self.file_busy && self.document.active_index() > 0,
+                        MenuCommand::MoveActiveDocument(true),
+                    ),
+                    (
+                        "Mover aba para a direita",
+                        "Ctrl+Shift+PageDown",
+                        !self.file_busy && self.document.active_index() + 1 < self.document.len(),
+                        MenuCommand::MoveActiveDocument(false),
+                    ),
+                ] {
+                    if enabled {
+                        entries.push(QuickSwitcherEntry {
+                            icon: ui::WorkflowIcon::Code,
+                            label: label.to_owned(),
+                            detail: "Abas".to_owned(),
+                            shortcut: Some(shortcut.to_owned()),
+                            action: QuickSwitcherAction::Run(command),
+                        });
+                    }
+                }
+                entries
+            }
+        };
+
+        filter_quick_switcher_entries(entries, &switcher.query)
+    }
+
+    fn navigate_quick_switcher(&mut self, navigation: QuickSwitcherNavigation) -> Task<Message> {
+        let entries = self.quick_switcher_entries();
+        if entries.is_empty() {
+            return Task::none();
+        }
+        let Some(switcher) = self.quick_switcher.as_mut() else {
+            return Task::none();
+        };
+        if navigation == QuickSwitcherNavigation::Activate {
+            let action = entries[switcher.focus.min(entries.len() - 1)]
+                .action
+                .clone();
+            return self.run_quick_switcher_action(action);
+        }
+
+        let last = entries.len() - 1;
+        switcher.focus = match navigation {
+            QuickSwitcherNavigation::Previous => switcher.focus.checked_sub(1).unwrap_or(last),
+            QuickSwitcherNavigation::Next => (switcher.focus + 1) % entries.len(),
+            QuickSwitcherNavigation::First => 0,
+            QuickSwitcherNavigation::Last => last,
+            QuickSwitcherNavigation::Activate => unreachable!(),
+        };
+        Task::none()
+    }
+
+    fn run_quick_switcher_action(&mut self, action: QuickSwitcherAction) -> Task<Message> {
+        self.quick_switcher = None;
+        match action {
+            QuickSwitcherAction::OpenFile(path) => self.open_project_file(path),
+            QuickSwitcherAction::Run(command) => self.run_menu_command(command),
+            QuickSwitcherAction::SwitchMode(mode) => self.open_quick_switcher(mode),
+        }
     }
 
     fn start_project_search(&mut self) -> Task<Message> {
@@ -8413,6 +8972,54 @@ fn menu_keyboard_subscription() -> Subscription<Message> {
     })
 }
 
+fn quick_switcher_keyboard_subscription() -> Subscription<Message> {
+    event::listen_with(|event, _status, _window| {
+        let iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            repeat,
+            ..
+        }) = event
+        else {
+            return None;
+        };
+        if repeat {
+            return None;
+        }
+
+        match key {
+            keyboard::key::Named::ArrowUp => Some(Message::QuickSwitcherNavigate(
+                QuickSwitcherNavigation::Previous,
+            )),
+            keyboard::key::Named::ArrowDown => Some(Message::QuickSwitcherNavigate(
+                QuickSwitcherNavigation::Next,
+            )),
+            keyboard::key::Named::Home => Some(Message::QuickSwitcherNavigate(
+                QuickSwitcherNavigation::First,
+            )),
+            keyboard::key::Named::End => Some(Message::QuickSwitcherNavigate(
+                QuickSwitcherNavigation::Last,
+            )),
+            keyboard::key::Named::Escape => Some(Message::CloseQuickSwitcher),
+            _ => None,
+        }
+    })
+}
+
+fn document_info_keyboard_subscription() -> Subscription<Message> {
+    event::listen_with(|event, _status, _window| {
+        let iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            repeat: false,
+            ..
+        }) = event
+        else {
+            return None;
+        };
+
+        Some(Message::CloseDocumentInfo)
+    })
+}
+
 fn alert_dialog_keyboard_subscription() -> Subscription<Message> {
     event::listen_with(|event, _status, _window| {
         let iced::Event::Keyboard(keyboard::Event::KeyPressed {
@@ -8469,6 +9076,8 @@ fn shortcut_message(key: char, modifiers: keyboard::Modifiers) -> Option<Message
         ('f', false) => Some(Message::OpenSearch),
         ('f', true) => Some(Message::OpenProjectSearch),
         ('h', false) => Some(Message::OpenReplace),
+        ('p', false) => Some(Message::OpenQuickSwitcher(QuickSwitcherMode::Files)),
+        ('p', true) => Some(Message::OpenQuickSwitcher(QuickSwitcherMode::Commands)),
         ('j', false) => Some(Message::RevealInPreview),
         _ => None,
     }
@@ -8499,6 +9108,34 @@ fn open_external_url(url: &str) -> io::Result<()> {
             io::ErrorKind::Unsupported,
             "sistema operacional sem abridor de URL configurado",
         ))
+    }
+}
+
+fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        return ProcessCommand::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .map(|_| ());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return ProcessCommand::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map(|_| ());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let directory = path.parent().unwrap_or(path);
+        ProcessCommand::new("xdg-open")
+            .arg(directory)
+            .spawn()
+            .map(|_| ())
     }
 }
 
@@ -8594,6 +9231,28 @@ fn collect_project_files(entries: &[project::ProjectEntry]) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+fn filter_quick_switcher_entries(
+    mut entries: Vec<QuickSwitcherEntry>,
+    query: &str,
+) -> Vec<QuickSwitcherEntry> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        entries.truncate(100);
+        return entries;
+    }
+    let terms = query.split_whitespace().collect::<Vec<_>>();
+    entries.retain(|entry| {
+        let haystack = format!("{} {}", entry.label, entry.detail).to_lowercase();
+        terms.iter().all(|term| haystack.contains(term))
+    });
+    entries.sort_by_key(|entry| {
+        let label = entry.label.to_lowercase();
+        (!label.starts_with(&query), label.len())
+    });
+    entries.truncate(100);
+    entries
 }
 
 fn append_visible_project_entries(
@@ -9062,8 +9721,154 @@ mod tests {
             shortcut_message('s', command | keyboard::Modifiers::ALT),
             Some(Message::SaveAllDocuments)
         ));
+        assert!(matches!(
+            shortcut_message('p', command),
+            Some(Message::OpenQuickSwitcher(QuickSwitcherMode::Files))
+        ));
+        assert!(matches!(
+            shortcut_message('p', command | keyboard::Modifiers::SHIFT),
+            Some(Message::OpenQuickSwitcher(QuickSwitcherMode::Commands))
+        ));
         assert!(shortcut_message('s', keyboard::Modifiers::NONE).is_none());
         assert!(shortcut_message('n', command | keyboard::Modifiers::SHIFT).is_none());
+    }
+
+    #[test]
+    fn quick_switcher_filters_labels_and_relative_paths_and_prioritizes_prefixes() {
+        let entries = vec![
+            QuickSwitcherEntry {
+                icon: ui::WorkflowIcon::FileCode,
+                label: "my-chapter.typ".to_owned(),
+                detail: "appendix/my-chapter.typ".to_owned(),
+                shortcut: None,
+                action: QuickSwitcherAction::OpenFile(PathBuf::from("my-chapter.typ")),
+            },
+            QuickSwitcherEntry {
+                icon: ui::WorkflowIcon::FileCode,
+                label: "chapter.typ".to_owned(),
+                detail: "content/chapter.typ".to_owned(),
+                shortcut: None,
+                action: QuickSwitcherAction::OpenFile(PathBuf::from("chapter.typ")),
+            },
+            QuickSwitcherEntry {
+                icon: ui::WorkflowIcon::FileCode,
+                label: "main.typ".to_owned(),
+                detail: "content/chapter/main.typ".to_owned(),
+                shortcut: None,
+                action: QuickSwitcherAction::OpenFile(PathBuf::from("main.typ")),
+            },
+        ];
+
+        let filtered = filter_quick_switcher_entries(entries, "chapter");
+
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0].label, "chapter.typ");
+        assert!(filtered.iter().any(|entry| entry.label == "main.typ"));
+    }
+
+    #[test]
+    fn command_palette_reuses_enabled_application_commands() {
+        let mut app = App::new();
+        let _ = app.update(Message::OpenQuickSwitcher(QuickSwitcherMode::Commands));
+
+        let labels = app
+            .quick_switcher_entries()
+            .into_iter()
+            .map(|entry| entry.label)
+            .collect::<Vec<_>>();
+
+        assert!(labels.contains(&"Abrir arquivo rapidamente".to_owned()));
+        assert!(labels.contains(&"Configurações".to_owned()));
+        assert!(labels.contains(&"Salvar".to_owned()));
+        assert!(!labels.contains(&"Paleta de comandos".to_owned()));
+        assert!(!labels.contains(&"Abertura rápida".to_owned()));
+        assert!(!labels.contains(&"Reabrir aba fechada".to_owned()));
+    }
+
+    #[test]
+    fn global_actions_are_distributed_across_application_menus() {
+        let mut app = App::new();
+        app.settings.auto_save = false;
+        let file_entries = app.menu_entries(AppMenu::File);
+        let edit_entries = app.menu_entries(AppMenu::Edit);
+        let view_entries = app.menu_entries(AppMenu::View);
+        let file = menu_labels(&file_entries);
+        let edit = menu_labels(&edit_entries);
+        let view = menu_labels(&view_entries);
+
+        assert!(file.contains(&"Abertura rápida"));
+        assert!(file.contains(&"Salvamento automático"));
+        assert!(edit.contains(&"Buscar"));
+        assert!(edit.contains(&"Buscar no projeto"));
+        assert!(view.contains(&"Paleta de comandos"));
+        assert!(view.contains(&"Mostrar árvore do projeto"));
+        assert!(view.contains(&"Localizar cursor no Preview"));
+
+        let auto_save = file_entries.iter().find(|entry| {
+            matches!(entry, AppMenuEntry::Item { label, .. } if label == "Salvamento automático")
+        });
+        assert!(matches!(
+            auto_save,
+            Some(AppMenuEntry::Item {
+                selected: false,
+                command: MenuCommand::AutoSave(true),
+                ..
+            })
+        ));
+
+        let _ = app.run_menu_command(MenuCommand::AutoSave(true));
+        assert!(app.settings.auto_save);
+    }
+
+    #[test]
+    fn tab_commands_remain_in_the_palette_when_removed_from_the_file_menu() {
+        let mut app = App::new();
+        app.document.add(Document::new());
+        let _ = app.update(Message::OpenQuickSwitcher(QuickSwitcherMode::Commands));
+        let palette_labels = app
+            .quick_switcher_entries()
+            .into_iter()
+            .map(|entry| entry.label)
+            .collect::<Vec<_>>();
+        let file_entries = app.menu_entries(AppMenu::File);
+        let file_labels = menu_labels(&file_entries);
+
+        assert!(palette_labels.contains(&"Próxima aba".to_owned()));
+        assert!(palette_labels.contains(&"Mover aba para a esquerda".to_owned()));
+        assert!(!file_labels.contains(&"Próxima aba"));
+        assert!(!file_labels.contains(&"Mover aba para a esquerda"));
+    }
+
+    #[test]
+    fn file_menu_document_actions_follow_the_active_path() {
+        let mut app = App::new();
+        let draft_entries = app.menu_entries(AppMenu::File);
+        let draft_reveal = draft_entries.iter().find(|entry| {
+            matches!(entry, AppMenuEntry::Item { label, .. } if label == "Mostrar no gerenciador de arquivos")
+        });
+        assert!(matches!(
+            draft_reveal,
+            Some(AppMenuEntry::Item { enabled: false, .. })
+        ));
+
+        let path = app.workspace_root.join("chapter.typ");
+        app.document.active_mut().relocate(path.clone());
+        let named_entries = app.menu_entries(AppMenu::File);
+        let named_reveal = named_entries.iter().find(|entry| {
+            matches!(entry, AppMenuEntry::Item { label, .. } if label == "Mostrar no gerenciador de arquivos")
+        });
+        let set_main = named_entries.iter().find(|entry| {
+            matches!(entry, AppMenuEntry::Item { label, .. } if label == "Definir como documento principal")
+        });
+
+        assert!(matches!(
+            named_reveal,
+            Some(AppMenuEntry::Item { enabled: true, .. })
+        ));
+        assert!(matches!(
+            set_main,
+            Some(AppMenuEntry::Item { enabled: true, .. })
+        ));
     }
 
     #[test]
@@ -9682,10 +10487,7 @@ mod tests {
         assert_eq!(root_item.reserve_icon_space, Some(false));
         assert!(root_item.expanded);
         assert!(root_item.has_children);
-        assert_eq!(root_item.actions.len(), 3);
-        assert_eq!(root_item.actions[0].icon, ui::WorkflowIcon::FileAdd);
-        assert_eq!(root_item.actions[1].icon, ui::WorkflowIcon::FolderAdd);
-        assert_eq!(root_item.actions[2].icon, ui::WorkflowIcon::Refresh);
+        assert!(root_item.actions.is_empty());
         assert_eq!(root_item.children.len(), 1);
 
         app.project_scan_busy = true;
@@ -10560,6 +11362,32 @@ mod tests {
         let _ = app.update(Message::Editor(Action::Insert("total".to_owned())));
         let _ = app.update(Message::Editor(Action::Indent));
         assert_eq!(app.document.selection_text().as_deref(), Some("value"));
+    }
+
+    #[test]
+    fn toolbar_snippet_preserves_selection_and_reuses_placeholder_navigation() {
+        let mut app = App::new();
+        app.document = Documents::new(Document::opened(
+            PathBuf::from("document.typ"),
+            "documentação".to_owned(),
+        ));
+        app.document.perform(Action::SelectAll);
+
+        let _ = app.update(Message::InsertTypstSnippet(formatting::TypstSnippet::Link));
+        assert_eq!(
+            app.document.snapshot().1,
+            "#link(\"https://example.com\")[documentação]"
+        );
+        assert_eq!(
+            app.document.selection_text().as_deref(),
+            Some("https://example.com")
+        );
+
+        let _ = app.update(Message::Editor(Action::Indent));
+        assert_eq!(
+            app.document.selection_text().as_deref(),
+            Some("documentação")
+        );
     }
 
     #[test]

@@ -31,6 +31,8 @@ A [Typst](https://typst.app) editor with live preview, written in Rust.
 - New, Open, Save, Save As, Save All, and optional autosave operations using
   native file dialogs and atomic writes.
 - Keyboard shortcuts for file operations and inline formatting.
+- Quick file opening with `Ctrl+P` and a command palette with `Ctrl+Shift+P`,
+  both filtered incrementally from the current project and application state.
 - Atomic document replacement that preserves existing file permissions and
   symbolic links.
 - PDF, SVG, PNG, and experimental HTML export from the current editor snapshot,

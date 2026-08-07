@@ -33,6 +33,13 @@ Adobe sob a licença Apache-2.0:
 - `code.svg`: `CodeIcon`, usado para alternar comentários de código;
 - `zoom-in.svg`: `ZoomInIcon`, usado para aumentar o Preview;
 - `zoom-out.svg`: `ZoomOutIcon`, usado para diminuir o Preview.
+- `text-size.svg`: `TextSizeIcon`, usado para títulos;
+- `function.svg`: `FunctionIcon`, usado para equações;
+- `link.svg`: `LinkIcon`, usado para hyperlinks;
+- `image.svg`: `ImageIcon`, usado para figuras;
+- `table.svg`: `TableIcon`, usado para tabelas;
+- `bookmark-single-outline.svg`: `BookmarkSingleOutlineIcon`, usado para labels;
+- `link-page.svg`: `LinkPageIcon`, usado para referências internas.
 
 O SVG de interface foi extraído de
 `@spectrum-web-components/icons-ui` versão `1.12.2`, sob a mesma licença:

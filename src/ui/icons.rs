@@ -33,10 +33,17 @@ const REDO: &[u8] = include_bytes!("assets/redo.svg");
 const CODE: &[u8] = include_bytes!("assets/code.svg");
 const ZOOM_IN: &[u8] = include_bytes!("assets/zoom-in.svg");
 const ZOOM_OUT: &[u8] = include_bytes!("assets/zoom-out.svg");
+const TEXT_SIZE: &[u8] = include_bytes!("assets/text-size.svg");
+const FUNCTION: &[u8] = include_bytes!("assets/function.svg");
+const LINK: &[u8] = include_bytes!("assets/link.svg");
+const IMAGE: &[u8] = include_bytes!("assets/image.svg");
+const TABLE: &[u8] = include_bytes!("assets/table.svg");
+const BOOKMARK_SINGLE_OUTLINE: &[u8] = include_bytes!("assets/bookmark-single-outline.svg");
+const LINK_PAGE: &[u8] = include_bytes!("assets/link-page.svg");
 const CROSS_100: &[u8] = include_bytes!("assets/cross-100.svg");
 const CHECKMARK_100: &[u8] = include_bytes!("assets/checkmark-100.svg");
 
-static HANDLES: LazyLock<[svg::Handle; 29]> = LazyLock::new(|| {
+static HANDLES: LazyLock<[svg::Handle; 36]> = LazyLock::new(|| {
     [
         svg::Handle::from_memory(TEXT_BOLD),
         svg::Handle::from_memory(TEXT_ITALIC),
@@ -67,6 +74,13 @@ static HANDLES: LazyLock<[svg::Handle; 29]> = LazyLock::new(|| {
         svg::Handle::from_memory(CODE),
         svg::Handle::from_memory(ZOOM_IN),
         svg::Handle::from_memory(ZOOM_OUT),
+        svg::Handle::from_memory(TEXT_SIZE),
+        svg::Handle::from_memory(FUNCTION),
+        svg::Handle::from_memory(LINK),
+        svg::Handle::from_memory(IMAGE),
+        svg::Handle::from_memory(TABLE),
+        svg::Handle::from_memory(BOOKMARK_SINGLE_OUTLINE),
+        svg::Handle::from_memory(LINK_PAGE),
     ]
 });
 
@@ -108,6 +122,13 @@ pub enum WorkflowIcon {
     Code,
     ZoomIn,
     ZoomOut,
+    TextSize,
+    Function,
+    Link,
+    Image,
+    Table,
+    BookmarkSingleOutline,
+    LinkPage,
 }
 
 impl WorkflowIcon {
@@ -146,6 +167,13 @@ impl WorkflowIcon {
             Self::Code => 26,
             Self::ZoomIn => 27,
             Self::ZoomOut => 28,
+            Self::TextSize => 29,
+            Self::Function => 30,
+            Self::Link => 31,
+            Self::Image => 32,
+            Self::Table => 33,
+            Self::BookmarkSingleOutline => 34,
+            Self::LinkPage => 35,
         }
     }
 }
@@ -205,6 +233,13 @@ mod tests {
             WorkflowIcon::Code,
             WorkflowIcon::ZoomIn,
             WorkflowIcon::ZoomOut,
+            WorkflowIcon::TextSize,
+            WorkflowIcon::Function,
+            WorkflowIcon::Link,
+            WorkflowIcon::Image,
+            WorkflowIcon::Table,
+            WorkflowIcon::BookmarkSingleOutline,
+            WorkflowIcon::LinkPage,
         ];
         let ids: Vec<_> = icons.into_iter().map(|icon| icon.handle().id()).collect();
 

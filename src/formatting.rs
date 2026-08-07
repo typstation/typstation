@@ -2,6 +2,96 @@ use std::ops::Range;
 
 use typst_iced_editor::{Action, Bias, Content};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypstSnippet {
+    Math,
+    Link,
+    Figure,
+    Table,
+    Label,
+    Reference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnippetExpansion {
+    pub text: String,
+    pub placeholders: Vec<Range<usize>>,
+}
+
+impl TypstSnippet {
+    pub fn expand(self, selection: Option<&str>) -> SnippetExpansion {
+        let selected = selection.filter(|value| !value.is_empty());
+        let mut expansion = SnippetExpansion {
+            text: String::new(),
+            placeholders: Vec::new(),
+        };
+
+        match self {
+            Self::Math => {
+                expansion.text.push('$');
+                expansion.placeholder(selected.unwrap_or("expressão"));
+                expansion.text.push('$');
+            }
+            Self::Link => {
+                expansion.text.push_str("#link(\"");
+                expansion.placeholder("https://example.com");
+                expansion.text.push_str("\")[");
+                expansion.placeholder(selected.unwrap_or("texto"));
+                expansion.text.push(']');
+            }
+            Self::Figure => {
+                expansion.text.push_str("#figure(\n  image(\"");
+                expansion.placeholder("image.png");
+                expansion.text.push_str("\", width: 100%),\n  caption: [");
+                expansion.placeholder("Legenda");
+                expansion.text.push_str("],\n) <");
+                expansion.placeholder("figura");
+                expansion.text.push('>');
+            }
+            Self::Table => {
+                expansion.text.push_str("#table(\n  columns: ");
+                expansion.placeholder("2");
+                expansion.text.push_str(",\n  [");
+                expansion.placeholder("Cabeçalho 1");
+                expansion.text.push_str("], [");
+                expansion.placeholder("Cabeçalho 2");
+                expansion.text.push_str("],\n  [");
+                expansion.placeholder("Célula 1");
+                expansion.text.push_str("], [");
+                expansion.placeholder("Célula 2");
+                expansion.text.push_str("],\n)");
+            }
+            Self::Label => {
+                expansion.text.push('<');
+                expansion.placeholder(valid_label_selection(selected).unwrap_or("rotulo"));
+                expansion.text.push('>');
+            }
+            Self::Reference => {
+                expansion.text.push('@');
+                expansion.placeholder(valid_label_selection(selected).unwrap_or("rotulo"));
+            }
+        }
+
+        expansion
+    }
+}
+
+impl SnippetExpansion {
+    fn placeholder(&mut self, value: &str) {
+        let start = self.text.len();
+        self.text.push_str(value);
+        self.placeholders.push(start..self.text.len());
+    }
+}
+
+fn valid_label_selection(selection: Option<&str>) -> Option<&str> {
+    selection.filter(|value| {
+        !value
+            .chars()
+            .any(|character| character.is_whitespace() || matches!(character, '<' | '>' | '@'))
+    })
+}
+
 pub fn toggle_surround(content: &mut Content, open: &str, close: &str) -> bool {
     let range = content.selection();
 
@@ -207,5 +297,46 @@ mod tests {
 
         assert!(toggle_line_prefix(&mut content, "+ "));
         assert_eq!(content.text(), "+ one\n\n+ three");
+    }
+
+    #[test]
+    fn typst_link_preserves_selection_and_exposes_both_placeholders() {
+        let expansion = TypstSnippet::Link.expand(Some("documentação"));
+
+        assert_eq!(
+            expansion.text,
+            "#link(\"https://example.com\")[documentação]"
+        );
+        assert_eq!(
+            &expansion.text[expansion.placeholders[0].clone()],
+            "https://example.com"
+        );
+        assert_eq!(
+            &expansion.text[expansion.placeholders[1].clone()],
+            "documentação"
+        );
+    }
+
+    #[test]
+    fn typst_block_snippets_expose_every_editable_value() {
+        let figure = TypstSnippet::Figure.expand(None);
+        let table = TypstSnippet::Table.expand(None);
+
+        assert_eq!(figure.placeholders.len(), 3);
+        assert_eq!(table.placeholders.len(), 5);
+        assert!(figure.text.starts_with("#figure("));
+        assert!(table.text.starts_with("#table("));
+    }
+
+    #[test]
+    fn label_snippets_ignore_invalid_selected_text() {
+        assert_eq!(
+            TypstSnippet::Label.expand(Some("duas palavras")).text,
+            "<rotulo>"
+        );
+        assert_eq!(
+            TypstSnippet::Reference.expand(Some("figura-1")).text,
+            "@figura-1"
+        );
     }
 }

@@ -10,6 +10,7 @@ mod menu;
 mod panel_tabs;
 mod picker;
 mod problems;
+mod quick_switcher;
 mod slider;
 mod surface;
 mod tabs;
@@ -35,6 +36,7 @@ pub use menu::{Menu, MenuEntry, MenuItem, menu_bar_button};
 pub use panel_tabs::{PanelTabItem, PanelTabNotification, PanelTabs};
 pub use picker::spectrum_picker;
 pub use problems::{ProblemItem, ProblemSeverity, Problems, problem_count_indicator};
+pub use quick_switcher::{QuickSwitcherItem, quick_switcher};
 pub use slider::spectrum_slider;
 pub use surface::{
     bar_style, divider_style, elevated_dialog_style, layer_style, metadata_text_style,
